@@ -141,42 +141,20 @@ def parse_whatsapp_with_llm(chat_text, bookings):
 
     booking_list.sort(key=lambda x: x["checkout"])
 
-    prompt = f"""Analyze this WhatsApp conversation about cleaning schedules. The cleaning happens on the checkout date of each booking.
+    prompt = f"""Parse this WhatsApp chat about cleaning schedules. Cleaning happens on booking checkout dates.
 
-Here are the upcoming Airbnb bookings (cleaning needed on checkout day):
-{json.dumps(booking_list, indent=2)}
+Bookings (checkout = cleaning day):
+{json.dumps(booking_list)}
 
-Here is the WhatsApp chat text:
+Chat:
 ---
 {chat_text}
 ---
 
-For each date mentioned in the chat, match it to the closest booking checkout date (within 1 day).
-Determine if the cleaner confirmed (gave a time or said yes) or declined ("I'm full", "can't", etc.).
+Match each date in the chat to the nearest booking checkout (within 1 day). Status: "confirmed" if they gave a time or said yes, "declined" if "I'm full"/can't, else "unclear".
 
-Return ONLY valid JSON in this exact format, no other text:
-{{
-  "matches": [
-    {{
-      "booking_uid": "the uid from the booking list",
-      "booking_label": "the label from the booking list",
-      "cleaning_date": "the date mentioned in chat (YYYY-MM-DD)",
-      "cleaner_name": "name of the cleaner",
-      "status": "confirmed" or "declined" or "unclear",
-      "time": "the time they said they'd clean, or null",
-      "note": "brief summary of what they said about this date"
-    }}
-  ],
-  "unmatched": [
-    {{
-      "cleaning_date": "YYYY-MM-DD",
-      "cleaner_name": "name",
-      "status": "confirmed" or "declined" or "unclear",
-      "note": "what they said"
-    }}
-  ],
-  "summary": "one-line summary of the overall conversation"
-}}"""
+Return ONLY valid JSON, no other text. Keep notes very short (under 10 words). Omit null fields:
+{{"matches":[{{"booking_uid":"uid","booking_label":"label","cleaning_date":"YYYY-MM-DD","cleaner_name":"name","status":"confirmed|declined|unclear","time":"time or omit","note":"short note"}}],"unmatched":[{{"cleaning_date":"YYYY-MM-DD","cleaner_name":"name","status":"...","note":"short"}}],"summary":"one line"}}"""
 
     try:
         resp = requests.post(
@@ -188,7 +166,7 @@ Return ONLY valid JSON in this exact format, no other text:
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=30,
