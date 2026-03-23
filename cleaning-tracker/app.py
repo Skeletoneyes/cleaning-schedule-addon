@@ -85,9 +85,18 @@ def sync_ical():
         seen_uids.add(uid)
 
         if uid in data["bookings"]:
-            data["bookings"][uid]["start"] = start_str
-            data["bookings"][uid]["end"] = end_str
-            data["bookings"][uid]["status"] = "active"
+            b = data["bookings"][uid]
+            if b.get("cleaner") and (b["start"] != start_str or b["end"] != end_str):
+                if not b.get("conflict"):
+                    b["conflict"] = {
+                        "type": "dates_changed",
+                        "old_start": b["start"],
+                        "old_end": b["end"],
+                        "detected": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+            b["start"] = start_str
+            b["end"] = end_str
+            b["status"] = "active"
         else:
             data["bookings"][uid] = {
                 "start": start_str,
@@ -109,6 +118,13 @@ def sync_ical():
                 b["status"] = "complete"
             else:
                 b["status"] = "cancelled"
+            if b.get("cleaner") and not b.get("conflict"):
+                b["conflict"] = {
+                    "type": "cancelled",
+                    "old_start": b["start"],
+                    "old_end": b["end"],
+                    "detected": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                }
 
     data["last_sync"] = datetime.now().isoformat()
     save_data(data)
@@ -250,6 +266,7 @@ TEMPLATE = """
   .card.confirmed { border-left-color: #198754; }
   .card.complete { border-left-color: #198754; background: var(--green); }
   .card.cancelled { border-left-color: #999; background: var(--red); opacity: 0.6; }
+  .card.conflicted { border-left-color: #fd7e14; background: #fff8f0; }
   .card.urgent { animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100% { box-shadow: 0 1px 3px rgba(0,0,0,0.08); } 50% { box-shadow: 0 0 12px rgba(220,53,69,0.3); } }
 
@@ -360,7 +377,60 @@ TEMPLATE = """
     <div class="stat-num">{{ upcoming_count }}</div>
     <div class="stat-label">Upcoming</div>
   </div>
+  {% if conflicts_count %}
+  <div class="stat">
+    <div class="stat-num" style="color:#fd7e14">{{ conflicts_count }}</div>
+    <div class="stat-label">Needs Review</div>
+  </div>
+  {% endif %}
 </div>
+
+<!-- Conflict / Needs Review section -->
+{% if conflicts %}
+<div style="margin-bottom:16px;">
+  <h2 style="font-size:1.05rem;font-weight:700;color:#fd7e14;margin-bottom:10px;">&#9888; Needs Review</h2>
+  {% for b in conflicts %}
+  <div class="card conflicted">
+    <div class="card-header">
+      <div>
+        {% if b.conflict.type == 'dates_changed' %}
+        <div class="dates">{{ b.start_fmt }} &rarr; {{ b.end_fmt }}</div>
+        <div style="font-size:0.85rem;color:#fd7e14;margin-top:2px;">
+          Was: {{ b.conflict.old_start }} &rarr; {{ b.conflict.old_end }}
+        </div>
+        {% else %}
+        <div class="dates">{{ b.start_fmt }} &rarr; {{ b.end_fmt }}</div>
+        {% endif %}
+        <div style="font-size:0.85rem;margin-top:4px;">
+          <strong>{{ b.conflict_fmt }}</strong>
+        </div>
+        <div style="font-size:0.85rem;color:#666;margin-top:2px;">
+          Cleaner: <strong>{{ b.cleaner }}</strong>
+          {% if b.cleaner_since_fmt %}<span style="color:#999;"> · assigned {{ b.cleaner_since_fmt }}</span>{% endif %}
+        </div>
+      </div>
+      <span class="badge" style="background:#ffe8cc;color:#854d0e;">Review</span>
+    </div>
+    <div class="card-actions" style="margin-top:10px;">
+      <form action="{{ prefix }}/resolve/{{ b.uid }}" method="POST" style="display:inline;">
+        <input type="hidden" name="action" value="keep">
+        <button type="submit" class="btn btn-sm btn-success">Keep Cleaning</button>
+      </form>
+      <form action="{{ prefix }}/resolve/{{ b.uid }}" method="POST" style="display:inline;">
+        <input type="hidden" name="action" value="cancel">
+        <button type="submit" class="btn btn-sm btn-danger">Cancel Cleaning</button>
+      </form>
+      {% if b.conflict.type == 'dates_changed' %}
+      <form action="{{ prefix }}/resolve/{{ b.uid }}" method="POST" style="display:inline;">
+        <input type="hidden" name="action" value="move">
+        <button type="submit" class="btn btn-sm btn-warning">Move Cleaning</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 
 <!-- Tabs -->
 <div class="tabs">
@@ -411,6 +481,9 @@ TEMPLATE = """
     </div>
     {% if b.notes %}
     <div style="margin-top:6px;font-size:0.85rem;color:#666">{{ b.notes }}</div>
+    {% endif %}
+    {% if b.cleaner_since %}
+    <div style="margin-top:4px;font-size:0.75rem;color:#999">Assigned: {{ b.cleaner_since_fmt }}</div>
     {% endif %}
   </div>
   {% endfor %}
@@ -601,6 +674,17 @@ ADD_TEMPLATE = """
 
 # ── View helpers ─────────────────────────────────────────────────────────────
 
+def _fmt_timestamp(ts):
+    """Format an ISO timestamp to a short human-readable string."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+        return dt.strftime("%b %d, %I:%M %p")
+    except (ValueError, TypeError):
+        return ts
+
+
 def format_booking(uid, b):
     start = datetime.strptime(b["start"], "%Y-%m-%d").date()
     end = datetime.strptime(b["end"], "%Y-%m-%d").date()
@@ -630,6 +714,19 @@ def format_booking(uid, b):
         if 0 <= days_until <= 3:
             card_class += " urgent"
 
+    conflict = b.get("conflict")
+    conflict_fmt = None
+    if conflict:
+        old_end = conflict.get("old_end", "")
+        if conflict["type"] == "dates_changed":
+            try:
+                old_end_dt = datetime.strptime(old_end, "%Y-%m-%d").date()
+                conflict_fmt = f"Checkout moved from {old_end_dt.strftime('%b %d')} to {end.strftime('%b %d')}"
+            except ValueError:
+                conflict_fmt = "Dates changed"
+        else:
+            conflict_fmt = "Booking cancelled"
+
     return {
         "uid": uid,
         "start_fmt": start.strftime("%b %d"),
@@ -644,6 +741,10 @@ def format_booking(uid, b):
         "status": b["status"],
         "card_class": card_class,
         "notes": b.get("notes", ""),
+        "cleaner_since": b.get("cleaner_since"),
+        "cleaner_since_fmt": _fmt_timestamp(b.get("cleaner_since")),
+        "conflict": conflict,
+        "conflict_fmt": conflict_fmt,
     }
 
 
@@ -654,6 +755,7 @@ def build_view_data(data):
 
     upcoming = []
     past = []
+    conflicts = []
     needs_cleaner = 0
     assigned_count = 0
     confirmed_count = 0
@@ -662,8 +764,12 @@ def build_view_data(data):
         fb = format_booking(uid, b)
         end = datetime.strptime(b["end"], "%Y-%m-%d").date()
 
+        if fb["conflict"]:
+            conflicts.append(fb)
+
         if b["status"] == "cancelled":
-            past.append(fb)
+            if not fb["conflict"]:
+                past.append(fb)
             continue
 
         if end >= today and b["status"] == "active":
@@ -679,6 +785,7 @@ def build_view_data(data):
 
     upcoming.sort(key=lambda x: x["end"])
     past.sort(key=lambda x: x["end"], reverse=True)
+    conflicts.sort(key=lambda x: x["end"])
 
     last_sync = data.get("last_sync")
     if last_sync:
@@ -691,6 +798,8 @@ def build_view_data(data):
     return {
         "upcoming": upcoming,
         "past": past[:30],
+        "conflicts": conflicts,
+        "conflicts_count": len(conflicts),
         "needs_cleaner": needs_cleaner,
         "assigned_count": assigned_count,
         "confirmed_count": confirmed_count,
@@ -731,6 +840,7 @@ def assign(uid):
     cleaner = request.form.get("cleaner", "").strip()
     if uid in data["bookings"]:
         data["bookings"][uid]["cleaner"] = cleaner or None
+        data["bookings"][uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") if cleaner else None
         if not cleaner:
             data["bookings"][uid]["confirmed"] = False
         save_data(data)
@@ -801,6 +911,7 @@ def whatsapp():
                 if cleaner_name:
                     if not bookings[uid].get("cleaner"):
                         bookings[uid]["cleaner"] = cleaner_name
+                        bookings[uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                     bookings[uid]["confirmed"] = True
                     note_parts = []
                     if match.get("time"):
@@ -853,6 +964,7 @@ def apply_match():
     if uid and uid in bookings:
         if cleaner_name and not bookings[uid].get("cleaner"):
             bookings[uid]["cleaner"] = cleaner_name
+            bookings[uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         if status == "confirmed":
             bookings[uid]["confirmed"] = True
         elif status == "declined":
@@ -866,6 +978,26 @@ def apply_match():
             bookings[uid]["notes"] = " | ".join(note_parts)
         save_data(data)
 
+    return redirect(ingress_prefix() + "/")
+
+
+@app.route("/resolve/<path:uid>", methods=["POST"])
+def resolve(uid):
+    data = load_data()
+    if uid in data["bookings"]:
+        b = data["bookings"][uid]
+        action = request.form.get("action", "keep")
+        if action == "keep":
+            b.pop("conflict", None)
+        elif action == "cancel":
+            b.pop("conflict", None)
+            b["cleaner"] = None
+            b["cleaner_since"] = None
+            b["confirmed"] = False
+        elif action == "move":
+            b.pop("conflict", None)
+            b["confirmed"] = False
+        save_data(data)
     return redirect(ingress_prefix() + "/")
 
 
