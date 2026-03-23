@@ -479,6 +479,26 @@ TEMPLATE = """
       {% if m.note %}
       <div class="wa-note">{{ m.note }}</div>
       {% endif %}
+      {% if wa_booking_options %}
+      <form action="{{ prefix }}/apply-match" method="POST" style="display:flex;gap:4px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+        <select name="booking_uid" style="padding:3px 6px;border-radius:4px;border:1px solid #ccc;font-size:0.8rem;">
+          {% for opt in wa_booking_options %}
+          <option value="{{ opt.uid }}" {{ 'selected' if opt.uid == m.booking_uid }}>{{ opt.label }}</option>
+          {% endfor %}
+        </select>
+        <input type="hidden" name="cleaner_name" value="{{ m.cleaner_name }}">
+        <input type="hidden" name="status" value="{{ m.status }}">
+        <input type="hidden" name="time" value="{{ m.time or '' }}">
+        <input type="hidden" name="note" value="{{ m.note or '' }}">
+        {% if m.status == 'declined' %}
+        <button type="submit" class="btn btn-sm btn-danger">Apply Decline</button>
+        {% elif m.status == 'confirmed' %}
+        <button type="submit" class="btn btn-sm btn-success">Apply</button>
+        {% else %}
+        <button type="submit" class="btn btn-sm btn-warning">Apply</button>
+        {% endif %}
+      </form>
+      {% endif %}
     </div>
     {% endfor %}
     {% endif %}
@@ -495,6 +515,27 @@ TEMPLATE = """
       ">{{ m.status }}</span>
       {% if m.note %}
       <div class="wa-note">{{ m.note }}</div>
+      {% endif %}
+      {% if wa_booking_options %}
+      <form action="{{ prefix }}/apply-match" method="POST" style="display:flex;gap:4px;align-items:center;margin-top:6px;flex-wrap:wrap;">
+        <select name="booking_uid" style="padding:3px 6px;border-radius:4px;border:1px solid #ccc;font-size:0.8rem;">
+          <option value="">-- Select booking --</option>
+          {% for opt in wa_booking_options %}
+          <option value="{{ opt.uid }}">{{ opt.label }}</option>
+          {% endfor %}
+        </select>
+        <input type="hidden" name="cleaner_name" value="{{ m.cleaner_name }}">
+        <input type="hidden" name="status" value="{{ m.status }}">
+        <input type="hidden" name="time" value="{{ m.time or '' }}">
+        <input type="hidden" name="note" value="{{ m.note or '' }}">
+        {% if m.status == 'declined' %}
+        <button type="submit" class="btn btn-sm btn-danger">Apply Decline</button>
+        {% elif m.status == 'confirmed' %}
+        <button type="submit" class="btn btn-sm btn-success">Apply</button>
+        {% else %}
+        <button type="submit" class="btn btn-sm btn-warning">Apply</button>
+        {% endif %}
+      </form>
       {% endif %}
     </div>
     {% endfor %}
@@ -670,6 +711,7 @@ def index():
     return render_template_string(
         TEMPLATE, error=request.args.get("error"),
         wa_text=None, wa_parsed=None, wa_error=None, wa_applied=0,
+        wa_booking_options=[],
         **ctx,
     )
 
@@ -772,14 +814,59 @@ def whatsapp():
 
     ctx = build_view_data(data)
 
+    today = date.today()
+    wa_booking_options = []
+    for uid, b in bookings.items():
+        if b["status"] != "active":
+            continue
+        end = datetime.strptime(b["end"], "%Y-%m-%d").date()
+        if end < today:
+            continue
+        start = datetime.strptime(b["start"], "%Y-%m-%d").date()
+        wa_booking_options.append({
+            "uid": uid,
+            "label": f"{start.strftime('%b %d')} \u2192 {end.strftime('%b %d')}",
+        })
+    wa_booking_options.sort(key=lambda x: x["label"])
+
     return render_template_string(
         TEMPLATE, error=None,
         wa_text=chat_text,
         wa_parsed=parsed,
         wa_error=error,
         wa_applied=applied_count,
+        wa_booking_options=wa_booking_options,
         **ctx,
     )
+
+
+@app.route("/apply-match", methods=["POST"])
+def apply_match():
+    data = load_data()
+    bookings = data.get("bookings", {})
+    uid = request.form.get("booking_uid", "").strip()
+    cleaner_name = request.form.get("cleaner_name", "").strip()
+    status = request.form.get("status", "").strip()
+    time_val = request.form.get("time", "").strip()
+    note = request.form.get("note", "").strip()
+
+    if uid and uid in bookings:
+        if cleaner_name and not bookings[uid].get("cleaner"):
+            bookings[uid]["cleaner"] = cleaner_name
+        if status == "confirmed":
+            bookings[uid]["confirmed"] = True
+        elif status == "declined":
+            bookings[uid]["confirmed"] = False
+        note_parts = []
+        if time_val:
+            note_parts.append(f"Time: {time_val}")
+        if note:
+            note_parts.append(note)
+        if note_parts and not bookings[uid].get("notes"):
+            bookings[uid]["notes"] = " | ".join(note_parts)
+        save_data(data)
+
+    return redirect(ingress_prefix() + "/")
 
 
 if __name__ == "__main__":
