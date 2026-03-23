@@ -1,7 +1,7 @@
 name: Cleaning Schedule Tracker
-version: "1.0.1"
+version: "1.1.0"
 slug: cleaning-tracker
-description: Airbnb cleaning schedule tracker with iCal sync and WhatsApp parsing
+description: Airbnb cleaning schedule tracker with iCal sync and AI-powered WhatsApp parsing
 init: false
 arch:
   - amd64
@@ -14,8 +14,10 @@ panel_icon: mdi:broom
 panel_title: Cleaning Schedule
 options:
   ical_url: ""
+  anthropic_api_key: ""
   cleaners: []
 schema:
   ical_url: url
+  anthropic_api_key: password
   cleaners:
     - str

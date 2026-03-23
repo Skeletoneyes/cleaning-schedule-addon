@@ -6,12 +6,11 @@ Paste WhatsApp chat logs to verify cleaner confirmations.
 
 import json
 import os
-import re
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template_string, request, jsonify, redirect
+from flask import Flask, render_template_string, request, redirect
 
 app = Flask(__name__)
 
@@ -30,6 +29,7 @@ def load_options():
 
 OPTIONS = load_options()
 ICAL_URL = OPTIONS.get("ical_url", os.environ.get("ICAL_URL", ""))
+ANTHROPIC_API_KEY = OPTIONS.get("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
 CLEANERS = OPTIONS.get("cleaners", [])
 DATA_FILE = DATA_DIR / "data.json"
 
@@ -39,18 +39,13 @@ def ingress_prefix():
     return request.headers.get("X-Ingress-Path", "")
 
 
-def url_for_ingress(path):
-    """Build a URL that works behind HA ingress."""
-    return ingress_prefix() + path
-
-
 # ── Data persistence ─────────────────────────────────────────────────────────
 
 def load_data():
     if DATA_FILE.exists():
         with open(DATA_FILE) as f:
             return json.load(f)
-    return {"bookings": {}, "whatsapp_logs": [], "last_sync": None}
+    return {"bookings": {}, "last_sync": None}
 
 
 def save_data(data):
@@ -120,98 +115,102 @@ def sync_ical():
     return data, None
 
 
-# ── WhatsApp parsing ─────────────────────────────────────────────────────────
+# ── WhatsApp parsing via LLM ────────────────────────────────────────────────
 
-WHATSAPP_LINE_RE = re.compile(
-    r"[\[>]?(\d{1,2}/\d{1,2}/\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{0,2})"
-    r"[\]>]?\s*[-–]?\s*([^:]+):\s*(.*)"
-)
+def parse_whatsapp_with_llm(chat_text, bookings):
+    """Use Claude Haiku to parse WhatsApp chat and match to bookings."""
+    if not ANTHROPIC_API_KEY:
+        return None, "No Anthropic API key configured. Set it in the add-on options."
 
-DATE_IN_MSG_RE = re.compile(
-    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-    r"\s+(\d{1,2})(?:st|nd|rd|th)?",
-    re.IGNORECASE,
-)
-
-CONFIRM_WORDS = re.compile(
-    r"\b(yes|ok|okay|sure|confirmed?|i can|sí|si|claro|listo|está bien|dale|perfecto)\b",
-    re.IGNORECASE,
-)
-
-MONTH_MAP = {
-    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-    "aug": 8, "august": 8, "sep": 9, "september": 9, "oct": 10, "october": 10,
-    "nov": 11, "november": 11, "dec": 12, "december": 12,
-}
-
-
-def parse_whatsapp(text):
-    messages = []
-    for match in WHATSAPP_LINE_RE.finditer(text):
-        date_str, time_str, sender, body = match.groups()
-        sender = sender.strip()
-        body = body.strip()
-
-        is_cleaner = any(c.lower() in sender.lower() for c in CLEANERS)
-        has_confirm = bool(CONFIRM_WORDS.search(body))
-
-        mentioned_dates = []
-        for dm in DATE_IN_MSG_RE.finditer(body):
-            month_name, day = dm.groups()
-            month_num = MONTH_MAP.get(month_name.lower())
-            if month_num:
-                now = date.today()
-                guess = date(now.year, month_num, int(day))
-                if guess < now - timedelta(days=180):
-                    guess = date(now.year + 1, month_num, int(day))
-                mentioned_dates.append(guess.isoformat())
-
-        messages.append({
-            "date": date_str,
-            "time": time_str.strip(),
-            "sender": sender,
-            "body": body,
-            "is_cleaner": is_cleaner,
-            "has_confirm": has_confirm,
-            "mentioned_dates": mentioned_dates,
+    # Build a list of booking checkout dates for the LLM
+    today = date.today()
+    booking_list = []
+    for uid, b in bookings.items():
+        if b["status"] != "active":
+            continue
+        end = datetime.strptime(b["end"], "%Y-%m-%d").date()
+        if end < today:
+            continue
+        start = datetime.strptime(b["start"], "%Y-%m-%d").date()
+        booking_list.append({
+            "uid": uid,
+            "checkin": b["start"],
+            "checkout": b["end"],
+            "label": f"{start.strftime('%b %d')} → {end.strftime('%b %d')}",
         })
 
-    return messages
+    booking_list.sort(key=lambda x: x["checkout"])
 
+    prompt = f"""Analyze this WhatsApp conversation about cleaning schedules. The cleaning happens on the checkout date of each booking.
 
-def match_messages_to_bookings(messages, bookings):
-    matches = {}
+Here are the upcoming Airbnb bookings (cleaning needed on checkout day):
+{json.dumps(booking_list, indent=2)}
 
-    for uid, b in bookings.items():
-        b_start = datetime.strptime(b["start"], "%Y-%m-%d").date()
-        b_end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-        cleaning_date = b_end
+Here is the WhatsApp chat text:
+---
+{chat_text}
+---
 
-        relevant = []
-        for msg in messages:
-            for md in msg["mentioned_dates"]:
-                md_date = datetime.strptime(md, "%Y-%m-%d").date()
-                if abs((md_date - cleaning_date).days) <= 1:
-                    relevant.append(msg)
-                    break
-            else:
-                try:
-                    parts = msg["date"].replace("/", "-").split("-")
-                    if len(parts[2]) == 2:
-                        parts[2] = "20" + parts[2]
-                    msg_date = date(int(parts[2]), int(parts[0]), int(parts[1]))
-                    if timedelta(0) <= (cleaning_date - msg_date) <= timedelta(days=7):
-                        if msg["is_cleaner"] or any(c.lower() in msg["body"].lower() for c in CLEANERS):
-                            relevant.append(msg)
-                except (ValueError, IndexError):
-                    pass
+For each date mentioned in the chat, match it to the closest booking checkout date (within 1 day).
+Determine if the cleaner confirmed (gave a time or said yes) or declined ("I'm full", "can't", etc.).
 
-        if relevant:
-            matches[uid] = relevant
+Return ONLY valid JSON in this exact format, no other text:
+{{
+  "matches": [
+    {{
+      "booking_uid": "the uid from the booking list",
+      "booking_label": "the label from the booking list",
+      "cleaning_date": "the date mentioned in chat (YYYY-MM-DD)",
+      "cleaner_name": "name of the cleaner",
+      "status": "confirmed" or "declined" or "unclear",
+      "time": "the time they said they'd clean, or null",
+      "note": "brief summary of what they said about this date"
+    }}
+  ],
+  "unmatched": [
+    {{
+      "cleaning_date": "YYYY-MM-DD",
+      "cleaner_name": "name",
+      "status": "confirmed" or "declined" or "unclear",
+      "note": "what they said"
+    }}
+  ],
+  "summary": "one-line summary of the overall conversation"
+}}"""
 
-    return matches
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        text = result["content"][0]["text"]
+
+        # Extract JSON from response (handle markdown code blocks)
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0]
+        parsed = json.loads(text)
+        return parsed, None
+
+    except requests.exceptions.HTTPError as e:
+        return None, f"Anthropic API error: {e.response.status_code} - {e.response.text[:200]}"
+    except json.JSONDecodeError as e:
+        return None, f"Failed to parse LLM response as JSON: {e}"
+    except Exception as e:
+        return None, f"Error calling Anthropic API: {e}"
 
 
 # ── HTML Template ────────────────────────────────────────────────────────────
@@ -299,14 +298,21 @@ TEMPLATE = """
     width: 100%; min-height: 150px; border: 1px solid #ccc; border-radius: 6px;
     padding: 10px; font-size: 0.85rem; font-family: inherit; resize: vertical;
   }
+
   .wa-results { margin-top: 12px; }
-  .wa-msg {
+  .wa-match {
     background: #fff; border-radius: 8px; padding: 10px; margin-bottom: 6px;
-    border-left: 3px solid #25d366;
+    border-left: 3px solid #dee2e6;
   }
-  .wa-msg.confirm { background: #d4edda; }
-  .wa-msg .sender { font-weight: 600; color: #25d366; }
-  .wa-msg .meta { font-size: 0.75rem; color: #999; }
+  .wa-match.confirmed { border-left-color: #198754; background: #d4edda; }
+  .wa-match.declined { border-left-color: #dc3545; background: #ffcccb; }
+  .wa-match.unclear { border-left-color: #ffc107; background: #fff3cd; }
+  .wa-match .wa-date { font-weight: 600; }
+  .wa-match .wa-note { font-size: 0.85rem; color: #555; margin-top: 2px; }
+  .wa-summary {
+    background: #e2e3e5; border-radius: 8px; padding: 10px; margin-bottom: 12px;
+    font-size: 0.9rem;
+  }
 
   .stats {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
@@ -319,13 +325,15 @@ TEMPLATE = """
   .stat-num { font-size: 1.8rem; font-weight: 700; }
   .stat-label { font-size: 0.75rem; color: #666; text-transform: uppercase; }
 
-  .filter-bar { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-
   .empty { text-align: center; color: #999; padding: 40px; }
 
   .config-warning {
     background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px;
     padding: 12px; margin-bottom: 16px; font-size: 0.9rem;
+  }
+  .error-box {
+    background: #ffcccb; border: 1px solid #dc3545; border-radius: 8px;
+    padding: 12px; margin-bottom: 12px; font-size: 0.9rem;
   }
 
   @media (max-width: 500px) {
@@ -422,9 +430,6 @@ TEMPLATE = """
       {% elif b.paid %}
         <span class="badge" style="background:#d4edda;color:#155724">Paid</span>
       {% endif %}
-      {% if b.wa_matches %}
-        <span class="badge" style="background:#25d366;color:#fff">{{ b.wa_matches }} WhatsApp msg{{ 's' if b.wa_matches != 1 }}</span>
-      {% endif %}
     </div>
     {% if b.notes %}
     <div style="margin-top:6px;font-size:0.85rem;color:#666">{{ b.notes }}</div>
@@ -457,42 +462,70 @@ TEMPLATE = """
 <!-- WhatsApp Panel -->
 <div id="whatsapp" class="panel">
   <p style="margin-bottom:8px;font-size:0.9rem;">
-    Paste a WhatsApp chat export below. The app will match messages to bookings
-    and highlight cleaner confirmations.
+    Paste a WhatsApp chat below. An AI will parse the messages, match dates to bookings,
+    and detect confirmations or declines.
   </p>
   <form action="{{ prefix }}/whatsapp" method="POST">
-    <textarea name="chat" class="whatsapp-box" placeholder="Paste WhatsApp chat here...&#10;&#10;Example:&#10;[3/20/26, 2:15:30 PM] Jane: Yes I can clean on March 25th">{{ wa_text or "" }}</textarea>
-    <div style="margin-top:8px;">
+    <textarea name="chat" class="whatsapp-box" placeholder="Paste WhatsApp chat here — any format works.">{{ wa_text or "" }}</textarea>
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
       <button type="submit" class="btn btn-primary">Parse Chat</button>
+      <label style="font-size:0.85rem;">
+        <input type="checkbox" name="auto_apply" value="1"> Auto-apply confirmations to bookings
+      </label>
     </div>
   </form>
 
-  {% if wa_results %}
-  <div class="wa-results">
-    <h3 style="margin:12px 0 8px;">Matched Messages</h3>
-    {% for uid, msgs in wa_results.items() %}
-      <div style="font-weight:600;margin:8px 0 4px;">
-        Booking: {{ wa_booking_labels[uid] }}
-      </div>
-      {% for m in msgs %}
-      <div class="wa-msg {{ 'confirm' if m.has_confirm }}">
-        <span class="sender">{{ m.sender }}</span>
-        <span class="meta">{{ m.date }} {{ m.time }}</span>
-        <div>{{ m.body }}</div>
-        {% if m.has_confirm %}<span class="badge badge-complete">Confirmation detected</span>{% endif %}
-      </div>
-      {% endfor %}
-    {% endfor %}
+  {% if wa_error %}
+  <div class="error-box">{{ wa_error }}</div>
+  {% endif %}
 
-    {% if wa_unmatched %}
-    <h3 style="margin:12px 0 8px;">Unmatched Cleaner Messages</h3>
-    {% for m in wa_unmatched %}
-      <div class="wa-msg">
-        <span class="sender">{{ m.sender }}</span>
-        <span class="meta">{{ m.date }} {{ m.time }}</span>
-        <div>{{ m.body }}</div>
+  {% if wa_parsed %}
+  <div class="wa-results">
+    {% if wa_parsed.summary %}
+    <div class="wa-summary">{{ wa_parsed.summary }}</div>
+    {% endif %}
+
+    {% if wa_parsed.matches %}
+    <h3 style="margin:12px 0 8px;">Matched to Bookings</h3>
+    {% for m in wa_parsed.matches %}
+    <div class="wa-match {{ m.status }}">
+      <div class="wa-date">
+        {{ m.booking_label }} — {{ m.cleaner_name }}
+        {% if m.time %} at {{ m.time }}{% endif %}
       </div>
+      <span class="badge badge-{{ m.status }}" style="
+        {% if m.status == 'confirmed' %}background:#d4edda;color:#155724
+        {% elif m.status == 'declined' %}background:#ffcccb;color:#721c24
+        {% else %}background:#fff3cd;color:#856404{% endif %}
+      ">{{ m.status }}</span>
+      {% if m.note %}
+      <div class="wa-note">{{ m.note }}</div>
+      {% endif %}
+    </div>
     {% endfor %}
+    {% endif %}
+
+    {% if wa_parsed.unmatched %}
+    <h3 style="margin:12px 0 8px;">Unmatched Dates</h3>
+    {% for m in wa_parsed.unmatched %}
+    <div class="wa-match {{ m.status }}">
+      <div class="wa-date">{{ m.cleaning_date }} — {{ m.cleaner_name }}</div>
+      <span class="badge" style="
+        {% if m.status == 'confirmed' %}background:#d4edda;color:#155724
+        {% elif m.status == 'declined' %}background:#ffcccb;color:#721c24
+        {% else %}background:#fff3cd;color:#856404{% endif %}
+      ">{{ m.status }}</span>
+      {% if m.note %}
+      <div class="wa-note">{{ m.note }}</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    {% if wa_applied %}
+    <div style="margin-top:12px;padding:10px;background:#d4edda;border-radius:8px;font-size:0.9rem;">
+      Auto-applied {{ wa_applied }} confirmation(s) to bookings.
+    </div>
     {% endif %}
   </div>
   {% endif %}
@@ -549,7 +582,7 @@ ADD_TEMPLATE = """
 
 # ── View helpers ─────────────────────────────────────────────────────────────
 
-def format_booking(uid, b, wa_match_counts=None):
+def format_booking(uid, b):
     start = datetime.strptime(b["start"], "%Y-%m-%d").date()
     end = datetime.strptime(b["end"], "%Y-%m-%d").date()
     today = date.today()
@@ -592,11 +625,10 @@ def format_booking(uid, b, wa_match_counts=None):
         "status": b["status"],
         "card_class": card_class,
         "notes": b.get("notes", ""),
-        "wa_matches": (wa_match_counts or {}).get(uid, 0),
     }
 
 
-def build_view_data(data, wa_match_counts=None):
+def build_view_data(data):
     """Build the template context from booking data."""
     bookings = data.get("bookings", {})
     today = date.today()
@@ -608,7 +640,7 @@ def build_view_data(data, wa_match_counts=None):
     confirmed_count = 0
 
     for uid, b in bookings.items():
-        fb = format_booking(uid, b, wa_match_counts)
+        fb = format_booking(uid, b)
         end = datetime.strptime(b["end"], "%Y-%m-%d").date()
 
         if b["status"] == "cancelled":
@@ -659,7 +691,7 @@ def index():
     ctx = build_view_data(data)
     return render_template_string(
         TEMPLATE, error=request.args.get("error"),
-        wa_text=None, wa_results=None, wa_booking_labels=None, wa_unmatched=None,
+        wa_text=None, wa_parsed=None, wa_error=None, wa_applied=0,
         **ctx,
     )
 
@@ -735,45 +767,39 @@ def whatsapp():
     data = load_data()
     bookings = data.get("bookings", {})
     chat_text = request.form.get("chat", "")
+    auto_apply = request.form.get("auto_apply") == "1"
 
-    messages = parse_whatsapp(chat_text)
-    matches = match_messages_to_bookings(messages, bookings)
+    parsed, error = parse_whatsapp_with_llm(chat_text, bookings)
 
-    labels = {}
-    for uid in matches:
-        b = bookings[uid]
-        start = datetime.strptime(b["start"], "%Y-%m-%d").date()
-        end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-        labels[uid] = f"{start.strftime('%b %d')} → {end.strftime('%b %d')}"
+    # Auto-apply confirmed matches to bookings
+    applied_count = 0
+    if parsed and auto_apply:
+        for match in parsed.get("matches", []):
+            uid = match.get("booking_uid")
+            if uid and uid in bookings and match.get("status") == "confirmed":
+                cleaner_name = match.get("cleaner_name", "")
+                if cleaner_name:
+                    if not bookings[uid].get("cleaner"):
+                        bookings[uid]["cleaner"] = cleaner_name
+                    bookings[uid]["confirmed"] = True
+                    note_parts = []
+                    if match.get("time"):
+                        note_parts.append(f"Time: {match['time']}")
+                    if match.get("note"):
+                        note_parts.append(match["note"])
+                    if note_parts and not bookings[uid].get("notes"):
+                        bookings[uid]["notes"] = " | ".join(note_parts)
+                    applied_count += 1
+        save_data(data)
 
-    matched_msgs = set()
-    for msgs in matches.values():
-        for m in msgs:
-            matched_msgs.add(id(m))
-    unmatched = [m for m in messages if m["is_cleaner"] and id(m) not in matched_msgs]
-
-    for uid, msgs in matches.items():
-        for m in msgs:
-            if m["is_cleaner"] and m["has_confirm"]:
-                if uid in bookings:
-                    for c in CLEANERS:
-                        if c.lower() in m["sender"].lower():
-                            if not bookings[uid].get("cleaner"):
-                                bookings[uid]["cleaner"] = c
-                            bookings[uid]["confirmed"] = True
-                            break
-
-    save_data(data)
-
-    wa_match_counts = {uid: len(msgs) for uid, msgs in matches.items()}
-    ctx = build_view_data(data, wa_match_counts)
+    ctx = build_view_data(data)
 
     return render_template_string(
         TEMPLATE, error=None,
         wa_text=chat_text,
-        wa_results=matches if matches else None,
-        wa_booking_labels=labels,
-        wa_unmatched=unmatched if unmatched else None,
+        wa_parsed=parsed,
+        wa_error=error,
+        wa_applied=applied_count,
         **ctx,
     )
 
