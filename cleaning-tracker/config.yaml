@@ -1,5 +1,5 @@
 name: Cleaning Schedule Tracker
-version: "1.0.0"
+version: "1.0.1"
 slug: cleaning-tracker
 description: Airbnb cleaning schedule tracker with iCal sync and WhatsApp parsing
 init: false
