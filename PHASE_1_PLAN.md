@@ -140,10 +140,7 @@ fast-forward.
 
 ### Pending
 
-- **User HA smoke test of `1.4.0-rc1`**: install the update, click around
-  the calendar, try adding a custom stay, view `/print`. Live on `master`
-  at `homeassistant.local:8123/app/27cbea7f_cleaning-tracker`.
-- Once smoke-tested, drop the `-rc1` suffix and tag `1.4.0`.
+- None. Smoke test passed 2026-04-19; version bumped to `1.4.0`.
 
 ### Known non-blockers
 
