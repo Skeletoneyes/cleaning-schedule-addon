@@ -57,6 +57,7 @@ def load_data():
             b["type"] = "manual_cleaning" if uid.startswith("manual-") else "airbnb"
     data.setdefault("messages", [])
     data.setdefault("cleaner_jids", {})
+    data.setdefault("group_labels", {})
     return data
 
 
@@ -110,6 +111,11 @@ def lookup_cleaner_by_jid(data, jid):
         if jid in jids:
             return name
     return None
+
+
+def group_label(data, jid):
+    """Human-friendly label for a group JID, or the JID itself if unlabeled."""
+    return data.get("group_labels", {}).get(jid) or jid
 
 
 # ── Cleaner color ─────────────────────────────────────────────────────────────
@@ -323,8 +329,11 @@ def upcoming_booking_list(bookings):
     return out
 
 
-def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleaner):
+def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleaner, labels):
     """Ask Haiku to interpret a single inbound WhatsApp message in context.
+
+    `history` is the full cross-group message archive (volume is low enough to
+    just pass everything). `labels` is {group_jid: human_label}.
 
     Returns ({booking_uid, cleaner, action, confidence, reason}, None) or
     (None, error_str). `action` is "confirm", "decline", or "none".
@@ -334,9 +343,10 @@ def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleane
 
     booking_list = upcoming_booking_list(bookings)
     history_lines = []
-    for h in history[-10:]:
+    for h in history:
+        grp = labels.get(h.get("group")) or h.get("group") or "unknown-group"
         sender_label = h.get("sender") or "unknown"
-        history_lines.append(f"[{h.get('timestamp','')}] {sender_label}: {h.get('text','')}")
+        history_lines.append(f"[{h.get('timestamp','')}] ({grp}) {sender_label}: {h.get('text','')}")
     history_text = "\n".join(history_lines) if history_lines else "(no prior messages)"
 
     sender_hint = (
@@ -344,6 +354,7 @@ def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleane
         if sender_cleaner
         else "This sender is not yet mapped to a known cleaner."
     )
+    this_group = labels.get(msg.get("group")) or msg.get("group") or "unknown-group"
 
     prompt = f"""You interpret a single incoming WhatsApp message from a house-cleaning group chat.
 
@@ -353,15 +364,15 @@ Known cleaners: {json.dumps(known_cleaners)}
 Upcoming bookings (checkout date = cleaning day):
 {json.dumps(booking_list)}
 
-Prior messages in this group (most recent last):
+Message archive across all groups (most recent last). Each line is [timestamp] (group) sender: text.
 ---
 {history_text}
 ---
 
-The new message (from {msg.get('sender','unknown')} at {msg.get('timestamp','')}):
+The new message (from {msg.get('sender','unknown')} in group "{this_group}" at {msg.get('timestamp','')}):
 {msg.get('text','')}
 
-Decide whether this message is the cleaner confirming or declining a specific cleaning. Short replies like "yes"/"ok"/"can do"/"sorry full" are only meaningful relative to the prior chatter. If the message isn't actionable (chit-chat, question, unrelated) return action "none".
+Decide whether this message is the cleaner confirming or declining a specific cleaning. Short replies like "yes"/"ok"/"can do"/"sorry full" are only meaningful relative to the prior chatter — use the archive to resolve ambiguity. Messages from other groups may still be useful context (e.g. Michelle approving a plan in the host chat). If the message isn't actionable (chit-chat, question, unrelated) return action "none".
 
 Return ONLY valid JSON, no other text:
 {{"action":"confirm|decline|none","booking_uid":"uid or null","cleaner":"cleaner name or null","confidence":0.0,"reason":"one short sentence"}}"""
@@ -445,13 +456,15 @@ def process_message(msg_id):
         if msg.get("parsed"):
             return
         # Snapshot everything we need, then release the lock while we call the
-        # API. Re-acquire on write.
-        history = [m for m in data["messages"] if m.get("group") == msg.get("group") and m.get("id") != msg_id]
+        # API. Re-acquire on write. Volume is low, so pass the full archive
+        # across all groups rather than a per-group window.
+        history = [m for m in data["messages"] if m.get("id") != msg_id]
         bookings = dict(data.get("bookings", {}))
         known = cleaner_names()
         sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
+        labels = dict(data.get("group_labels", {}))
 
-    result, error = parse_whatsapp_message(msg, history, bookings, known, sender_cleaner)
+    result, error = parse_whatsapp_message(msg, history, bookings, known, sender_cleaner, labels)
 
     with DATA_LOCK:
         data = load_data()
@@ -1028,11 +1041,29 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
     Inbound messages parsed by Haiku that need a human decision.
   </p>
 
+  {% if groups %}
+  <h3 style="font-size:0.95rem;margin:14px 0 8px;">Groups</h3>
+  <p class="subtitle" style="font-size:0.8rem;margin-bottom:8px;">
+    Human-friendly names shown to the LLM instead of opaque JIDs.
+  </p>
+  {% for g in groups %}
+  <div class="card" style="padding:10px;">
+    <form action="{{ prefix }}/review/label_group" method="POST" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+      <input type="hidden" name="jid" value="{{ g.jid }}">
+      <span style="font-size:0.75rem;color:#666;font-family:monospace;flex:1;min-width:180px;word-break:break-all;">{{ g.jid }}</span>
+      <span style="font-size:0.75rem;color:#999;">{{ g.count }} msg{{ 's' if g.count != 1 }}</span>
+      <input type="text" name="label" value="{{ g.label }}" placeholder="label (e.g. Maria group)" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
+      <button type="submit" class="btn btn-sm btn-outline">Save</button>
+    </form>
+  </div>
+  {% endfor %}
+  {% endif %}
+
   {% if unmapped_senders %}
   <h3 style="font-size:0.95rem;margin:14px 0 8px;color:#fd7e14;">Unmapped senders</h3>
   {% for u in unmapped_senders %}
   <div class="card" style="border-left-color:#fd7e14;">
-    <div style="font-size:0.85rem;color:#666;">{{ u.jid }} · in {{ u.group }} · {{ u.timestamp }}</div>
+    <div style="font-size:0.85rem;color:#666;">{{ u.jid }} · in {{ u.group_label }} · {{ u.timestamp }}</div>
     <div style="margin:6px 0;font-size:0.9rem;">{{ u.first_text }}</div>
     <form action="{{ prefix }}/review/map" method="POST" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px;">
       <input type="hidden" name="jid" value="{{ u.jid }}">
@@ -1921,6 +1952,7 @@ def whatsapp_inbound():
 def _build_review_context(data):
     """Gather pending messages + what would change if accepted."""
     bookings = data.get("bookings", {})
+    labels = data.get("group_labels", {})
     jid_map = cleaner_jid_map(data)
     known_jids = set()
     for jids in jid_map.values():
@@ -1933,10 +1965,12 @@ def _build_review_context(data):
             continue
         sender = m.get("sender") or ""
         if sender and sender not in known_jids and sender not in unmapped_senders:
+            grp = m.get("group")
             unmapped_senders[sender] = {
                 "jid": sender,
                 "first_text": m.get("text", "")[:200],
-                "group": m.get("group"),
+                "group": grp,
+                "group_label": labels.get(grp) or grp,
                 "timestamp": m.get("timestamp"),
             }
         res = m.get("haiku_result") or {}
@@ -1986,11 +2020,26 @@ def _build_review_context(data):
         })
     options.sort(key=lambda x: x["end"])
 
+    # Build the groups list for the label-editing UI. Every distinct group
+    # that has ever sent a message shows up here with its current label (if
+    # any) and a message count.
+    group_counts = {}
+    for m in data.get("messages", []):
+        g = m.get("group")
+        if g:
+            group_counts[g] = group_counts.get(g, 0) + 1
+    labels = data.get("group_labels", {})
+    groups = [
+        {"jid": jid, "label": labels.get(jid, ""), "count": n}
+        for jid, n in sorted(group_counts.items(), key=lambda x: -x[1])
+    ]
+
     return {
         "pending": pending,
         "pending_count": len(pending),
         "unmapped_senders": list(unmapped_senders.values()),
         "booking_options": options,
+        "groups": groups,
     }
 
 
@@ -2014,6 +2063,24 @@ def review_accept(msg_id):
             msg["review_state"] = "auto"
             msg["applied_uid"] = booking_uid
             save_data(data)
+    return redirect(ingress_prefix() + "/#review")
+
+
+@app.route("/review/label_group", methods=["POST"])
+def review_label_group():
+    """Set a human-friendly label for a group JID."""
+    jid = request.form.get("jid", "").strip()
+    label = request.form.get("label", "").strip()
+    if not jid:
+        return redirect(ingress_prefix() + "/#review")
+    with DATA_LOCK:
+        data = load_data()
+        labels = data.setdefault("group_labels", {})
+        if label:
+            labels[jid] = label
+        else:
+            labels.pop(jid, None)
+        save_data(data)
     return redirect(ingress_prefix() + "/#review")
 
 
