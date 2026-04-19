@@ -8,11 +8,14 @@ import calendar
 import hashlib
 import json
 import os
+import queue
+import threading
+import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template_string, request, redirect, jsonify
+from flask import Flask, render_template_string, request, redirect, jsonify, abort
 
 app = Flask(__name__)
 
@@ -52,12 +55,61 @@ def load_data():
     for uid, b in data.get("bookings", {}).items():
         if "type" not in b:
             b["type"] = "manual_cleaning" if uid.startswith("manual-") else "airbnb"
+    data.setdefault("messages", [])
+    data.setdefault("cleaner_jids", {})
     return data
 
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+# ── Data lock ────────────────────────────────────────────────────────────────
+# Serializes reads/writes against data.json. The parse worker mutates messages
+# and bookings concurrently with Flask request handlers.
+
+DATA_LOCK = threading.RLock()
+
+
+# ── Cleaner config helpers ───────────────────────────────────────────────────
+# CLEANERS from config.yaml is a list of strings today. We also support an
+# object form {"name": "...", "whatsapp": ["jid", ...]} for forward-compat.
+
+def cleaner_names():
+    """Return the list of cleaner display names, regardless of config shape."""
+    names = []
+    for c in CLEANERS:
+        if isinstance(c, str):
+            names.append(c)
+        elif isinstance(c, dict) and c.get("name"):
+            names.append(c["name"])
+    return names
+
+
+def cleaner_jid_map(data):
+    """Merge JIDs from config.yaml (if present) with runtime data.cleaner_jids.
+
+    Returns {cleaner_name: [jid, ...]}. Runtime data wins on conflict.
+    """
+    merged = {}
+    for c in CLEANERS:
+        if isinstance(c, dict) and c.get("name") and c.get("whatsapp"):
+            merged[c["name"]] = list(c["whatsapp"])
+    for name, jids in data.get("cleaner_jids", {}).items():
+        merged.setdefault(name, [])
+        for jid in jids:
+            if jid not in merged[name]:
+                merged[name].append(jid)
+    return merged
+
+
+def lookup_cleaner_by_jid(data, jid):
+    """Return the cleaner name mapped to this JID, or None."""
+    for name, jids in cleaner_jid_map(data).items():
+        if jid in jids:
+            return name
+    return None
 
 
 # ── Cleaner color ─────────────────────────────────────────────────────────────
@@ -234,6 +286,241 @@ Return ONLY valid JSON, no other text. Keep notes very short (under 10 words). O
         return None, f"Failed to parse LLM response as JSON: {e}"
     except Exception as e:
         return None, f"Error calling Anthropic API: {e}"
+
+
+# ── Inbound WhatsApp: message parsing with chat context ─────────────────────
+
+# Auto-apply threshold. Haiku-returned confidence ≥ this value AND a known
+# cleaner AND an unambiguous booking → apply directly to the booking. Anything
+# else lands in the review queue.
+AUTO_APPLY_CONFIDENCE = 0.85
+
+
+def upcoming_booking_list(bookings):
+    """Booking list shown to the LLM — checkout within recent past + future."""
+    today = date.today()
+    out = []
+    for uid, b in bookings.items():
+        if b.get("status") != "active":
+            continue
+        try:
+            end = datetime.strptime(b["end"], "%Y-%m-%d").date()
+            start = datetime.strptime(b["start"], "%Y-%m-%d").date()
+        except (ValueError, TypeError, KeyError):
+            continue
+        # Include cleanings from 3 days ago up to 60 days ahead — short replies
+        # like "yes" may arrive after the actual clean date for past tense.
+        if end < today - timedelta(days=3) or end > today + timedelta(days=60):
+            continue
+        out.append({
+            "uid": uid,
+            "checkin": b["start"],
+            "checkout": b["end"],
+            "label": f"{start.strftime('%b %d')} → {end.strftime('%b %d')}",
+            "current_cleaner": b.get("cleaner"),
+        })
+    out.sort(key=lambda x: x["checkout"])
+    return out
+
+
+def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleaner):
+    """Ask Haiku to interpret a single inbound WhatsApp message in context.
+
+    Returns ({booking_uid, cleaner, action, confidence, reason}, None) or
+    (None, error_str). `action` is "confirm", "decline", or "none".
+    """
+    if not ANTHROPIC_API_KEY:
+        return None, "No Anthropic API key configured."
+
+    booking_list = upcoming_booking_list(bookings)
+    history_lines = []
+    for h in history[-10:]:
+        sender_label = h.get("sender") or "unknown"
+        history_lines.append(f"[{h.get('timestamp','')}] {sender_label}: {h.get('text','')}")
+    history_text = "\n".join(history_lines) if history_lines else "(no prior messages)"
+
+    sender_hint = (
+        f"This sender is known to be cleaner: {sender_cleaner}."
+        if sender_cleaner
+        else "This sender is not yet mapped to a known cleaner."
+    )
+
+    prompt = f"""You interpret a single incoming WhatsApp message from a house-cleaning group chat.
+
+Known cleaners: {json.dumps(known_cleaners)}
+{sender_hint}
+
+Upcoming bookings (checkout date = cleaning day):
+{json.dumps(booking_list)}
+
+Prior messages in this group (most recent last):
+---
+{history_text}
+---
+
+The new message (from {msg.get('sender','unknown')} at {msg.get('timestamp','')}):
+{msg.get('text','')}
+
+Decide whether this message is the cleaner confirming or declining a specific cleaning. Short replies like "yes"/"ok"/"can do"/"sorry full" are only meaningful relative to the prior chatter. If the message isn't actionable (chit-chat, question, unrelated) return action "none".
+
+Return ONLY valid JSON, no other text:
+{{"action":"confirm|decline|none","booking_uid":"uid or null","cleaner":"cleaner name or null","confidence":0.0,"reason":"one short sentence"}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        text = result["content"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0]
+        parsed = json.loads(text)
+        return parsed, None
+    except requests.exceptions.HTTPError as e:
+        return None, f"Anthropic API error: {e.response.status_code} - {e.response.text[:200]}"
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        return None, f"Failed to parse LLM response: {e}"
+    except Exception as e:
+        return None, f"Error calling Anthropic API: {e}"
+
+
+# ── Message queue + worker ──────────────────────────────────────────────────
+# Single module-level queue; a worker thread drains it and calls Haiku. This
+# keeps the Flask request handler fast and bounds Anthropic API concurrency.
+# Pool size 2 is deliberately small — burst traffic in one group shouldn't
+# fan out unbounded requests.
+
+MESSAGE_QUEUE = queue.Queue()
+_WORKERS_STARTED = False
+_WORKERS_LOCK = threading.Lock()
+
+
+def enqueue_message(msg_id):
+    MESSAGE_QUEUE.put(msg_id)
+
+
+def _message_worker():
+    while True:
+        msg_id = MESSAGE_QUEUE.get()
+        try:
+            process_message(msg_id)
+        except Exception as e:
+            # Worker must never die — log and continue.
+            print(f"[worker] error processing {msg_id}: {e}")
+        finally:
+            MESSAGE_QUEUE.task_done()
+
+
+def ensure_workers_started(pool_size=2):
+    global _WORKERS_STARTED
+    with _WORKERS_LOCK:
+        if _WORKERS_STARTED:
+            return
+        for i in range(pool_size):
+            t = threading.Thread(target=_message_worker, daemon=True, name=f"wa-worker-{i}")
+            t.start()
+        _WORKERS_STARTED = True
+
+
+def process_message(msg_id):
+    """Parse one inbound message with Haiku; auto-apply or flag for review."""
+    with DATA_LOCK:
+        data = load_data()
+        msg = _find_message(data, msg_id)
+        if not msg:
+            return
+        if msg.get("parsed"):
+            return
+        # Snapshot everything we need, then release the lock while we call the
+        # API. Re-acquire on write.
+        history = [m for m in data["messages"] if m.get("group") == msg.get("group") and m.get("id") != msg_id]
+        bookings = dict(data.get("bookings", {}))
+        known = cleaner_names()
+        sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
+
+    result, error = parse_whatsapp_message(msg, history, bookings, known, sender_cleaner)
+
+    with DATA_LOCK:
+        data = load_data()
+        msg = _find_message(data, msg_id)
+        if not msg:
+            return
+        msg["parsed"] = True
+        msg["parse_error"] = error
+        msg["haiku_result"] = result
+
+        if error or not result:
+            msg["review_state"] = "pending"
+            save_data(data)
+            return
+
+        action = (result.get("action") or "none").lower()
+        confidence = float(result.get("confidence") or 0.0)
+        booking_uid = result.get("booking_uid")
+        cleaner = result.get("cleaner") or sender_cleaner
+
+        sender_known = sender_cleaner is not None
+        booking_known = booking_uid and booking_uid in data.get("bookings", {})
+        auto = (
+            action in ("confirm", "decline")
+            and confidence >= AUTO_APPLY_CONFIDENCE
+            and sender_known
+            and booking_known
+            and cleaner in known
+        )
+
+        if action == "none":
+            msg["review_state"] = "ignored"
+        elif auto:
+            _apply_booking_change(data, booking_uid, cleaner, action, msg)
+            msg["review_state"] = "auto"
+            msg["applied_uid"] = booking_uid
+        else:
+            msg["review_state"] = "pending"
+
+        save_data(data)
+
+
+def _find_message(data, msg_id):
+    for m in data.get("messages", []):
+        if m.get("id") == msg_id:
+            return m
+    return None
+
+
+def _apply_booking_change(data, booking_uid, cleaner_name, action, msg):
+    """Apply a confirm/decline to a booking. Caller holds DATA_LOCK."""
+    booking = data["bookings"].get(booking_uid)
+    if not booking:
+        return
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    if action == "confirm":
+        if cleaner_name and not booking.get("cleaner"):
+            booking["cleaner"] = cleaner_name
+            booking["cleaner_since"] = now
+        booking["confirmed"] = True
+    elif action == "decline":
+        # Clear the cleaner so the booking surfaces as "needs cleaner" again.
+        # Preserve notes so the history of what the cleaner said is visible.
+        if booking.get("cleaner") == cleaner_name:
+            booking["cleaner"] = None
+            booking["cleaner_since"] = None
+        booking["confirmed"] = False
+    # Record the message id that last mutated this booking.
+    booking["last_wa_msg_id"] = msg.get("id")
 
 
 # ── HTML Templates ───────────────────────────────────────────────────────────
@@ -720,15 +1007,95 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   <a href="{{ prefix }}/print" class="btn btn-outline">Print Month</a>
 </div>
 
-<!-- Top-level tabs: Calendar / List -->
+<!-- Top-level tabs: Calendar / List / Review -->
 <div class="top-tabs">
   <button class="top-tab active" onclick="showTopTab('calendar-tab', this)">Calendar</button>
   <button class="top-tab" onclick="showTopTab('list-tab', this)">List</button>
+  <button class="top-tab" onclick="showTopTab('review-tab', this)" id="review-tab-btn">
+    Review{% if pending_count %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ pending_count }}</span>{% endif %}
+  </button>
 </div>
 
 <!-- Calendar panel -->
 <div id="calendar-tab" class="top-panel active">
   <div id="calendar"></div>
+</div>
+
+<!-- Review panel -->
+<div id="review-tab" class="top-panel">
+  <h2 style="font-size:1.05rem;margin-bottom:8px;">WhatsApp Review Queue</h2>
+  <p class="subtitle" style="margin-bottom:12px;">
+    Inbound messages parsed by Haiku that need a human decision.
+  </p>
+
+  {% if unmapped_senders %}
+  <h3 style="font-size:0.95rem;margin:14px 0 8px;color:#fd7e14;">Unmapped senders</h3>
+  {% for u in unmapped_senders %}
+  <div class="card" style="border-left-color:#fd7e14;">
+    <div style="font-size:0.85rem;color:#666;">{{ u.jid }} · in {{ u.group }} · {{ u.timestamp }}</div>
+    <div style="margin:6px 0;font-size:0.9rem;">{{ u.first_text }}</div>
+    <form action="{{ prefix }}/review/map" method="POST" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px;">
+      <input type="hidden" name="jid" value="{{ u.jid }}">
+      <select name="cleaner" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;">
+        <option value="">-- map to existing cleaner --</option>
+        {% for c in cleaners %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </select>
+      <span style="font-size:0.85rem;color:#666;">or</span>
+      <input type="text" name="new_cleaner" placeholder="new cleaner name" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
+      <button type="submit" class="btn btn-sm btn-primary">Save mapping</button>
+    </form>
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <h3 style="font-size:0.95rem;margin:14px 0 8px;">Pending messages</h3>
+  {% if not pending %}
+  <div class="empty">No messages pending review.</div>
+  {% endif %}
+  {% for m in pending %}
+  <div class="card">
+    <div style="font-size:0.8rem;color:#666;">
+      {{ m.timestamp }} · from {{ m.sender_cleaner or m.sender }}
+      {% if not m.sender_cleaner %}<span style="color:#fd7e14;"> · unmapped</span>{% endif %}
+    </div>
+    <div style="margin:6px 0;font-size:0.95rem;white-space:pre-wrap;">{{ m.text }}</div>
+    <div style="font-size:0.85rem;color:#555;background:#f8f9fa;padding:6px 8px;border-radius:6px;margin-top:6px;">
+      {% if m.parse_error %}
+        <strong>Parse error:</strong> {{ m.parse_error }}
+      {% elif m.haiku_action == 'none' or not m.haiku_action %}
+        <strong>Haiku:</strong> not actionable{% if m.haiku_reason %} — {{ m.haiku_reason }}{% endif %}
+      {% else %}
+        <strong>Haiku suggests:</strong> {{ m.haiku_action }}
+        {% if m.haiku_booking_label %} for {{ m.haiku_booking_label }}{% endif %}
+        {% if m.haiku_cleaner %} by {{ m.haiku_cleaner }}{% endif %}
+        {% if m.haiku_confidence is not none %} (conf {{ '%.0f' | format(m.haiku_confidence * 100) }}%){% endif %}
+        {% if m.haiku_reason %}<div style="font-size:0.8rem;color:#666;margin-top:2px;">{{ m.haiku_reason }}</div>{% endif %}
+      {% endif %}
+    </div>
+    <form action="{{ prefix }}/review/accept/{{ m.id }}" method="POST" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+      <select name="booking_uid" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
+        <option value="">-- booking --</option>
+        {% for opt in booking_options %}
+        <option value="{{ opt.uid }}" {{ 'selected' if opt.uid == m.haiku_booking_uid }}>{{ opt.label }}</option>
+        {% endfor %}
+      </select>
+      <select name="action" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
+        <option value="confirm" {{ 'selected' if m.haiku_action == 'confirm' }}>confirm</option>
+        <option value="decline" {{ 'selected' if m.haiku_action == 'decline' }}>decline</option>
+      </select>
+      <select name="cleaner" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
+        <option value="">-- cleaner --</option>
+        {% for c in cleaners %}
+        <option value="{{ c }}" {{ 'selected' if (m.haiku_cleaner or m.sender_cleaner) == c }}>{{ c }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn btn-sm btn-success">Accept</button>
+    </form>
+    <form action="{{ prefix }}/review/ignore/{{ m.id }}" method="POST" style="display:inline-block;margin-top:4px;">
+      <button type="submit" class="btn btn-sm btn-outline">Ignore</button>
+    </form>
+  </div>
+  {% endfor %}
 </div>
 
 <!-- List panel — existing UI embedded inline -->
@@ -743,7 +1110,16 @@ function showTopTab(id, btn) {
   document.querySelectorAll('.top-panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  btn.classList.add('active');
+  if (btn) btn.classList.add('active');
+  history.replaceState(null, '', '#' + id.replace('-tab',''));
+}
+
+// Restore the active tab from the URL hash on load (e.g. #review).
+if (location.hash === '#review') {
+  document.addEventListener('DOMContentLoaded', function() {
+    var btn = document.getElementById('review-tab-btn');
+    showTopTab('review-tab', btn);
+  });
 }
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -1157,7 +1533,7 @@ def build_view_data(data):
         "confirmed_count": confirmed_count,
         "upcoming_count": len(upcoming),
         "last_sync": last_sync,
-        "cleaners": CLEANERS,
+        "cleaners": cleaner_names(),
         "prefix": ingress_prefix(),
         "no_ical": not ICAL_URL,
     }
@@ -1263,11 +1639,13 @@ def build_print_data(month_str: str, bookings: dict) -> dict:
 def index():
     data = load_data()
     ctx = build_view_data(data)
+    review = _build_review_context(data)
     return render_template_string(
         CALENDAR_TEMPLATE, error=request.args.get("error"),
         wa_text=None, wa_parsed=None, wa_error=None, wa_applied=0,
         wa_booking_options=[],
         **ctx,
+        **review,
     )
 
 
@@ -1321,7 +1699,7 @@ def edit(uid):
         EDIT_TEMPLATE,
         uid=uid,
         booking=booking,
-        cleaners=CLEANERS,
+        cleaners=cleaner_names(),
         prefix=ingress_prefix(),
         deletable=booking.get("type") in ("custom_stay", "manual_cleaning"),
     )
@@ -1342,7 +1720,7 @@ def add():
     if request.method == "GET":
         prefill_date = request.args.get("date", "")
         return render_template_string(
-            ADD_TEMPLATE, cleaners=CLEANERS, prefix=ingress_prefix(),
+            ADD_TEMPLATE, cleaners=cleaner_names(), prefix=ingress_prefix(),
             prefill_date=prefill_date,
         )
 
@@ -1496,6 +1874,193 @@ def resolve(uid):
     return redirect(ingress_prefix() + "/")
 
 
+@app.route("/internal/whatsapp/inbound", methods=["POST"])
+def whatsapp_inbound():
+    """Accept a single WhatsApp message from the local Baileys sidecar.
+
+    Loopback-only. Dedups on message id (Baileys replays on reconnect).
+    Appends to data.messages and enqueues for the parse worker.
+    """
+    remote = request.remote_addr or ""
+    if remote not in ("127.0.0.1", "::1"):
+        abort(403)
+
+    payload = request.get_json(silent=True) or {}
+    msg_id = (payload.get("id") or "").strip()
+    text = payload.get("text") or ""
+    sender = (payload.get("sender_jid") or "").strip()
+    group = (payload.get("group_jid") or "").strip()
+    ts = (payload.get("timestamp") or "").strip()
+
+    if not msg_id or not text or not sender or not group:
+        return jsonify({"error": "missing required fields"}), 400
+
+    with DATA_LOCK:
+        data = load_data()
+        if _find_message(data, msg_id):
+            return jsonify({"status": "duplicate", "id": msg_id})
+        data["messages"].append({
+            "id": msg_id,
+            "timestamp": ts or datetime.now().isoformat(timespec="seconds"),
+            "sender": sender,
+            "group": group,
+            "text": text,
+            "parsed": False,
+            "applied_uid": None,
+            "review_state": "pending",
+        })
+        save_data(data)
+
+    ensure_workers_started()
+    enqueue_message(msg_id)
+    return jsonify({"status": "queued", "id": msg_id})
+
+
+# ── Review queue routes ─────────────────────────────────────────────────────
+
+def _build_review_context(data):
+    """Gather pending messages + what would change if accepted."""
+    bookings = data.get("bookings", {})
+    jid_map = cleaner_jid_map(data)
+    known_jids = set()
+    for jids in jid_map.values():
+        known_jids.update(jids)
+
+    pending = []
+    unmapped_senders = {}  # sender_jid -> first msg preview
+    for m in data.get("messages", []):
+        if m.get("review_state") != "pending":
+            continue
+        sender = m.get("sender") or ""
+        if sender and sender not in known_jids and sender not in unmapped_senders:
+            unmapped_senders[sender] = {
+                "jid": sender,
+                "first_text": m.get("text", "")[:200],
+                "group": m.get("group"),
+                "timestamp": m.get("timestamp"),
+            }
+        res = m.get("haiku_result") or {}
+        booking_uid = res.get("booking_uid")
+        booking = bookings.get(booking_uid) if booking_uid else None
+        booking_label = None
+        if booking:
+            try:
+                s = datetime.strptime(booking["start"], "%Y-%m-%d").date()
+                e = datetime.strptime(booking["end"], "%Y-%m-%d").date()
+                booking_label = f"{s.strftime('%b %d')} → {e.strftime('%b %d')}"
+            except (ValueError, KeyError):
+                booking_label = booking_uid
+        pending.append({
+            "id": m.get("id"),
+            "timestamp": m.get("timestamp"),
+            "sender": sender,
+            "sender_cleaner": lookup_cleaner_by_jid(data, sender),
+            "group": m.get("group"),
+            "text": m.get("text", ""),
+            "haiku_action": res.get("action"),
+            "haiku_cleaner": res.get("cleaner"),
+            "haiku_confidence": res.get("confidence"),
+            "haiku_reason": res.get("reason"),
+            "haiku_booking_uid": booking_uid,
+            "haiku_booking_label": booking_label,
+            "parse_error": m.get("parse_error"),
+        })
+
+    # Build booking options for manual assignment in review UI
+    today = date.today()
+    options = []
+    for uid, b in bookings.items():
+        if b.get("status") != "active":
+            continue
+        try:
+            end = datetime.strptime(b["end"], "%Y-%m-%d").date()
+            start = datetime.strptime(b["start"], "%Y-%m-%d").date()
+        except (ValueError, KeyError):
+            continue
+        if end < today - timedelta(days=7):
+            continue
+        options.append({
+            "uid": uid,
+            "label": f"{start.strftime('%b %d')} → {end.strftime('%b %d')} ({b.get('cleaner') or 'unassigned'})",
+            "end": b["end"],
+        })
+    options.sort(key=lambda x: x["end"])
+
+    return {
+        "pending": pending,
+        "pending_count": len(pending),
+        "unmapped_senders": list(unmapped_senders.values()),
+        "booking_options": options,
+    }
+
+
+@app.route("/review/accept/<msg_id>", methods=["POST"])
+def review_accept(msg_id):
+    """Apply Haiku's suggestion (or a user-overridden version) to the booking."""
+    override_uid = request.form.get("booking_uid", "").strip()
+    override_action = request.form.get("action", "").strip()
+    override_cleaner = request.form.get("cleaner", "").strip()
+    with DATA_LOCK:
+        data = load_data()
+        msg = _find_message(data, msg_id)
+        if not msg:
+            return redirect(ingress_prefix() + "/#review")
+        res = msg.get("haiku_result") or {}
+        booking_uid = override_uid or res.get("booking_uid")
+        action = override_action or res.get("action") or "confirm"
+        cleaner = override_cleaner or res.get("cleaner") or lookup_cleaner_by_jid(data, msg.get("sender"))
+        if booking_uid and booking_uid in data.get("bookings", {}) and action in ("confirm", "decline"):
+            _apply_booking_change(data, booking_uid, cleaner, action, msg)
+            msg["review_state"] = "auto"
+            msg["applied_uid"] = booking_uid
+            save_data(data)
+    return redirect(ingress_prefix() + "/#review")
+
+
+@app.route("/review/ignore/<msg_id>", methods=["POST"])
+def review_ignore(msg_id):
+    with DATA_LOCK:
+        data = load_data()
+        msg = _find_message(data, msg_id)
+        if msg:
+            msg["review_state"] = "ignored"
+            save_data(data)
+    return redirect(ingress_prefix() + "/#review")
+
+
+@app.route("/review/map", methods=["POST"])
+def review_map_sender():
+    """Map a WhatsApp sender JID to a cleaner name. Either maps to an existing
+    cleaner (from the dropdown) or records a new name in data.cleaner_jids.
+    After mapping, re-queue any of this sender's pending messages for a fresh
+    parse so the sender hint applies.
+    """
+    jid = request.form.get("jid", "").strip()
+    cleaner = request.form.get("cleaner", "").strip()
+    new_name = request.form.get("new_cleaner", "").strip()
+    target = cleaner or new_name
+    if not jid or not target:
+        return redirect(ingress_prefix() + "/#review")
+    with DATA_LOCK:
+        data = load_data()
+        jids = data.setdefault("cleaner_jids", {}).setdefault(target, [])
+        if jid not in jids:
+            jids.append(jid)
+        # Re-queue this sender's pending messages
+        requeue = []
+        for m in data.get("messages", []):
+            if m.get("sender") == jid and m.get("review_state") == "pending":
+                m["parsed"] = False
+                m["haiku_result"] = None
+                m["parse_error"] = None
+                requeue.append(m["id"])
+        save_data(data)
+    ensure_workers_started()
+    for mid in requeue:
+        enqueue_message(mid)
+    return redirect(ingress_prefix() + "/#review")
+
+
 @app.route("/events.json")
 def events_json():
     data = load_data()
@@ -1613,6 +2178,9 @@ if __name__ == "__main__":
             print("Sync complete!")
     else:
         print("No iCal URL configured — skipping initial sync.")
+
+    ensure_workers_started()
+    print("WhatsApp parse workers started (pool=2).")
 
     print("\nStarting server at http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)
