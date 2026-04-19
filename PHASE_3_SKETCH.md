@@ -1,5 +1,74 @@
 # Phase 3 Plan — WhatsApp automation
 
+## Current status (2026-04-19)
+
+**Step 1 is complete and merged to `Calendar-Redo`** (commits `8969f9b`,
+`66a85e4`; add-on `1.5.1`). Built against synthetic messages; no real
+WhatsApp traffic yet.
+
+Shipped:
+
+- `data.json` schema extended with `messages`, `cleaner_jids`, and
+  `group_labels`. All backwards-compatible defaults.
+- `POST /internal/whatsapp/inbound` — loopback-only, dedups on message
+  id, enqueues to a 2-thread worker pool.
+- Haiku parse worker: passes the **full cross-group archive** + booking
+  list + known cleaners + sender hint. Returns
+  `{action, booking_uid, cleaner, confidence, reason}`.
+- Auto-apply gate: confidence ≥ 0.85 + known cleaner JID + known
+  booking → writes to booking. Everything else → Review tab.
+- Review tab in the index page with:
+  - Groups section (label editor — "Maria group" instead of a JID).
+  - Unmapped-sender flow (map to existing cleaner OR create new one;
+    re-queues that sender's pending messages on save).
+  - Pending messages with accept/override/ignore controls.
+  - Pending-count badge on the tab.
+- `scripts/whatsapp_fixture.py` — synthetic-message harness covering
+  confirm / decline / ambiguous / unmapped / chitchat.
+
+Deviations from the original Step 1 sketch (recorded here so the
+motivation isn't lost):
+
+- **History window**: the plan said "last 10 messages in the same
+  group." At observed volume (<1 message/day across all chats) it's
+  cheaper and smarter to hand Haiku the entire archive across all
+  groups. Revisit if volume ever climbs above ~10/day.
+- **No tool-use**: the earlier design considered a
+  `search_messages` / `list_groups` tool the model could call. Dropped
+  — at this volume the archive fits in one prompt, so there's nothing
+  for the tool to do. Preserve the sketch below under "Deferred" in
+  case volume changes.
+- **No retention / compaction**: a monthly Sonnet pruning pass was
+  considered and dropped for the same reason. `data.json` grows
+  linearly at <400 messages/year; revisit only if the file itself
+  becomes slow.
+
+## Next steps
+
+1. **Step 2 — user procures bot account** (blocking; see below). Nothing
+   for the assistant to do until this is done.
+2. **Step 3 — wire Baileys sidecar** once the account exists. Details
+   unchanged from the original sketch below.
+3. After Step 3 is paired to a real group: week-long observation with
+   auto-apply disabled, then tune the 0.85 confidence threshold + the
+   parse prompt against real messages.
+4. Add the host/Michelle chat (third group) once the bot has been
+   trusted in one cleaner group.
+
+## Deferred (revisit if volume grows past ~10 msg/day)
+
+- Tool-use for the LLM: `search_messages(group?, since?, limit?, text?)`
+  and `list_groups()` as loopback-only Flask routes, fed into the
+  Anthropic request's `tools` field. Would let the model pull its own
+  context window instead of receiving the full archive every time.
+- Monthly Sonnet compaction: wake on a day-cadence daemon, pass
+  batches of messages older than 60 days + still-relevant bookings,
+  soft-delete anything that only references past dates. Archive to
+  `/data/messages-archive.jsonl`. Preserve standing arrangements
+  ("Maria can't do Sundays") by prompt.
+
+---
+
 ## Route
 
 **Baileys sidecar** (unofficial linked-device). Route A (WhatsApp Cloud
@@ -9,10 +78,13 @@ the bot only operates in visible, human-auditable chats.
 
 ## Three-step rollout
 
-### Step 1 — Build against fake data
+### Step 1 — Build against fake data  ✅ DONE
 
 Everything except the Baileys link is built and tested first, using
 synthetic inbound messages. Zero WhatsApp risk.
+
+> Status: shipped in `8969f9b` + `66a85e4`. See "Current status" above
+> for what was built and what was simplified from this plan.
 
 **Add-on changes** (`cleaning-tracker/app.py`):
 
@@ -58,7 +130,7 @@ synthetic inbound messages. Zero WhatsApp risk.
 - Verify the review queue, auto-apply thresholds, and the mapping
   flow before any real WhatsApp account is involved.
 
-### Step 2 — User procures the number and account
+### Step 2 — User procures the number and account  ⏳ BLOCKED (user action)
 
 User, not assistant:
 
@@ -70,7 +142,7 @@ User, not assistant:
 
 Nothing technical on the add-on side during this step.
 
-### Step 3 — Wire Baileys to the supplied account
+### Step 3 — Wire Baileys to the supplied account  ⏳ blocked on Step 2
 
 User supplies the new number/account; assistant does the integration.
 
