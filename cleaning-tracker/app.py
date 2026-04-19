@@ -4,13 +4,15 @@ A simple web app to manage cleaning schedules from Airbnb bookings.
 Paste WhatsApp chat logs to verify cleaner confirmations.
 """
 
+import calendar
+import hashlib
 import json
 import os
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, render_template_string, request, redirect, jsonify
 
 app = Flask(__name__)
 
@@ -44,13 +46,40 @@ def ingress_prefix():
 def load_data():
     if DATA_FILE.exists():
         with open(DATA_FILE) as f:
-            return json.load(f)
-    return {"bookings": {}, "last_sync": None}
+            data = json.load(f)
+    else:
+        data = {"bookings": {}, "last_sync": None}
+    for uid, b in data.get("bookings", {}).items():
+        if "type" not in b:
+            b["type"] = "manual_cleaning" if uid.startswith("manual-") else "airbnb"
+    return data
 
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+# ── Cleaner color ─────────────────────────────────────────────────────────────
+
+def cleaner_color(name: str) -> str:
+    """Return a stable #RRGGBB color derived from the cleaner's name."""
+    if not name:
+        return "#9ca3af"
+    digest = hashlib.md5(name.encode()).hexdigest()
+    hue = int(digest[:4], 16) % 360
+    s, l = 0.65, 0.55
+    # HSL → RGB (C = chroma, X = intermediate, m = offset)
+    c = (1 - abs(2 * l - 1)) * s
+    x = c * (1 - abs((hue / 60) % 2 - 1))
+    m = l - c / 2
+    sector = int(hue / 60)
+    rgb_f = [
+        (c, x, 0), (x, c, 0), (0, c, x),
+        (0, x, c), (x, 0, c), (c, 0, x),
+    ][sector]
+    r, g, b = (round((v + m) * 255) for v in rgb_f)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ── iCal sync ────────────────────────────────────────────────────────────────
@@ -110,7 +139,7 @@ def sync_ical():
 
     today = date.today()
     for uid, b in data["bookings"].items():
-        if uid.startswith("manual-"):
+        if b.get("type", "airbnb") != "airbnb":
             continue
         if uid not in seen_uids:
             end_dt = datetime.strptime(b["end"], "%Y-%m-%d").date()
@@ -207,16 +236,10 @@ Return ONLY valid JSON, no other text. Keep notes very short (under 10 words). O
         return None, f"Error calling Anthropic API: {e}"
 
 
-# ── HTML Template ────────────────────────────────────────────────────────────
+# ── HTML Templates ───────────────────────────────────────────────────────────
 
-TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cleaning Schedule</title>
-<style>
+# Shared CSS used by both the legacy TEMPLATE and the new CALENDAR_TEMPLATE.
+_SHARED_STYLES = """
   :root {
     --green: #d4edda; --red: #ffcccb; --yellow: #fff3cd;
     --blue: #cce5ff; --gray: #f8f9fa; --dark: #212529;
@@ -224,7 +247,7 @@ TEMPLATE = """
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--gray); color: var(--dark); padding: 12px; max-width: 800px; margin: 0 auto;
+    background: var(--gray); color: var(--dark); padding: 12px; max-width: 960px; margin: 0 auto;
   }
   h1 { font-size: 1.3rem; margin-bottom: 4px; }
   .subtitle { color: #666; font-size: 0.85rem; margin-bottom: 16px; }
@@ -336,10 +359,12 @@ TEMPLATE = """
     .card { padding: 10px; }
     .dates { font-size: 0.95rem; }
   }
-</style>
-</head>
-<body>
+"""
 
+# Body content shared between TEMPLATE and the List tab of CALENDAR_TEMPLATE.
+# Does NOT include <html>/<head>/<body> tags — those are supplied by the
+# wrapping template.
+LIST_PANEL_TEMPLATE = """
 <h1>Cleaning Schedule</h1>
 <p class="subtitle">
   Last synced: {{ last_sync or "Never" }}
@@ -631,9 +656,126 @@ function showTab(name) {
   event.target.classList.add('active');
 }
 </script>
+"""
+
+# Legacy full-page template — still used by the /whatsapp POST route so the
+# WhatsApp results page continues to work standalone.
+TEMPLATE = (
+    "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<title>Cleaning Schedule</title>\n"
+    "<style>" + _SHARED_STYLES + "</style>\n"
+    "</head>\n<body>\n"
+    + LIST_PANEL_TEMPLATE +
+    "</body>\n</html>\n"
+)
+
+# ── Calendar template (new index page) ───────────────────────────────────────
+# Built by string concatenation so LIST_PANEL_TEMPLATE is spliced in directly,
+# avoiding the need for render_template_string include support.
+
+_CALENDAR_HEAD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cleaning Schedule</title>
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
+<style>
+""" + _SHARED_STYLES + """
+  /* Calendar tab extras */
+  #calendar { margin-top: 8px; }
+  .top-tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #dee2e6; }
+  .top-tab {
+    padding: 8px 18px; cursor: pointer; border: none; background: none;
+    font-size: 1rem; border-bottom: 3px solid transparent; margin-bottom: -2px;
+  }
+  .top-tab.active { border-bottom-color: #0d6efd; font-weight: 600; color: #0d6efd; }
+  .top-panel { display: none; }
+  .top-panel.active { display: block; }
+  .fc-event { cursor: pointer; }
+  .cancelled-stay { opacity: 0.45; }
+</style>
+</head>
+<body>
+
+<h1>Cleaning Schedule</h1>
+<p class="subtitle">
+  Last synced: {{ last_sync or "Never" }}
+  {% if error %}<span style="color:red"> | Sync error: {{ error }}</span>{% endif %}
+</p>
+
+{% if no_ical %}
+<div class="config-warning">
+  No iCal URL configured. Go to <strong>Settings &gt; Add-ons &gt; Cleaning Schedule Tracker &gt; Configuration</strong> and set your Airbnb calendar URL.
+</div>
+{% endif %}
+
+<div class="sync-bar">
+  <form action="{{ prefix }}/sync" method="POST">
+    <button type="submit" class="btn btn-primary">Sync Airbnb</button>
+  </form>
+  <a href="{{ prefix }}/add" class="btn btn-secondary">+ Add Entry</a>
+  <a href="{{ prefix }}/print" class="btn btn-outline">Print Month</a>
+</div>
+
+<!-- Top-level tabs: Calendar / List -->
+<div class="top-tabs">
+  <button class="top-tab active" onclick="showTopTab('calendar-tab', this)">Calendar</button>
+  <button class="top-tab" onclick="showTopTab('list-tab', this)">List</button>
+</div>
+
+<!-- Calendar panel -->
+<div id="calendar-tab" class="top-panel active">
+  <div id="calendar"></div>
+</div>
+
+<!-- List panel — existing UI embedded inline -->
+<div id="list-tab" class="top-panel">
+"""
+
+_CALENDAR_FOOT = """
+</div><!-- /#list-tab -->
+
+<script>
+function showTopTab(id, btn) {
+  document.querySelectorAll('.top-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  const calendarEl = document.getElementById('calendar');
+  const prefix = "{{ prefix }}";
+  const isMobile = window.innerWidth < 600;
+  const calendar = new FullCalendar.Calendar(calendarEl, {
+    initialView: isMobile ? 'listWeek' : 'dayGridMonth',
+    headerToolbar: { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
+    height: 'auto',
+    eventSources: [ prefix + '/events.json' ],
+    eventClick: function(info) {
+      const p = info.event.extendedProps;
+      if (p.type === 'cleaning') {
+        window.location = prefix + '/edit/' + encodeURIComponent(p.uid);
+      } else if (p.type === 'airbnb' || p.type === 'custom_stay') {
+        window.location = prefix + '/edit/' + encodeURIComponent(p.uid);
+      }
+    },
+    dateClick: function(info) {
+      window.location = prefix + '/add?date=' + info.dateStr;
+    }
+  });
+  calendar.render();
+});
+</script>
 </body>
 </html>
 """
+
+# Concatenate at module load: head + list panel body + foot.
+CALENDAR_TEMPLATE = _CALENDAR_HEAD + LIST_PANEL_TEMPLATE + _CALENDAR_FOOT
 
 ADD_TEMPLATE = """
 <!DOCTYPE html>
@@ -641,7 +783,7 @@ ADD_TEMPLATE = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Add Manual Cleaning</title>
+<title>Add Entry</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, sans-serif; padding: 20px; max-width: 500px; margin: 0 auto; }
@@ -649,24 +791,234 @@ ADD_TEMPLATE = """
   input, select, textarea { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; }
   button { margin-top: 16px; padding: 10px 24px; background: #0d6efd; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; }
   a { color: #0d6efd; }
+  .type-radio { display: flex; gap: 16px; margin-bottom: 16px; }
+  .type-radio label { display: flex; align-items: center; gap: 6px; font-weight: 600; cursor: pointer; margin: 0; }
+  .type-radio input[type=radio] { width: auto; }
 </style>
 </head>
 <body>
-<h2>Add Manual Cleaning</h2>
+<h2>Add Entry</h2>
 <form action="{{ prefix }}/add" method="POST">
-  <label>Cleaning Date</label>
-  <input type="date" name="date" required>
-  <label>Cleaner</label>
-  <select name="cleaner">
-    <option value="">-- Select --</option>
-    {% for c in cleaners %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
-  </select>
+  <div class="type-radio">
+    <span style="font-weight:600;margin-right:4px;">Type:</span>
+    <label><input type="radio" name="entry_type" value="cleaning" checked onchange="toggleType()"> Cleaning</label>
+    <label><input type="radio" name="entry_type" value="stay" onchange="toggleType()"> Stay</label>
+  </div>
+
+  <div id="cleaning-fields">
+    <label>Cleaning Date</label>
+    <input type="date" name="date" value="{{ prefill_date or '' }}">
+    <label>Cleaner</label>
+    <select name="cleaner">
+      <option value="">-- Select --</option>
+      {% for c in cleaners %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+    </select>
+  </div>
+
+  <div id="stay-fields" style="display:none;">
+    <label>Start Date</label>
+    <input type="date" name="start_date" value="{{ prefill_date or '' }}">
+    <label>End Date</label>
+    <input type="date" name="end_date">
+  </div>
+
   <label>Notes</label>
-  <textarea name="notes" rows="2" placeholder="e.g., Friend visit, deep clean"></textarea>
+  <textarea name="notes" rows="2" placeholder="e.g., Mom visiting, deep clean"></textarea>
   <br>
   <button type="submit">Add</button>
   <a href="{{ prefix }}/" style="margin-left:12px;">Cancel</a>
 </form>
+<script>
+function toggleType() {
+  var val = document.querySelector('input[name=entry_type]:checked').value;
+  document.getElementById('cleaning-fields').style.display = val === 'cleaning' ? '' : 'none';
+  document.getElementById('stay-fields').style.display = val === 'stay' ? '' : 'none';
+}
+</script>
+</body>
+</html>
+"""
+
+EDIT_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edit Booking</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, sans-serif; padding: 20px; max-width: 500px; margin: 0 auto; }
+  h2 { margin-bottom: 4px; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 20px; }
+  .section { margin-bottom: 20px; padding: 14px; background: #f8f9fa; border-radius: 8px; }
+  .section h3 { font-size: 1rem; margin-bottom: 10px; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 0.9rem; }
+  select, input[type=text] { width: 100%; padding: 7px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem; }
+  button { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 500; }
+  .btn-primary { background: #0d6efd; color: #fff; }
+  .btn-success { background: #198754; color: #fff; }
+  .btn-warning { background: #ffc107; color: #000; }
+  .btn-danger { background: #dc3545; color: #fff; }
+  .btn-outline { background: transparent; border: 1px solid #ccc; color: #333; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  a { color: #0d6efd; font-size: 0.9rem; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+  .delete-zone { margin-top: 24px; padding: 12px; border: 1px solid #dc3545; border-radius: 8px; }
+  .delete-zone h3 { color: #dc3545; font-size: 0.95rem; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<a href="{{ prefix }}/">&larr; Back to calendar</a>
+<h2 style="margin-top:12px;">
+  {% if booking.type == 'manual_cleaning' %}Manual Cleaning
+  {% elif booking.type == 'custom_stay' %}Custom Stay
+  {% else %}Airbnb Booking{% endif %}
+</h2>
+<div class="meta">
+  {{ booking.start }} &rarr; {{ booking.end }}
+  &nbsp;&middot;&nbsp;
+  <span class="badge" style="
+    {% if booking.status == 'active' %}background:#cce5ff;color:#004085
+    {% elif booking.status == 'complete' %}background:#d4edda;color:#155724
+    {% else %}background:#ffcccb;color:#721c24{% endif %}
+  ">{{ booking.status }}</span>
+</div>
+
+<!-- Assign cleaner -->
+<div class="section">
+  <h3>Cleaner Assignment</h3>
+  <form action="{{ prefix }}/assign/{{ uid }}" method="POST">
+    <label>Cleaner</label>
+    <select name="cleaner">
+      <option value="">-- None --</option>
+      {% for c in cleaners %}
+      <option value="{{ c }}" {{ 'selected' if booking.cleaner == c }}>{{ c }}</option>
+      {% endfor %}
+    </select>
+    <div class="actions">
+      <button type="submit" class="btn-primary">Save</button>
+    </div>
+  </form>
+</div>
+
+<!-- Confirm / Pay -->
+<div class="section">
+  <h3>Status</h3>
+  <div class="actions">
+    {% if booking.cleaner and not booking.confirmed %}
+    <form action="{{ prefix }}/confirm/{{ uid }}" method="POST" style="display:inline;">
+      <button type="submit" class="btn-success">Mark Confirmed</button>
+    </form>
+    {% elif booking.confirmed %}
+    <span class="badge" style="background:#d4edda;color:#155724">Confirmed</span>
+    {% endif %}
+    {% if not booking.paid %}
+    <form action="{{ prefix }}/pay/{{ uid }}" method="POST" style="display:inline;">
+      <button type="submit" class="btn-warning">Mark Paid</button>
+    </form>
+    {% else %}
+    <span class="badge" style="background:#d4edda;color:#155724">Paid</span>
+    {% endif %}
+  </div>
+  {% if booking.notes %}
+  <div style="margin-top:10px;font-size:0.85rem;color:#555;">Notes: {{ booking.notes }}</div>
+  {% endif %}
+</div>
+
+<!-- Delete (only for manual/custom types) -->
+{% if deletable %}
+<div class="delete-zone">
+  <h3>Delete</h3>
+  <p style="font-size:0.85rem;color:#666;margin-bottom:10px;">Permanently removes this entry. Cannot be undone.</p>
+  <form action="{{ prefix }}/delete/{{ uid }}" method="POST" onsubmit="return confirm('Delete this entry?');">
+    <button type="submit" class="btn-danger">Delete</button>
+  </form>
+</div>
+{% endif %}
+</body>
+</html>
+"""
+
+
+PRINT_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ month_label }} — Print View</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 11px; background: #fff; color: #000; }
+  .nav-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #f8f9fa; border-bottom: 1px solid #dee2e6; flex-wrap: wrap; }
+  .nav-bar a { color: #0d6efd; text-decoration: none; font-size: 0.9rem; }
+  .nav-bar a:hover { text-decoration: underline; }
+  .nav-bar h2 { font-size: 1.1rem; flex: 1; text-align: center; }
+  .print-btn { padding: 6px 14px; background: #0d6efd; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-size: 0.85rem; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th { background: #212529; color: #fff; text-align: center; padding: 4px 2px; font-size: 10px; font-weight: 700; border: 1px solid #000; }
+  td { border: 1px solid #ccc; vertical-align: top; height: 80px; padding: 2px 3px; width: 14.285%; }
+  td.other-month { background: #f5f5f5; }
+  .day-num { font-weight: 700; font-size: 11px; margin-bottom: 2px; }
+  .stay-bar {
+    display: block; font-size: 9px; padding: 1px 3px; border-radius: 2px; margin-bottom: 1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  .cleaning-line { font-size: 9px; font-weight: 700; margin-top: 2px; padding: 1px 2px; border-radius: 2px; }
+  .cleaning-unassigned { color: #dc3545; }
+  @media print {
+    .nav-bar { display: none !important; }
+    body { font-size: 10px; }
+    td { height: 70px; border: 1px solid #000; }
+    th { border: 1px solid #000; }
+    @page { size: landscape; margin: 0.5in; }
+  }
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="{{ prefix }}/print?month={{ prev_month }}">&laquo; Prev</a>
+  <h2>{{ month_label }}</h2>
+  <a href="{{ prefix }}/print?month={{ next_month }}">Next &raquo;</a>
+  <a href="{{ prefix }}/">Back to app</a>
+  <button class="print-btn" onclick="window.print()">Print this page</button>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Sun</th><th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th><th>Sat</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for week in weeks %}
+    <tr>
+      {% for cell in week %}
+      <td class="{{ '' if cell.in_month else 'other-month' }}">
+        {% if cell.day %}
+        <div class="day-num">{{ cell.day }}</div>
+        {% for stay in cell.stays %}
+        <span class="stay-bar" style="background:{{ stay.color }};">
+          {% if stay.is_start %}&#9654; {% endif %}{{ stay.title }}{% if stay.is_end %} &#9664;{% endif %}
+        </span>
+        {% endfor %}
+        {% for cl in cell.cleanings %}
+        {% if cl.cleaner %}
+        <div class="cleaning-line" style="color:{{ cl.color }};">&#9986; {{ cl.cleaner }}{% if cl.confirmed %} &#10003;{% endif %}</div>
+        {% else %}
+        <div class="cleaning-line cleaning-unassigned">&#9986; ??</div>
+        {% endif %}
+        {% endfor %}
+        {% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
 </body>
 </html>
 """
@@ -811,6 +1163,100 @@ def build_view_data(data):
     }
 
 
+# ── Print-view helper ────────────────────────────────────────────────────────
+
+def build_print_data(month_str: str, bookings: dict) -> dict:
+    """Build the data structure for the /print month-grid view."""
+    month_dt = datetime.strptime(month_str, "%Y-%m")
+    year = month_dt.year
+    month = month_dt.month
+
+    month_label = month_dt.strftime("%B %Y")
+
+    # Prev/next month strings
+    first_of_month = date(year, month, 1)
+    prev_first = first_of_month - timedelta(days=1)
+    prev_month = prev_first.strftime("%Y-%m")
+    last_day_num = calendar.monthrange(year, month)[1]
+    last_of_month = date(year, month, last_day_num)
+    next_first = last_of_month + timedelta(days=1)
+    next_month = next_first.strftime("%Y-%m")
+
+    # Grid: Sun=0 ... Sat=6.  Find first Sunday at-or-before day 1.
+    # date.weekday(): Mon=0..Sun=6  →  Sunday offset = (weekday + 1) % 7
+    sun_offset = (first_of_month.weekday() + 1) % 7
+    grid_start = first_of_month - timedelta(days=sun_offset)
+    # Last Saturday at-or-after last day of month
+    sat_offset = (5 - last_of_month.weekday()) % 7  # days until Saturday (weekday 5)
+    grid_end = last_of_month + timedelta(days=sat_offset)
+
+    # Build a dict: iso_date -> cell
+    cells = {}
+    cur = grid_start
+    while cur <= grid_end:
+        cells[cur.isoformat()] = {
+            "day": cur.day if cur.month == month else None,
+            "iso": cur.isoformat(),
+            "in_month": cur.month == month,
+            "stays": [],
+            "cleanings": [],
+        }
+        cur += timedelta(days=1)
+
+    # Populate stays and cleanings
+    for uid, b in bookings.items():
+        btype = b.get("type", "airbnb")
+        status = b.get("status", "active")
+        if status == "cancelled":
+            continue
+
+        b_start = date.fromisoformat(b["start"])
+        b_end = date.fromisoformat(b["end"])
+
+        # Stay bars for airbnb and custom_stay
+        if btype in ("airbnb", "custom_stay"):
+            stay_color = "#cfe2ff" if btype == "airbnb" else "#d1e7dd"
+            title = b.get("notes") or ("Airbnb" if btype == "airbnb" else "Custom stay")
+            # Iterate every day of the stay that falls in the grid
+            d = max(b_start, grid_start)
+            end_iter = min(b_end - timedelta(days=1), grid_end)  # stay end is exclusive checkout
+            while d <= end_iter:
+                if d.isoformat() in cells:
+                    cells[d.isoformat()]["stays"].append({
+                        "title": title,
+                        "color": stay_color,
+                        "is_start": d == b_start,
+                        "is_end": d == b_end - timedelta(days=1),
+                    })
+                d += timedelta(days=1)
+
+        # Cleaning annotations
+        if btype == "custom_stay":
+            continue
+        # For airbnb: cleaning on checkout (b_end). For manual_cleaning: b_end == b_start.
+        clean_date = b_end
+        if clean_date.isoformat() in cells:
+            cleaner = b.get("cleaner")
+            cells[clean_date.isoformat()]["cleanings"].append({
+                "cleaner": cleaner,
+                "confirmed": b.get("confirmed", False),
+                "color": cleaner_color(cleaner) if cleaner else "#dc3545",
+            })
+
+    # Arrange into weeks
+    weeks = []
+    ordered = sorted(cells.values(), key=lambda c: c["iso"])
+    for i in range(0, len(ordered), 7):
+        weeks.append(ordered[i:i + 7])
+
+    return {
+        "month_label": month_label,
+        "prev_month": prev_month,
+        "next_month": next_month,
+        "weeks": weeks,
+    }
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -818,7 +1264,7 @@ def index():
     data = load_data()
     ctx = build_view_data(data)
     return render_template_string(
-        TEMPLATE, error=request.args.get("error"),
+        CALENDAR_TEMPLATE, error=request.args.get("error"),
         wa_text=None, wa_parsed=None, wa_error=None, wa_applied=0,
         wa_booking_options=[],
         **ctx,
@@ -865,29 +1311,78 @@ def pay(uid):
     return redirect(ingress_prefix() + "/")
 
 
+@app.route("/edit/<path:uid>")
+def edit(uid):
+    data = load_data()
+    booking = data["bookings"].get(uid)
+    if not booking:
+        return redirect(ingress_prefix() + "/")
+    return render_template_string(
+        EDIT_TEMPLATE,
+        uid=uid,
+        booking=booking,
+        cleaners=CLEANERS,
+        prefix=ingress_prefix(),
+        deletable=booking.get("type") in ("custom_stay", "manual_cleaning"),
+    )
+
+
+@app.route("/delete/<path:uid>", methods=["POST"])
+def delete_booking(uid):
+    data = load_data()
+    booking = data["bookings"].get(uid)
+    if booking and booking.get("type") in ("custom_stay", "manual_cleaning"):
+        del data["bookings"][uid]
+        save_data(data)
+    return redirect(ingress_prefix() + "/")
+
+
 @app.route("/add", methods=["GET", "POST"])
 def add():
     if request.method == "GET":
-        return render_template_string(ADD_TEMPLATE, cleaners=CLEANERS, prefix=ingress_prefix())
+        prefill_date = request.args.get("date", "")
+        return render_template_string(
+            ADD_TEMPLATE, cleaners=CLEANERS, prefix=ingress_prefix(),
+            prefill_date=prefill_date,
+        )
 
-    cleaning_date = request.form.get("date")
-    cleaner = request.form.get("cleaner", "").strip()
+    entry_type = request.form.get("entry_type", "cleaning")
     notes = request.form.get("notes", "").strip()
-
-    if not cleaning_date:
-        return redirect(ingress_prefix() + "/add")
-
     data = load_data()
-    uid = f"manual-{cleaning_date}-{len(data['bookings'])}"
-    data["bookings"][uid] = {
-        "start": cleaning_date,
-        "end": cleaning_date,
-        "cleaner": cleaner or None,
-        "paid": False,
-        "status": "active",
-        "confirmed": bool(cleaner),
-        "notes": notes or "Manual cleaning",
-    }
+
+    if entry_type == "stay":
+        start_date = request.form.get("start_date", "").strip()
+        end_date = request.form.get("end_date", "").strip()
+        if not start_date or not end_date:
+            return redirect(ingress_prefix() + "/add")
+        uid = f"custom-{start_date}-{len(data['bookings'])}"
+        data["bookings"][uid] = {
+            "start": start_date,
+            "end": end_date,
+            "cleaner": None,
+            "paid": False,
+            "status": "active",
+            "confirmed": False,
+            "notes": notes or "Custom stay",
+            "type": "custom_stay",
+        }
+    else:
+        cleaning_date = request.form.get("date", "").strip()
+        cleaner = request.form.get("cleaner", "").strip()
+        if not cleaning_date:
+            return redirect(ingress_prefix() + "/add")
+        uid = f"manual-{cleaning_date}-{len(data['bookings'])}"
+        data["bookings"][uid] = {
+            "start": cleaning_date,
+            "end": cleaning_date,
+            "cleaner": cleaner or None,
+            "paid": False,
+            "status": "active",
+            "confirmed": bool(cleaner),
+            "notes": notes or "Manual cleaning",
+            "type": "manual_cleaning",
+        }
+
     save_data(data)
     return redirect(ingress_prefix() + "/")
 
@@ -999,6 +1494,113 @@ def resolve(uid):
             b["confirmed"] = False
         save_data(data)
     return redirect(ingress_prefix() + "/")
+
+
+@app.route("/events.json")
+def events_json():
+    data = load_data()
+    bookings = data.get("bookings", {})
+
+    raw_start = request.args.get("start")
+    raw_end = request.args.get("end")
+    win_start = date.fromisoformat(raw_start[:10]) if raw_start else None
+    win_end = date.fromisoformat(raw_end[:10]) if raw_end else None
+
+    events = []
+
+    for uid, b in bookings.items():
+        btype = b.get("type", "airbnb")
+        status = b.get("status", "active")
+        b_start = date.fromisoformat(b["start"])
+        b_end = date.fromisoformat(b["end"])
+
+        # ── Stay events ───────────────────────────────────────────────────────
+        if btype in ("airbnb", "custom_stay"):
+            fc_end = b_end + timedelta(days=1)
+            in_window = (win_start is None) or (b_start < win_end and fc_end > win_start)
+            if in_window:
+                if status == "cancelled":
+                    bg = "#e9ecef"
+                elif btype == "custom_stay":
+                    bg = "#d1e7dd"
+                else:
+                    bg = "#cfe2ff"
+
+                border = "#fd7e14" if b.get("conflict") else bg
+
+                event = {
+                    "id": f"stay-{uid}",
+                    "title": (b.get("notes") or "Airbnb") if btype == "airbnb" else (b.get("notes") or "Custom stay"),
+                    "start": b["start"],
+                    "end": fc_end.isoformat(),
+                    "allDay": True,
+                    "display": "block",
+                    "backgroundColor": bg,
+                    "borderColor": border,
+                    "extendedProps": {
+                        "type": btype,
+                        "uid": uid,
+                        "status": status,
+                        "cancelled": status == "cancelled",
+                    },
+                }
+                if status == "cancelled":
+                    event["classNames"] = ["cancelled-stay"]
+                events.append(event)
+
+        # ── Cleaning events ───────────────────────────────────────────────────
+        if status == "cancelled":
+            continue
+        if btype == "custom_stay":
+            continue
+
+        clean_date = b_end  # checkout day for airbnb; same as start for manual_cleaning
+        in_window = (win_start is None) or (win_start <= clean_date < win_end)
+        if not in_window:
+            continue
+
+        cleaner = b.get("cleaner")
+        confirmed = b.get("confirmed", False)
+        bg_clean = cleaner_color(cleaner) if cleaner else "#dc3545"
+        border_clean = "#198754" if confirmed else bg_clean
+
+        events.append({
+            "id": f"clean-{uid}",
+            "title": cleaner if cleaner else "Needs cleaner",
+            "start": clean_date.isoformat(),
+            "allDay": True,
+            "display": "block",
+            "backgroundColor": bg_clean,
+            "borderColor": border_clean,
+            "textColor": "#fff",
+            "extendedProps": {
+                "type": "cleaning",
+                "uid": uid,
+                "cleaner": cleaner,
+                "confirmed": confirmed,
+                "paid": b.get("paid", False),
+                "status": status,
+            },
+        })
+
+    return jsonify(events)
+
+
+@app.route("/print")
+def print_view():
+    month_str = request.args.get("month", "")
+    if not month_str:
+        month_str = date.today().strftime("%Y-%m")
+    try:
+        datetime.strptime(month_str, "%Y-%m")
+    except ValueError:
+        month_str = date.today().strftime("%Y-%m")
+
+    data = load_data()
+    bookings = data.get("bookings", {})
+    ctx = build_print_data(month_str, bookings)
+    ctx["prefix"] = ingress_prefix()
+    return render_template_string(PRINT_TEMPLATE, **ctx)
 
 
 if __name__ == "__main__":
