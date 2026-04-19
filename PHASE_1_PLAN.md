@@ -108,3 +108,48 @@ Each step is independently testable. Steps 1–3 are the core of the phase;
 - Existing list view, conflict-review flow, and WhatsApp paste-parse flow
   all still work (nested inside the new UI).
 - `config.yaml` version bumped; tested in a running HA add-on instance.
+
+---
+
+## Status (as of 2026-04-18)
+
+### Implementation: complete
+All 6 steps implemented on branch `Calendar-Redo`, merged to `master` via
+fast-forward.
+
+- Commit `2520226` — Phase 1 calendar redo (FullCalendar UI, custom stays,
+  print view, new routes: `/events.json`, `/edit/<uid>`, `/delete/<uid>`,
+  `/print`)
+- Commit `ea51ead` — version marker `1.4.0-rc1`
+
+### Deviations from the plan (worth noting)
+
+1. **Bug caught during review**: original `sync_ical()` gated the
+   "missing-from-feed → cancelled" sweep on UIDs starting with `manual-`.
+   With `custom-*` UIDs now possible, custom stays would have been wrongly
+   marked cancelled on every sync. Fix: gate on `b.get("type") != "airbnb"`
+   instead. (Applied in `2520226`.)
+
+2. **Small UX polish added**: "Print Month" button in the sync bar, and
+   relabelled "+ Manual Cleaning" → "+ Add Entry" since `/add` now handles
+   both cleaning and stay entries.
+
+3. **Sonnet agent UX flag (deferred)**: saving from `/edit/<uid>` redirects
+   to `/`, not back to `/edit/<uid>`. Fine for the first cut; can be
+   addressed with a `?next=` query param when it becomes annoying.
+
+### Pending
+
+- **User HA smoke test of `1.4.0-rc1`**: install the update, click around
+  the calendar, try adding a custom stay, view `/print`. Live on `master`
+  at `homeassistant.local:8123/app/27cbea7f_cleaning-tracker`.
+- Once smoke-tested, drop the `-rc1` suffix and tag `1.4.0`.
+
+### Known non-blockers
+
+- `cleaning-tracker/__pycache__/` shows up as untracked from local parse
+  checks. Consider adding to `.gitignore` in a follow-up.
+- FullCalendar loads from CDN; won't work air-gapped. Vendor later if
+  needed.
+- `app.py` is now ~1615 lines. Single-file is still fine but Phase 2 or 3
+  might want to split templates out.
