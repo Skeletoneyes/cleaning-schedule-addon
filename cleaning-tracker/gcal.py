@@ -13,7 +13,10 @@ no expiry.
 
 import hashlib
 import json
+import threading
 from datetime import datetime, date, timedelta
+
+_SYNC_LOCK = threading.Lock()
 
 try:
     from google.oauth2 import service_account
@@ -180,8 +183,13 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
 
 
 def _list_existing(service, calendar_id):
-    """Return {uid: event} for every event we own on the calendar."""
+    """Return ({uid: event}, [duplicate_event_ids]).
+
+    If two events share a uid (leftover from a race), keep one and mark the
+    rest for deletion.
+    """
     out = {}
+    dupes = []
     page_token = None
     while True:
         resp = service.events().list(
@@ -195,12 +203,16 @@ def _list_existing(service, calendar_id):
         for ev in resp.get("items", []):
             priv = (ev.get("extendedProperties") or {}).get("private") or {}
             uid = priv.get("uid")
-            if uid:
+            if not uid:
+                continue
+            if uid in out:
+                dupes.append(ev["id"])
+            else:
                 out[uid] = ev
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    return out
+    return out, dupes
 
 
 def _events_equal(existing, desired):
@@ -236,12 +248,22 @@ def sync_to_gcal(data, service_account_json, calendar_id):
     if not (service_account_json and calendar_id):
         return None, "Google Calendar credentials not configured"
 
+    if not _SYNC_LOCK.acquire(blocking=False):
+        return {"skipped": 1}, None  # another sync is already running
+
     try:
         service = _build_service(service_account_json)
-        existing = _list_existing(service, calendar_id)
+        existing, dupes = _list_existing(service, calendar_id)
         desired = _desired_events(data)
 
-        stats = {"inserted": 0, "patched": 0, "deleted": 0}
+        stats = {"inserted": 0, "patched": 0, "deleted": 0, "dupes_deleted": 0}
+
+        for dupe_id in dupes:
+            try:
+                service.events().delete(calendarId=calendar_id, eventId=dupe_id).execute()
+                stats["dupes_deleted"] += 1
+            except HttpError:
+                pass
 
         for uid, body in desired.items():
             if uid in existing:
@@ -266,3 +288,5 @@ def sync_to_gcal(data, service_account_json, calendar_id):
         return None, f"Google API error: {e}"
     except Exception as e:
         return None, f"GCal sync failed: {e}"
+    finally:
+        _SYNC_LOCK.release()
