@@ -1013,6 +1013,10 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   .top-panel.active { display: block; }
   .fc-event { cursor: pointer; }
   .cancelled-stay { opacity: 0.45; }
+  @media (max-width: 600px) {
+    .fc .fc-toolbar.fc-footer-toolbar { margin-top: 4px; }
+    .fc .fc-toolbar-title { font-size: 1.1rem; }
+  }
 </style>
 </head>
 <body>
@@ -1176,7 +1180,12 @@ document.addEventListener('DOMContentLoaded', function() {
   const isMobile = window.innerWidth < 600;
   const calendar = new FullCalendar.Calendar(calendarEl, {
     initialView: isMobile ? 'listWeek' : 'dayGridMonth',
-    headerToolbar: { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
+    headerToolbar: isMobile
+      ? { left: 'prev,next', center: 'title', right: 'today' }
+      : { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
+    footerToolbar: isMobile
+      ? { center: 'dayGridMonth,dayGridWeek,listWeek' }
+      : false,
     height: 'auto',
     eventSources: [ prefix + '/events.json' ],
     eventClick: function(info) {
