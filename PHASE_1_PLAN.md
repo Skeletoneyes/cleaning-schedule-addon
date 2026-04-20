@@ -1,5 +1,14 @@
 # Phase 1 Plan — Calendar-first UI
 
+> **Status (2026-04-20): superseded.** The FullCalendar home page shipped
+> as planned, but the project direction has since moved to Google Calendar
+> as the shared view. The FullCalendar view at `/` still works but is no
+> longer the primary surface; a dedicated conflict-manager page will
+> replace it. See `GCAL_VIEW_SKETCH.md` for current direction and TODOs.
+> This file is kept for historical context on the month/week/agenda
+> layout, custom-stay data model, and print view — all still live in the
+> codebase.
+
 ## Scope
 
 Replace the current tabs+cards UI with a FullCalendar-based view. Keep the

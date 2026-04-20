@@ -15,10 +15,17 @@ ingress. No database — data lives in `/data/data.json` (persists across
 rebuilds). Configuration is read from `/data/options.json` (populated by HA
 from `config.yaml` options).
 
-The UI is a FullCalendar 6 month/week/agenda view (loaded from CDN). The
-previous list-first UI has been removed; the calendar is the single home
-page. A Review tab hosts WhatsApp triage, conflict resolution, unmapped-sender
-mapping, and group labelling.
+**Current direction (1.6.x):** the add-on is the **brain**, Google Calendar
+is the **shared view**. `data.json` is the source of truth; `gcal.py` pushes
+a one-way projection to a GCal calendar shared with Michelle and the
+cleaners. The add-on UI exists to do the things GCal can't — WhatsApp review
+and (soon) conflict resolution. See `GCAL_VIEW_SKETCH.md` for the full
+picture and outstanding work.
+
+The legacy FullCalendar view at `/` still works but is no longer the primary
+viewing surface. A dedicated conflict-manager page will replace it in a
+future session (tracked in `GCAL_VIEW_SKETCH.md`). The Review tab already
+handles WhatsApp triage, unmapped-sender mapping, and group labelling.
 
 ### Key Files
 
@@ -33,7 +40,8 @@ cleaning-tracker/
 scripts/
 ├── whatsapp_fixture.py      # Synthetic inbound-message harness for Phase 3
 └── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
-PHASE_1_PLAN.md              # Calendar redo — shipped; see file for history
+GCAL_VIEW_SKETCH.md          # Current direction: GCal-as-view. Shipped state + TODOs
+PHASE_1_PLAN.md              # Historical: FullCalendar-first UI. Superseded by GCAL_VIEW_SKETCH.md
 PHASE_3_SKETCH.md            # WhatsApp automation — Step 1 shipped, Steps 2–3 pending
 ```
 
@@ -149,7 +157,7 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
 - The Baileys sidecar that would feed real WhatsApp traffic is not built yet
   (blocked on user procuring a bot account; see PHASE_3_SKETCH.md).
 
-### Google Calendar projection (optional, `gcal_enabled`)
+### Google Calendar projection (primary view, `gcal_enabled`)
 - One-way sync: `data.json` → GCal. Cleaners don't edit the calendar; they
   confirm via WhatsApp.
 - `gcal.py::sync_to_gcal()` diffs desired events (cancelled stays omitted,
@@ -158,11 +166,27 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
   patches / deletes to converge.
 - Triggered via `save_data()` in a daemon thread (fire-and-forget, errors
   logged and swallowed so GCal outages don't block local writes).
+- **Serialized** with a module-level lock — concurrent calls skip and return
+  `{"skipped": 1}`. iCal sync hits `save_data()` many times in a row, and
+  without the lock, racing threads inserted duplicate events (each thread
+  listed GCal before the others' inserts landed + indexed).
+- **Dedupes on the fly.** `_list_existing` returns any duplicate events
+  (same `uid` tag, multiple events); they're deleted at the start of each
+  sync.
 - Manual trigger: `POST /gcal/sync` (button on the home page when enabled).
 - Conflicts: events with `conflict` truthy get `colorId=11` (red) and a
   `⚠️ ` title prefix; resolves on the next sync.
 - Cleaner colour: md5-hashed onto 9 GCal palette slots (slot 8 reserved for
   cancelled if ever shown, 11 reserved for conflict/unassigned).
+- Timed events are tagged `America/Vancouver` (constant `LOCAL_TZ` in
+  `gcal.py`), matching how `clean_time` and Airbnb check-in/out are stored
+  in `data.json` as naive local clock times.
+- **Auth: service account.** Create one in Google Cloud, download its JSON
+  key, share the target calendar with the service account's email at
+  "Make changes to events", and paste the JSON into the
+  `gcal_service_account_json` option. No OAuth flow, no consent screen,
+  no refresh-token expiry. `scripts/gcal_auth.py` validates a downloaded
+  key and prints the email to share with.
 
 ### Ingress
 All URLs are prefixed with the `X-Ingress-Path` request header so forms and

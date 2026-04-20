@@ -1,5 +1,12 @@
 # Phase 3 Plan — WhatsApp automation
 
+> **Status (2026-04-20): Step 1 still current, Steps 2–3 deferred.** The
+> WhatsApp paste flow + inbound pipeline + Review tab are still the way the
+> add-on earns its keep — none of that was affected by the move to Google
+> Calendar as the shared view (see `GCAL_VIEW_SKETCH.md`). Steps 2 and 3
+> (Baileys sidecar, real WhatsApp traffic) remain blocked on procuring a
+> bot account.
+
 ## Current status (2026-04-19)
 
 **Step 1 is complete and merged to `Calendar-Redo`** (commits `8969f9b`,
