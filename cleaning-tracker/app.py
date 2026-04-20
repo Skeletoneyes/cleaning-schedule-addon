@@ -969,7 +969,7 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
   <div class="focus-card">
     <div class="focus-name">{{ current_bucket.cleaner }}</div>
     <ul class="diff-list">
-      {% for item in current_bucket.items %}
+      {% for item in current_bucket['items'] %}
       <li class="diff-item">
         <span class="kind {{ item.kind }}">{{ item.kind }}</span>
         {{ item.line }}
