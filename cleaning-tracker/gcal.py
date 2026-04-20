@@ -29,6 +29,7 @@ except ImportError:
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 SOURCE_TAG = "cleaning-tracker"
+LOCAL_TZ = "America/Vancouver"
 
 # GCal provides 11 event colours (ids "1"–"11"). We map a cleaner name onto
 # one of them deterministically — lossy compared to the HSL hash in app.py
@@ -99,8 +100,8 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
         if btype in ("airbnb", "custom_stay"):
             stay_uid = f"stay:{uid}"
             if btype == "airbnb":
-                ev_start = {"dateTime": f"{b['start']}T15:00:00", "timeZone": "UTC"}
-                ev_end = {"dateTime": f"{b['end']}T11:00:00", "timeZone": "UTC"}
+                ev_start = {"dateTime": f"{b['start']}T15:00:00", "timeZone": LOCAL_TZ}
+                ev_end = {"dateTime": f"{b['end']}T11:00:00", "timeZone": LOCAL_TZ}
             else:
                 # All-day; end is exclusive in GCal so add one day.
                 ev_start = {"date": b["start"]}
@@ -146,10 +147,10 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
             title = "⚠️ " + title
 
         if clean_time:
-            ev_start = {"dateTime": f"{clean_date.isoformat()}T{clean_time}", "timeZone": "UTC"}
+            ev_start = {"dateTime": f"{clean_date.isoformat()}T{clean_time}", "timeZone": LOCAL_TZ}
             # Default cleaning duration: 3 hours
             end_dt = datetime.strptime(f"{clean_date.isoformat()} {clean_time}", "%Y-%m-%d %H:%M:%S") + timedelta(hours=3)
-            ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
+            ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
         else:
             ev_start = {"date": clean_date.isoformat()}
             ev_end = {"date": (clean_date + timedelta(days=1)).isoformat()}
@@ -228,6 +229,8 @@ def _events_equal(existing, desired):
         e = existing.get(key, {})
         d = desired.get(key, {})
         if e.get("date") != d.get("date") or e.get("dateTime") != d.get("dateTime"):
+            return False
+        if e.get("timeZone") != d.get("timeZone"):
             return False
     # ExtendedProperties.private — check subset match on desired keys
     ep = (existing.get("extendedProperties") or {}).get("private") or {}
