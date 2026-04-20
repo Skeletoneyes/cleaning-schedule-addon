@@ -27,10 +27,12 @@ repository.yaml              # HA custom repo metadata
 cleaning-tracker/
 ├── config.yaml              # Add-on config: name, version, options schema
 ├── Dockerfile               # python:3.12-slim, pip install, runs app.py
-├── requirements.txt         # flask, requests, icalendar, anthropic
-└── app.py                   # Entire application (Flask routes, templates, logic) — ~1800 lines
+├── requirements.txt         # flask, requests, icalendar, anthropic, google-api-*
+├── app.py                   # Entire application (Flask routes, templates, logic) — ~1800 lines
+└── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
 scripts/
-└── whatsapp_fixture.py      # Synthetic inbound-message harness for Phase 3
+├── whatsapp_fixture.py      # Synthetic inbound-message harness for Phase 3
+└── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
 PHASE_1_PLAN.md              # Calendar redo — shipped; see file for history
 PHASE_3_SKETCH.md            # WhatsApp automation — Step 1 shipped, Steps 2–3 pending
 ```
@@ -52,6 +54,14 @@ resulting in an empty base image.
   paste-flow and Phase 3 inbound). Stored as password type.
 - `cleaners` — List of cleaner names (used for assignment dropdowns and as
   the canonical name set for JID mapping)
+- `gcal_enabled` — toggle Google Calendar projection (default: off)
+- `gcal_calendar_id` — target GCal calendar id (e.g.
+  `abc@group.calendar.google.com`)
+- `gcal_service_account_json` — full JSON blob for a Google Cloud service
+  account key. The service account's email must be added to the target
+  calendar's "Share with specific people" list with "Make changes to events"
+  permission. Use `scripts/gcal_auth.py` to validate a downloaded key and
+  print the exact sharing email.
 
 ## Data model (`/data/data.json`)
 
@@ -138,6 +148,21 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
   (confirm / decline / ambiguous / unmapped / chitchat).
 - The Baileys sidecar that would feed real WhatsApp traffic is not built yet
   (blocked on user procuring a bot account; see PHASE_3_SKETCH.md).
+
+### Google Calendar projection (optional, `gcal_enabled`)
+- One-way sync: `data.json` → GCal. Cleaners don't edit the calendar; they
+  confirm via WhatsApp.
+- `gcal.py::sync_to_gcal()` diffs desired events (cancelled stays omitted,
+  deleted from GCal) against existing ones tagged with
+  `extendedProperties.private.source="cleaning-tracker"`, then inserts /
+  patches / deletes to converge.
+- Triggered via `save_data()` in a daemon thread (fire-and-forget, errors
+  logged and swallowed so GCal outages don't block local writes).
+- Manual trigger: `POST /gcal/sync` (button on the home page when enabled).
+- Conflicts: events with `conflict` truthy get `colorId=11` (red) and a
+  `⚠️ ` title prefix; resolves on the next sync.
+- Cleaner colour: md5-hashed onto 9 GCal palette slots (slot 8 reserved for
+  cancelled if ever shown, 11 reserved for conflict/unassigned).
 
 ### Ingress
 All URLs are prefixed with the `X-Ingress-Path` request header so forms and

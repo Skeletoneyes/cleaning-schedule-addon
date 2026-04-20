@@ -18,6 +18,8 @@ from pathlib import Path
 import requests
 from flask import Flask, render_template_string, request, redirect, jsonify, abort
 
+import gcal as gcal_mod
+
 app = Flask(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -38,6 +40,27 @@ ICAL_URL = OPTIONS.get("ical_url", os.environ.get("ICAL_URL", ""))
 ANTHROPIC_API_KEY = OPTIONS.get("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
 CLEANERS = OPTIONS.get("cleaners", [])
 DATA_FILE = DATA_DIR / "data.json"
+
+GCAL_ENABLED = bool(OPTIONS.get("gcal_enabled", False))
+GCAL_CALENDAR_ID = OPTIONS.get("gcal_calendar_id", "")
+GCAL_SERVICE_ACCOUNT_JSON = OPTIONS.get("gcal_service_account_json", "")
+
+
+def _gcal_push(data):
+    """Fire-and-forget GCal projection after a write. Errors are swallowed so
+    a GCal outage never blocks the local app."""
+    if not GCAL_ENABLED:
+        return
+    try:
+        stats, err = gcal_mod.sync_to_gcal(
+            data, GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID,
+        )
+        if err:
+            print(f"[gcal] sync error: {err}")
+        elif stats:
+            print(f"[gcal] synced: {stats}")
+    except Exception as e:
+        print(f"[gcal] unexpected: {e}")
 
 
 def ingress_prefix():
@@ -65,6 +88,11 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
+    if GCAL_ENABLED:
+        # Snapshot the data so the worker thread doesn't race with further
+        # mutations by the caller.
+        snapshot = json.loads(json.dumps(data, default=str))
+        threading.Thread(target=_gcal_push, args=(snapshot,), daemon=True).start()
 
 
 # ── Data lock ────────────────────────────────────────────────────────────────
@@ -1049,6 +1077,11 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   </form>
   <a href="{{ prefix }}/add" class="btn btn-secondary">+ Add Entry</a>
   <a href="{{ prefix }}/print" class="btn btn-outline">Print Month</a>
+  {% if gcal_enabled %}
+  <form action="{{ prefix }}/gcal/sync" method="POST">
+    <button type="submit" class="btn btn-outline">Sync Google Calendar</button>
+  </form>
+  {% endif %}
 </div>
 
 <!-- Top-level tabs: Calendar / Review -->
@@ -1615,6 +1648,7 @@ def build_view_data(data):
         "cleaners": cleaner_names(),
         "prefix": ingress_prefix(),
         "no_ical": not ICAL_URL,
+        "gcal_enabled": GCAL_ENABLED,
     }
 
 
@@ -1734,6 +1768,20 @@ def sync():
     prefix = ingress_prefix()
     if error:
         return redirect(prefix + "/?error=" + error)
+    return redirect(prefix + "/")
+
+
+@app.route("/gcal/sync", methods=["POST"])
+def gcal_sync():
+    prefix = ingress_prefix()
+    if not GCAL_ENABLED:
+        return redirect(prefix + "/?error=Google+Calendar+is+not+enabled")
+    data = load_data()
+    stats, error = gcal_mod.sync_to_gcal(
+        data, GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID,
+    )
+    if error:
+        return redirect(prefix + "/?error=" + error.replace(" ", "+"))
     return redirect(prefix + "/")
 
 
