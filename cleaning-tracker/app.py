@@ -1341,6 +1341,8 @@ EDIT_TEMPLATE = """
       <option value="{{ c }}" {{ 'selected' if booking.cleaner == c }}>{{ c }}</option>
       {% endfor %}
     </select>
+    <label>Cleaning Time</label>
+    <input type="time" name="clean_time" value="{{ booking.clean_time[:5] if booking.clean_time else '' }}" style="width:100%;padding:7px;border:1px solid #ccc;border-radius:6px;font-size:0.95rem;">
     <div class="actions">
       <button type="submit" class="btn-primary">Save</button>
     </div>
@@ -1739,11 +1741,17 @@ def sync():
 def assign(uid):
     data = load_data()
     cleaner = request.form.get("cleaner", "").strip()
+    clean_time_raw = request.form.get("clean_time", "").strip()
     if uid in data["bookings"]:
         data["bookings"][uid]["cleaner"] = cleaner or None
         data["bookings"][uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") if cleaner else None
         if not cleaner:
             data["bookings"][uid]["confirmed"] = False
+        # input type="time" gives "HH:MM"; store as "HH:MM:SS"
+        if clean_time_raw:
+            data["bookings"][uid]["clean_time"] = clean_time_raw + ":00"
+        else:
+            data["bookings"][uid]["clean_time"] = None
         save_data(data)
     return redirect(ingress_prefix() + "/")
 
