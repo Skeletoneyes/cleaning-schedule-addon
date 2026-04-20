@@ -144,9 +144,49 @@ fast-forward.
 
 ### Known non-blockers
 
-- `cleaning-tracker/__pycache__/` shows up as untracked from local parse
-  checks. Consider adding to `.gitignore` in a follow-up.
+- ~~`cleaning-tracker/__pycache__/` shows up as untracked.~~ Resolved
+  2026-04-19 — added to `.gitignore` and untracked via
+  `git rm -r --cached`.
 - FullCalendar loads from CDN; won't work air-gapped. Vendor later if
   needed.
-- `app.py` is now ~1615 lines. Single-file is still fine but Phase 2 or 3
-  might want to split templates out.
+- `app.py` is now ~1800 lines after the polish pass below. Single-file is
+  still fine but Phase 2 or 3 might want to split templates out.
+
+---
+
+## Post-Phase-1 polish (2026-04-19)
+
+Small, calendar-focused changes made after Phase 1 closed. Too narrow to
+justify a Phase 2 doc; logged here so the motivation survives.
+
+- **Mobile-first calendar**: verified the UI on iPhone 15 Pro Max and
+  Pixel 7 via Playwright emulation. On mobile, view-switcher buttons moved
+  to a footer toolbar so the top bar keeps `prev/next/today`.
+- **Timed stay events**: Airbnb stays now render as timed events with a
+  15:00 check-in and 11:00 checkout (user's property defaults). Custom
+  stays stay all-day.
+- **Cleaning time in title**: new optional `clean_time` field on bookings.
+  Shown in the event title as `"Itzel · 11:00 AM"` and editable via a
+  `<input type="time">` on `/edit/<uid>`. `_parse_clean_time()` backfills
+  from legacy `notes: "Time: 11:00 AM | ..."` strings.
+- **Plan reversal — deleted the List / Manage tab**: Phase 1 said the
+  existing list UI would move into a nested "List" tab. In practice it
+  duplicated FullCalendar's Agenda view, so the top-level Manage tab was
+  removed entirely. Inline-assignment / stats / paste-parse features that
+  lived there moved to the Review tab (which Phase 3 was already building
+  out). The calendar is now the single home page.
+- **Greyscaled past**: past days and past events render greyscale +
+  dimmed so the eye snaps to upcoming work. Varying brightnesses per
+  original colour are preserved by `filter: grayscale(100%)` rather than
+  flat grey.
+- **Title normalization**: Airbnb stay titles always read `"Airbnb"` —
+  the earlier attempt to derive them from notes produced oddities like
+  `"3p Booked"` or `"2 hours"` in month view.
+- **Cancelled-stay styling**: dropped the orange conflict border on
+  cancelled bookings and raised opacity from `0.45` → `0.7` (was nearly
+  invisible). Cancelled bookings now show a **Dismiss** button on
+  `/edit/<uid>` that routes to `/delete/<uid>`; `/delete` accepts
+  cancelled bookings of any type.
+- **`displayEventTime: false`**: removes FullCalendar's auto time prefix
+  (which produced artifacts like `"2 Needs cleaner"`). Times we want
+  visible are baked into the title string instead.

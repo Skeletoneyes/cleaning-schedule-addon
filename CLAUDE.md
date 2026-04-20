@@ -2,11 +2,23 @@
 
 ## Purpose
 
-Home Assistant add-on that tracks Airbnb cleaning schedules. It syncs bookings from an Airbnb iCal feed, lets you assign cleaners to checkout dates, and parses WhatsApp conversations with cleaners using Claude Haiku to detect confirmations and declines.
+Home Assistant add-on that tracks Airbnb cleaning schedules. It syncs bookings
+from an Airbnb iCal feed, lets you assign cleaners to checkout dates, and uses
+Claude Haiku to interpret WhatsApp conversations with cleaners (both pasted
+text and, via Phase 3, a read-only bot account) to detect confirmations and
+declines.
 
 ## Architecture
 
-Single-file Flask app (`cleaning-tracker/app.py`) running as an HA add-on with ingress. No database — data is stored in `/data/data.json` (persists across rebuilds). Configuration is read from `/data/options.json` (populated by HA from `config.yaml` options).
+Single-file Flask app (`cleaning-tracker/app.py`) running as an HA add-on with
+ingress. No database — data lives in `/data/data.json` (persists across
+rebuilds). Configuration is read from `/data/options.json` (populated by HA
+from `config.yaml` options).
+
+The UI is a FullCalendar 6 month/week/agenda view (loaded from CDN). The
+previous list-first UI has been removed; the calendar is the single home
+page. A Review tab hosts WhatsApp triage, conflict resolution, unmapped-sender
+mapping, and group labelling.
 
 ### Key Files
 
@@ -15,49 +27,147 @@ repository.yaml              # HA custom repo metadata
 cleaning-tracker/
 ├── config.yaml              # Add-on config: name, version, options schema
 ├── Dockerfile               # python:3.12-slim, pip install, runs app.py
-├── requirements.txt         # flask, requests, icalendar
-└── app.py                   # Entire application (Flask routes, templates, logic)
+├── requirements.txt         # flask, requests, icalendar, anthropic
+└── app.py                   # Entire application (Flask routes, templates, logic) — ~1800 lines
+scripts/
+└── whatsapp_fixture.py      # Synthetic inbound-message harness for Phase 3
+PHASE_1_PLAN.md              # Calendar redo — shipped; see file for history
+PHASE_3_SKETCH.md            # WhatsApp automation — Step 1 shipped, Steps 2–3 pending
 ```
+
+Tests / doc-builder helpers live under `scripts/` and are not shipped in the
+add-on image.
 
 ### No build.yaml
 
-The Dockerfile hardcodes `python:3.12-slim` directly. The `BUILD_FROM` arg pattern from HA docs did not work — the Supervisor wasn't passing it through, resulting in an empty base image.
+The Dockerfile hardcodes `python:3.12-slim` directly. The `BUILD_FROM` arg
+pattern from HA docs did not work — the Supervisor wasn't passing it through,
+resulting in an empty base image.
 
 ## Add-on Options (set in HA UI)
 
-- `ical_url` — Airbnb iCal calendar URL (contains private token, never commit it)
-- `anthropic_api_key` — API key for Claude Haiku WhatsApp parsing (stored as password type)
-- `cleaners` — List of cleaner names (used for assignment dropdowns)
+- `ical_url` — Airbnb iCal calendar URL (contains private token, never commit
+  it)
+- `anthropic_api_key` — API key for Claude Haiku (WhatsApp parsing, both
+  paste-flow and Phase 3 inbound). Stored as password type.
+- `cleaners` — List of cleaner names (used for assignment dropdowns and as
+  the canonical name set for JID mapping)
 
-## How It Works
+## Data model (`/data/data.json`)
 
-### iCal Sync
-- Fetches Airbnb iCal, extracts `VEVENT` entries with `SUMMARY: Reserved`
-- Merges into `data.json`, preserving cleaner assignments across syncs
-- Marks bookings as cancelled/complete if they disappear from the feed
+Lazily backfilled on read; all fields are additive and backwards-compatible.
 
-### WhatsApp Parsing
-- User pastes WhatsApp chat text (any format — the LLM handles parsing)
-- App sends chat text + list of upcoming booking checkout dates to Claude Haiku
-- Haiku returns structured JSON: which dates are confirmed/declined, cleaner name, time
-- Optional "auto-apply" checkbox writes confirmations directly to booking data
+- `bookings` — keyed by UID.
+  - `type`: `"airbnb"` | `"custom_stay"` | `"manual_cleaning"`. iCal UIDs
+    default to `airbnb`, `manual-*` UIDs to `manual_cleaning`, `custom-*` to
+    `custom_stay`.
+  - `start`, `end` — ISO dates (end is exclusive, Airbnb-style).
+  - `status` — `"active"` | `"cancelled"` | `"complete"`.
+  - `cleaner` — assigned cleaner name or null.
+  - `clean_time` — `"HH:MM:SS"` or null. Shown in the calendar title
+    (`"Itzel · 11:00 AM"`) and editable on the edit page. `_parse_clean_time()`
+    backfills this from legacy `notes: "Time: 11:00 AM | ..."` strings.
+  - `conflict` — set when two stays overlap; renders an orange border (unless
+    cancelled, which suppresses the border).
+  - `notes` — free-text.
+- `messages` — Phase 3 inbound WhatsApp log. Entries:
+  `{id, timestamp, sender_jid, group_jid, text, parsed, applied_uid,
+    review_state: "auto"|"pending"|"ignored"}`.
+- `cleaner_jids` — `{jid: cleaner_name}` map built from Review-tab mappings.
+- `group_labels` — `{group_jid: label}` so the UI shows "Maria group" instead
+  of a raw JID.
+
+## How it works
+
+### iCal sync
+- Fetches Airbnb iCal, extracts `VEVENT` entries with `SUMMARY: Reserved`.
+- Merges into `data.json`, preserving cleaner assignments and `clean_time`
+  across syncs.
+- A booking that disappears from the feed is marked `cancelled` only when
+  `type == "airbnb"` — custom stays and manual cleanings are never
+  auto-cancelled by the sync sweep.
+
+### Calendar UI (`/`)
+- FullCalendar views: `dayGridMonth` (default), `dayGridWeek`, `listWeek`
+  (labelled "Agenda"). On mobile the view switcher moves to a footer toolbar.
+- Event feed: `GET /events.json?start=&end=` returns two streams:
+  - **Stays** — Airbnb stays render as timed events with 15:00 check-in and
+    11:00 checkout; custom stays render as all-day bars. Cancelled stays are
+    muted (`opacity: 0.7`) and drop the conflict border.
+  - **Cleanings** — pill events on checkout day, coloured from the cleaner
+    name via a deterministic HSL hash (`cleaner_color()`). Title includes
+    the cleaning time when set. Unassigned events show "Needs cleaner".
+- Past days and past events are greyscaled
+  (`filter: grayscale(100%); opacity: 0.6`) with a lighter day-cell
+  background, so the eye snaps to upcoming work.
+- Clicking an event goes to `/edit/<uid>`. Clicking an empty day goes to
+  `/add?date=YYYY-MM-DD`.
+
+### Edit / add / delete
+- `/add` — one form, radio for Cleaning vs Stay. Stays require start+end;
+  cleanings take a single date + optional cleaner + optional `clean_time`.
+- `/edit/<uid>` — edit cleaner, notes, and `clean_time`. Cancelled bookings
+  get a **Dismiss** button (hits `/delete/<uid>`); custom stays and manual
+  cleanings get a normal Delete. Airbnb stays can only be dismissed once
+  cancelled.
+- `/assign` — writes cleaner and clean_time; clears clean_time if blank.
+
+### Print view
+- `/print?month=YYYY-MM` — hand-rolled HTML table (not FullCalendar) with
+  print-optimized CSS. Black borders, colour bars for stays, cleaner + time
+  on checkout cells.
+
+### WhatsApp — paste flow
+- User pastes a chat transcript; Haiku is given the transcript plus the list
+  of upcoming checkout dates and known cleaners.
+- Output: structured JSON of confirm/decline per date with inferred cleaner
+  and time. Optional auto-apply checkbox writes directly to bookings.
+
+### WhatsApp — inbound pipeline (Phase 3 Step 1, shipped; Steps 2–3 pending a bot account)
+- `POST /internal/whatsapp/inbound` (loopback-only): dedups on message id,
+  enqueues to a 2-thread worker pool.
+- Parse worker hands Haiku the full cross-group archive + booking list +
+  known cleaners + sender hint. Returns
+  `{action, booking_uid, cleaner, confidence, reason}`.
+- Auto-apply gate: `confidence ≥ 0.85` AND known cleaner JID AND known
+  booking → writes to booking. Everything else → Review tab.
+- Review tab UI: pending-message queue with accept/override/ignore; group
+  label editor; unmapped-sender flow (map to existing cleaner OR create new,
+  then re-queue that sender's pending messages).
+- Scripted harness: `scripts/whatsapp_fixture.py` POSTs synthetic messages
+  (confirm / decline / ambiguous / unmapped / chitchat).
+- The Baileys sidecar that would feed real WhatsApp traffic is not built yet
+  (blocked on user procuring a bot account; see PHASE_3_SKETCH.md).
 
 ### Ingress
-All URLs are prefixed with the `X-Ingress-Path` request header so forms and redirects work behind HA's ingress proxy. The `ingress_prefix()` helper is passed to every template as `{{ prefix }}`.
+All URLs are prefixed with the `X-Ingress-Path` request header so forms and
+redirects work behind HA's ingress proxy. The `ingress_prefix()` helper is
+passed to every template as `{{ prefix }}`.
 
 ## Deployment
 
 Installed via HA custom repository:
-1. Add-ons > Add-on Store > Repositories > paste GitHub URL
-2. Install "Cleaning Schedule Tracker"
-3. Configure options (iCal URL, API key, cleaners)
-4. Start — appears in sidebar as "Cleaning Schedule"
+1. Add-ons > Add-on Store > Repositories > paste GitHub URL.
+2. Install "Cleaning Schedule Tracker".
+3. Configure options (iCal URL, API key, cleaners).
+4. Start — appears in sidebar as "Cleaning Schedule".
 
 Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 
-## Important Notes
+## Important notes
 
-- `init: false` in config.yaml is required — without it, the HA base image's s6-overlay conflicts with a bare `CMD`
-- Do NOT use Samba for iterative add-on development on HAOS from Windows — SMB write caching makes files stale
-- The Supervisor caches add-on configs — changing config.yaml for an existing slug requires a version bump
-- For local development, the app falls back to reading from the current directory when `/data/options.json` doesn't exist
+- **Always bump `config.yaml` version when pushing changes.** The Supervisor
+  caches add-on configs, and updates for an existing slug only take effect
+  on a version bump.
+- `init: false` in `config.yaml` is required — without it, the HA base
+  image's s6-overlay conflicts with a bare `CMD`. Phase 3 Step 3 may need
+  to revisit this when adding the Node.js sidecar; document the flip there.
+- Do NOT use Samba for iterative add-on development on HAOS from Windows —
+  SMB write caching makes files stale.
+- For local development, the app falls back to reading `options.json` from
+  the current directory when `/data/options.json` doesn't exist.
+- UI changes should be verified in a local Playwright (Chromium) run before
+  being reported as done. Playwright is a dev-only dependency — do **not**
+  add it to the add-on `requirements.txt`.
+- FullCalendar loads from CDN; the add-on won't work air-gapped. Vendor
+  later if that ever matters.
