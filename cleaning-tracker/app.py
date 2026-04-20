@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime, date, timedelta
@@ -119,6 +120,22 @@ def group_label(data, jid):
 
 
 # ── Cleaner color ─────────────────────────────────────────────────────────────
+
+def _parse_clean_time(notes: str):
+    """Return 'HH:MM:SS' parsed from a notes string like 'Time: 11:00 AM | ...'."""
+    if not notes:
+        return None
+    m = re.search(r'Time:\s*(\d{1,2}:\d{2}\s*(?:AM|PM)?)', notes, re.IGNORECASE)
+    if not m:
+        return None
+    ts = m.group(1).strip()
+    for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M"):
+        try:
+            return datetime.strptime(ts, fmt).strftime("%H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
 
 def cleaner_color(name: str) -> str:
     """Return a stable #RRGGBB color derived from the cleaner's name."""
@@ -2160,12 +2177,22 @@ def events_json():
 
                 border = "#fd7e14" if b.get("conflict") else bg
 
+                stay_title = (b.get("notes") or "Airbnb") if btype == "airbnb" else (b.get("notes") or "Custom stay")
+                stay_title = re.sub(r'\s*\|\s*Time:.*', '', stay_title, flags=re.IGNORECASE).strip() or stay_title
+                if btype == "airbnb":
+                    ev_start = f"{b['start']}T15:00:00"
+                    ev_end = f"{b['end']}T11:00:00"
+                    all_day = False
+                else:
+                    ev_start = b["start"]
+                    ev_end = fc_end.isoformat()
+                    all_day = True
                 event = {
                     "id": f"stay-{uid}",
-                    "title": (b.get("notes") or "Airbnb") if btype == "airbnb" else (b.get("notes") or "Custom stay"),
-                    "start": b["start"],
-                    "end": fc_end.isoformat(),
-                    "allDay": True,
+                    "title": stay_title,
+                    "start": ev_start,
+                    "end": ev_end,
+                    "allDay": all_day,
                     "display": "block",
                     "backgroundColor": bg,
                     "borderColor": border,
@@ -2196,11 +2223,13 @@ def events_json():
         bg_clean = cleaner_color(cleaner) if cleaner else "#dc3545"
         border_clean = "#198754" if confirmed else bg_clean
 
+        clean_time = b.get("clean_time") or _parse_clean_time(b.get("notes", ""))
+        clean_start = f"{clean_date.isoformat()}T{clean_time}" if clean_time else clean_date.isoformat()
         events.append({
             "id": f"clean-{uid}",
             "title": cleaner if cleaner else "Needs cleaner",
-            "start": clean_date.isoformat(),
-            "allDay": True,
+            "start": clean_start,
+            "allDay": not bool(clean_time),
             "display": "block",
             "backgroundColor": bg_clean,
             "borderColor": border_clean,
