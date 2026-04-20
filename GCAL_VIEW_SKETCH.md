@@ -1,83 +1,91 @@
 # GCal-as-View — Shipped + Roadmap
 
-Google Calendar is now the shared view for Joshua, Michelle, and the cleaners.
-The HA add-on is the **brain**: it owns `data.json`, runs the iCal sync, hosts
-the WhatsApp pipeline, and pushes a one-way projection to GCal. The add-on UI
-is no longer the primary viewing surface — it exists to do the things GCal
-can't: WhatsApp review and (soon) conflict resolution.
+Google Calendar is the shared view for Joshua, Michelle, and the cleaners.
+The HA add-on is the **brain**: it owns `data.json`, runs the iCal sync,
+hosts the WhatsApp pipeline, and pushes a one-way projection to GCal. The
+add-on UI's remaining job is the per-cleaner **notify queue** — deciding
+who needs a WhatsApp message and what to say.
 
-## What's shipped (as of 1.6.4)
+## Shipped
 
-- **`cleaning-tracker/gcal.py`** — one-way `data.json` → GCal projection.
-  Diffs by `extendedProperties.private.uid`, then insert/patch/delete.
-- **Service-account auth.** The add-on reads a service-account JSON from the
-  `gcal_service_account_json` option (schema: password). Calendar is shared
-  with the service-account email at "Make changes to events".
+### GCal projection (1.6.x → 1.7.x)
+
+- **`cleaning-tracker/gcal.py`** — one-way `data.json` → GCal. Diffs by
+  `extendedProperties.private.uid`, then insert/patch/delete.
+- **Service-account auth.** JSON key in option `gcal_service_account_json`;
+  calendar shared with the service-account email at "Make changes to events".
 - **Sync triggers.** `save_data()` fires a daemon-thread push after every
-  write; `POST /gcal/sync` does a manual run. Writes are coalesced under a
-  module-level lock — only one sync runs at a time, the rest skip.
-- **Dedupe.** `_list_existing` returns duplicates; each sync deletes them
-  before diffing.
-- **Local timezone.** Timed events are tagged `America/Vancouver`, matching
-  how `clean_time` and Airbnb check-in/out times are stored in `data.json`.
-- **Conflict signalling.** Events with `conflict=true` get `colorId=11` (red)
-  and a `⚠️ ` title prefix. Resolves on the next sync.
+  write; `POST /gcal/sync` does a manual run. Module-level lock serializes
+  runs — concurrent ones skip.
+- **Dedupe.** `_list_existing` flags any duplicate-uid events; each sync
+  deletes them before diffing.
+- **Local timezone.** Timed events are tagged `America/Vancouver`.
 - **Cancelled stays** are omitted from GCal (deleted).
+- **Drift signal on cleanings only.** Cleaning events whose booking has
+  unresolved `cleaner_commitment` drift get `colorId=11` (red) + `⚠️`
+  prefix. Stay events never get the warning. Resolves on the next sync
+  after "Mark notified".
+
+### Per-cleaner notify queue (1.7.x)
+
+`/` renders a one-cleaner-at-a-time focus card listing every booking whose
+`cleaner_commitment` snapshot diverges from current truth. Kinds:
+`new` (first assignment), `changed` (drift), `cancelled` (after commit),
+plus a separate **Unassigned** bucket for active Airbnb bookings with no
+cleaner. Pager via `?i=<n>`. "Mark notified" rewrites the commitment on
+every listed booking for that cleaner and advances.
+
+FullCalendar view is retired. `/events.json` is gone. The deprecated
+`conflict` field is no longer read or written. `/add`, `/edit/<uid>`,
+`/print` remain as escape hatches.
 
 ## What the add-on still owns
 
 - `data.json` (source of truth).
 - iCal sync from Airbnb.
-- WhatsApp paste flow + inbound pipeline + Review tab + JID mapping + group
-  labels.
-- **Per-cleaner notify queue at `/`** — drift detection between
-  `cleaner_commitment` (last communicated state) and current truth.
-  Replaces the FullCalendar view entirely.
+- WhatsApp paste flow + inbound pipeline + Review tab + JID mapping +
+  group labels.
+- Per-cleaner notify queue — drift detection driving both `/` and the
+  GCal `⚠️` signal.
 
-## What's next
+## Roadmap / open questions
 
-### Shipped — Per-cleaner notify queue (1.7.0)
+### Near-term
 
-`/` now renders a one-cleaner-at-a-time focus card listing every booking
-whose `cleaner_commitment` snapshot diverges from current truth (new
-assignment, date/time change, cancellation). "Mark notified" rewrites the
-commitment on every listed booking for that cleaner to match truth and
-advances to the next. An Unassigned bucket sits above the queue for
-active bookings without a cleaner. FullCalendar view retired.
+- **First-run noise.** Legacy data has no `cleaner_commitment` anywhere,
+  so on install every assigned booking appears as `new`. Resolution is
+  one "Mark notified" per cleaner. Haven't decided if that's acceptable
+  onboarding or if we want a one-shot "trust current state" admin action
+  that bulk-writes commitments to match truth. Revisit if Michelle finds
+  the initial flood painful.
+- **Playwright verification.** Task #8 — not yet run. The fix for
+  `current_bucket.items` (Jinja dot-access returning the `.items`
+  method) landed untested in the browser; first manual verify was in HA.
+  Should cover: mobile viewport (375×667), empty state, pager, Mark
+  notified, Unassigned-card assignment, plus a WhatsApp auto-apply
+  leg that writes `communicated_via="whatsapp"`.
 
-GCal red `⚠️` signal is now driven by the same drift check
-(`_needs_notify`) rather than the deprecated `conflict` field.
+### Deferred / rejected
 
-### Other deferred work
-
-- **Print view.** Still lives at `/print?month=YYYY-MM`. No reason to
-  retire it; Michelle occasionally prints a monthly sheet.
-- **Resolved-notify audit log.** Not built; revisit if Michelle asks.
-- **Per-line-item notify ticking.** MVP resolves a whole cleaner at once;
-  revisit if partial notifies turn out to be common.
+- **Resolved-notify audit log.** Not built. Revisit if Michelle asks.
+- **Per-line-item notify ticking.** MVP resolves a whole cleaner at
+  once. Revisit if partial notifies turn out to be common.
 - **Cleaner RSVP via GCal guest invites.** Skipped — WhatsApp pipeline
-  already handles confirmations. Revisit only if cleaners ask for it.
+  already handles confirmations.
+- **Stays vs cleanings split calendars.** Do cleaners want all stays or
+  just cleanings? Open; defer until someone complains.
+- **Print view retirement.** No — Michelle still prints `/print`.
 
 ## Auth — how we got here
 
-Initial plan was OAuth with a one-time refresh-token mint
-(`scripts/gcal_auth.py` + `InstalledAppFlow`). Google's consent screen
-threw `unknown_error` for this project regardless of scope, test-user
-casing, or fresh OAuth clients. Switched to a service account:
+Initial plan was OAuth with a one-time refresh-token mint. Google's
+consent screen threw `unknown_error` regardless of scope or test-user
+casing. Switched to a service account:
 
-- No consent screen, no test-users list, no 7-day refresh-token expiry on
-  apps in "Testing".
-- Access is controlled by sharing the target calendar with the service
+- No consent screen, no test-users list, no 7-day refresh-token expiry.
+- Access controlled by sharing the target calendar with the service
   account email, not by project IAM.
-- One option in HA (`gcal_service_account_json`) instead of three
-  (client id / secret / refresh token).
+- One option in HA instead of three (client id / secret / refresh token).
 
-`scripts/gcal_auth.py` still exists, but now just validates a downloaded
-service-account JSON key and prints the email to share the calendar with.
-
-## Open design decisions (still open)
-
-- Do cleaners want the whole year of stays, or just cleanings? Probably
-  just cleanings — fewer events, less noise. Could split into two
-  sub-calendars if needed.
-- Cancelled stays: deleted today. If Michelle wants a record, revisit.
+`scripts/gcal_auth.py` now just validates a downloaded JSON key and
+prints the email to share with.

@@ -1,13 +1,12 @@
 # Phase 1 Plan — Calendar-first UI
 
-> **Status (2026-04-20): superseded.** The FullCalendar home page shipped
-> as planned, but the project direction has since moved to Google Calendar
-> as the shared view. The FullCalendar view at `/` still works but is no
-> longer the primary surface; a dedicated conflict-manager page will
-> replace it. See `GCAL_VIEW_SKETCH.md` for current direction and TODOs.
-> This file is kept for historical context on the month/week/agenda
-> layout, custom-stay data model, and print view — all still live in the
-> codebase.
+> **Status (2026-04-20): fully superseded and removed.** The FullCalendar
+> home page shipped in Phase 1 but was retired in 1.7.0 when `/` was
+> replaced by the per-cleaner notify queue. See `GCAL_VIEW_SKETCH.md` for
+> current direction. Only the custom-stay data model and `/print` survive
+> from this plan — everything else (FullCalendar, `/events.json`, the
+> two-stays-overlap `conflict` field) has been deleted. This file exists
+> only as archaeology.
 
 ## Scope
 

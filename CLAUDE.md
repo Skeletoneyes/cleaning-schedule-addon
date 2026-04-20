@@ -15,17 +15,15 @@ ingress. No database — data lives in `/data/data.json` (persists across
 rebuilds). Configuration is read from `/data/options.json` (populated by HA
 from `config.yaml` options).
 
-**Current direction (1.6.x):** the add-on is the **brain**, Google Calendar
+**Current direction (1.7.x):** the add-on is the **brain**, Google Calendar
 is the **shared view**. `data.json` is the source of truth; `gcal.py` pushes
 a one-way projection to a GCal calendar shared with Michelle and the
-cleaners. The add-on UI exists to do the things GCal can't — WhatsApp review
-and (soon) conflict resolution. See `GCAL_VIEW_SKETCH.md` for the full
-picture and outstanding work.
+cleaners. The add-on UI's job is to handle everything GCal can't — the
+per-cleaner notify queue (see below) and WhatsApp review.
 
-The legacy FullCalendar view at `/` still works but is no longer the primary
-viewing surface. A dedicated conflict-manager page will replace it in a
-future session (tracked in `GCAL_VIEW_SKETCH.md`). The Review tab already
-handles WhatsApp triage, unmapped-sender mapping, and group labelling.
+The FullCalendar view is gone. `/` now renders a per-cleaner **notify
+queue** driven by `cleaner_commitment` drift — see
+`GCAL_VIEW_SKETCH.md` for rationale and shipped state.
 
 ### Key Files
 
@@ -35,13 +33,13 @@ cleaning-tracker/
 ├── config.yaml              # Add-on config: name, version, options schema
 ├── Dockerfile               # python:3.12-slim, pip install, runs app.py
 ├── requirements.txt         # flask, requests, icalendar, anthropic, google-api-*
-├── app.py                   # Entire application (Flask routes, templates, logic) — ~1800 lines
+├── app.py                   # Entire application (Flask routes, templates, logic) — ~1900 lines
 └── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
 scripts/
 ├── whatsapp_fixture.py      # Synthetic inbound-message harness for Phase 3
 └── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
 GCAL_VIEW_SKETCH.md          # Current direction: GCal-as-view. Shipped state + TODOs
-PHASE_1_PLAN.md              # Historical: FullCalendar-first UI. Superseded by GCAL_VIEW_SKETCH.md
+PHASE_1_PLAN.md              # Historical: FullCalendar-first UI. Superseded; kept only as archaeology
 PHASE_3_SKETCH.md            # WhatsApp automation — Step 1 shipped, Steps 2–3 pending
 ```
 
@@ -85,9 +83,17 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
   - `clean_time` — `"HH:MM:SS"` or null. Shown in the calendar title
     (`"Itzel · 11:00 AM"`) and editable on the edit page. `_parse_clean_time()`
     backfills this from legacy `notes: "Time: 11:00 AM | ..."` strings.
-  - `conflict` — set when two stays overlap; renders an orange border (unless
-    cancelled, which suppresses the border).
+  - `cleaner_commitment` — snapshot of the last state the cleaner was told:
+    `{cleaner, date, clean_time, communicated_at, communicated_via}`. Written
+    by `ack_notified()` on manual "Mark notified" and by the WhatsApp auto-
+    apply path (`communicated_via="whatsapp"`). Absent on legacy bookings
+    and on freshly-assigned ones — in both cases they show up in the notify
+    queue as "new" until cleared. Drift between this snapshot and current
+    truth is what drives the `/` view and the GCal `⚠️` signal.
   - `notes` — free-text.
+  - **Deprecated:** `conflict` — old two-stays-overlap flag. No longer
+    written; `needs_notify()` / `review_item()` supersede it. Safe to
+    ignore on read.
 - `messages` — Phase 3 inbound WhatsApp log. Entries:
   `{id, timestamp, sender_jid, group_jid, text, parsed, applied_uid,
     review_state: "auto"|"pending"|"ignored"}`.
@@ -105,21 +111,29 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
   `type == "airbnb"` — custom stays and manual cleanings are never
   auto-cancelled by the sync sweep.
 
-### Calendar UI (`/`)
-- FullCalendar views: `dayGridMonth` (default), `dayGridWeek`, `listWeek`
-  (labelled "Agenda"). On mobile the view switcher moves to a footer toolbar.
-- Event feed: `GET /events.json?start=&end=` returns two streams:
-  - **Stays** — Airbnb stays render as timed events with 15:00 check-in and
-    11:00 checkout; custom stays render as all-day bars. Cancelled stays are
-    muted (`opacity: 0.7`) and drop the conflict border.
-  - **Cleanings** — pill events on checkout day, coloured from the cleaner
-    name via a deterministic HSL hash (`cleaner_color()`). Title includes
-    the cleaning time when set. Unassigned events show "Needs cleaner".
-- Past days and past events are greyscaled
-  (`filter: grayscale(100%); opacity: 0.6`) with a lighter day-cell
-  background, so the eye snaps to upcoming work.
-- Clicking an event goes to `/edit/<uid>`. Clicking an empty day goes to
-  `/add?date=YYYY-MM-DD`.
+### Notify queue (`/`)
+The home page renders a focused, one-cleaner-at-a-time card listing every
+booking whose `cleaner_commitment` diverges from current truth. A booking
+enters the queue when:
+- `cleaner` is assigned but no `cleaner_commitment` exists → kind `new`
+- the commitment exists but `(cleaner, date, clean_time)` has drifted →
+  kind `changed`
+- the booking was cancelled after a commitment was written → kind
+  `cancelled`
+- an active Airbnb booking has no `cleaner` at all → goes to the separate
+  **Unassigned** bucket at the top of the page
+
+Buckets are grouped by cleaner and sorted by name. `?i=<n>` paginates
+through buckets. "Mark notified" (`POST /review/notify/<slug>`) rewrites
+the commitment on every listed booking for that cleaner to match current
+truth and advances to the next bucket. There's no per-line ticking —
+unit of work is one cleaner = one WhatsApp message.
+
+Empty state: "All cleaners up to date ✓". The WhatsApp Review tab lives
+as a second panel on the same page (tab-switched, not a separate route).
+
+Helpers: `review_item(uid, b)`, `review_queue(data)`, `needs_notify(b)`,
+`ack_notified(booking, via)` in `app.py` around line 500.
 
 ### Edit / add / delete
 - `/add` — one form, radio for Cleaning vs Stay. Stays require start+end;
@@ -174,10 +188,14 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
   (same `uid` tag, multiple events); they're deleted at the start of each
   sync.
 - Manual trigger: `POST /gcal/sync` (button on the home page when enabled).
-- Conflicts: events with `conflict` truthy get `colorId=11` (red) and a
-  `⚠️ ` title prefix; resolves on the next sync.
+- **Drift signal (cleanings only):** cleaning events whose booking has
+  unresolved drift (`needs_notify(b)` → `_needs_notify` annotation on the
+  snapshot passed to `sync_to_gcal`) get `colorId=11` (red) and a `⚠️ `
+  title prefix. Stay events never get this treatment — red means "a
+  cleaner needs to be told", which is always a property of the cleaning,
+  not the stay. Resolves on the next sync after "Mark notified".
 - Cleaner colour: md5-hashed onto 9 GCal palette slots (slot 8 reserved for
-  cancelled if ever shown, 11 reserved for conflict/unassigned).
+  cancelled if ever shown, 11 reserved for drift/unassigned).
 - Timed events are tagged `America/Vancouver` (constant `LOCAL_TZ` in
   `gcal.py`), matching how `clean_time` and Airbnb check-in/out are stored
   in `data.json` as naive local clock times.
@@ -218,5 +236,3 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 - UI changes should be verified in a local Playwright (Chromium) run before
   being reported as done. Playwright is a dev-only dependency — do **not**
   add it to the add-on `requirements.txt`.
-- FullCalendar loads from CDN; the add-on won't work air-gapped. Vendor
-  later if that ever matters.

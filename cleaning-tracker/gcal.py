@@ -107,13 +107,11 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
                 ev_start = {"date": b["start"]}
                 ev_end = {"date": (b_end + timedelta(days=1)).isoformat()}
             title = "Airbnb" if btype == "airbnb" else (b.get("notes") or "Custom stay")
-            if conflict:
-                title = "⚠️ " + title
             body = {
                 "summary": title,
                 "start": ev_start,
                 "end": ev_end,
-                "colorId": _COLOR_CONFLICT if conflict else "7",  # peacock for stays
+                "colorId": "7",  # peacock for stays
                 "extendedProperties": {
                     "private": {
                         "source": SOURCE_TAG,
@@ -125,8 +123,6 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
                     }
                 },
             }
-            if conflict:
-                body["description"] = "Conflicting booking — resolve in the add-on."
             desired[stay_uid] = body
 
         # ── Cleaning event ──────────────────────────────────────────────
@@ -177,7 +173,7 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
             },
         }
         if conflict:
-            body["description"] = "Conflicting booking — resolve in the add-on."
+            body["description"] = "Cleaner not yet notified of current state — open the add-on to confirm."
         desired[clean_uid] = body
 
     return desired
