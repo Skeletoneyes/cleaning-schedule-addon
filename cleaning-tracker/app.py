@@ -1041,10 +1041,9 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   <a href="{{ prefix }}/print" class="btn btn-outline">Print Month</a>
 </div>
 
-<!-- Top-level tabs: Calendar / List / Review -->
+<!-- Top-level tabs: Calendar / Review -->
 <div class="top-tabs">
   <button class="top-tab active" onclick="showTopTab('calendar-tab', this)">Calendar</button>
-  <button class="top-tab" onclick="showTopTab('list-tab', this)">Manage</button>
   <button class="top-tab" onclick="showTopTab('review-tab', this)" id="review-tab-btn">
     Review{% if pending_count %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ pending_count }}</span>{% endif %}
   </button>
@@ -1150,13 +1149,9 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   {% endfor %}
 </div>
 
-<!-- List panel — existing UI embedded inline -->
-<div id="list-tab" class="top-panel">
 """
 
 _CALENDAR_FOOT = """
-</div><!-- /#list-tab -->
-
 <script>
 function showTopTab(id, btn) {
   document.querySelectorAll('.top-panel').forEach(p => p.classList.remove('active'));
@@ -1209,7 +1204,7 @@ document.addEventListener('DOMContentLoaded', function() {
 """
 
 # Concatenate at module load: head + list panel body + foot.
-CALENDAR_TEMPLATE = _CALENDAR_HEAD + LIST_PANEL_TEMPLATE + _CALENDAR_FOOT
+CALENDAR_TEMPLATE = _CALENDAR_HEAD + _CALENDAR_FOOT
 
 ADD_TEMPLATE = """
 <!DOCTYPE html>
