@@ -2253,9 +2253,16 @@ def events_json():
 
         clean_time = b.get("clean_time") or _parse_clean_time(b.get("notes", ""))
         clean_start = f"{clean_date.isoformat()}T{clean_time}" if clean_time else clean_date.isoformat()
+        clean_label = cleaner if cleaner else "Needs cleaner"
+        if clean_time:
+            try:
+                t = datetime.strptime(clean_time, "%H:%M:%S")
+                clean_label += f" · {t.strftime('%I:%M %p').lstrip('0')}"
+            except ValueError:
+                pass
         events.append({
             "id": f"clean-{uid}",
-            "title": cleaner if cleaner else "Needs cleaner",
+            "title": clean_label,
             "start": clean_start,
             "allDay": not bool(clean_time),
             "display": "block",
