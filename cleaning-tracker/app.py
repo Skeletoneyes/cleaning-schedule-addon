@@ -1044,7 +1044,7 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
 <!-- Top-level tabs: Calendar / List / Review -->
 <div class="top-tabs">
   <button class="top-tab active" onclick="showTopTab('calendar-tab', this)">Calendar</button>
-  <button class="top-tab" onclick="showTopTab('list-tab', this)">List</button>
+  <button class="top-tab" onclick="showTopTab('list-tab', this)">Manage</button>
   <button class="top-tab" onclick="showTopTab('review-tab', this)" id="review-tab-btn">
     Review{% if pending_count %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ pending_count }}</span>{% endif %}
   </button>
@@ -1180,6 +1180,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const isMobile = window.innerWidth < 600;
   const calendar = new FullCalendar.Calendar(calendarEl, {
     initialView: isMobile ? 'listWeek' : 'dayGridMonth',
+    buttonText: { listWeek: 'Agenda', dayGridMonth: 'Month', dayGridWeek: 'Week' },
     headerToolbar: isMobile
       ? { left: 'prev,next', center: 'title', right: 'today' }
       : { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
