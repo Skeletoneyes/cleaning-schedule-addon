@@ -1176,6 +1176,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const calendar = new FullCalendar.Calendar(calendarEl, {
     initialView: isMobile ? 'listWeek' : 'dayGridMonth',
     buttonText: { listWeek: 'Agenda', dayGridMonth: 'Month', dayGridWeek: 'Week' },
+    displayEventTime: false,
     headerToolbar: isMobile
       ? { left: 'prev,next', center: 'title', right: 'today' }
       : { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
