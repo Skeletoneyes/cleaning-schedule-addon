@@ -2178,7 +2178,15 @@ def events_json():
                 border = "#fd7e14" if b.get("conflict") else bg
 
                 stay_title = (b.get("notes") or "Airbnb") if btype == "airbnb" else (b.get("notes") or "Custom stay")
-                stay_title = re.sub(r'\s*\|\s*Time:.*', '', stay_title, flags=re.IGNORECASE).strip() or stay_title
+                # Strip "Time: <time> | remainder" prefix, keeping only the remainder
+                m = re.match(r'^Time:[^|]*\|\s*(.+)$', stay_title, re.IGNORECASE)
+                if m:
+                    stay_title = m.group(1).strip()
+                else:
+                    stay_title = re.sub(r'^Time:.*$', '', stay_title, re.IGNORECASE).strip()
+                # Strip "... | Time: ..." suffix
+                stay_title = re.sub(r'\s*\|\s*Time:.*$', '', stay_title, flags=re.IGNORECASE).strip()
+                stay_title = stay_title or ("Airbnb" if btype == "airbnb" else "Custom stay")
                 if btype == "airbnb":
                     ev_start = f"{b['start']}T15:00:00"
                     ev_end = f"{b['end']}T11:00:00"
