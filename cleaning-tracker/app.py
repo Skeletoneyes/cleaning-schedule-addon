@@ -1013,6 +1013,16 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   .top-panel.active { display: block; }
   .fc-event { cursor: pointer; }
   .cancelled-stay { opacity: 0.45; }
+  /* Past days: grey background and dimmed day numbers */
+  .fc .fc-day-past:not(.fc-day-other) { background-color: #f0f0f0; }
+  .fc .fc-day-past .fc-daygrid-day-number { color: #bbb; }
+  /* Past events: greyscale preserving brightness differences */
+  .fc .fc-day-past .fc-event,
+  .fc .event-past { filter: grayscale(100%); opacity: 0.6; }
+  /* Past day headings in agenda/list view */
+  .fc .fc-list-day-past th { background: #efefef; }
+  .fc .fc-list-day-past .fc-list-day-text,
+  .fc .fc-list-day-past .fc-list-day-side-text { color: #aaa; }
   @media (max-width: 600px) {
     .fc .fc-toolbar.fc-footer-toolbar { margin-top: 4px; }
     .fc .fc-toolbar-title { font-size: 1.1rem; }
@@ -1177,6 +1187,11 @@ document.addEventListener('DOMContentLoaded', function() {
     initialView: isMobile ? 'listWeek' : 'dayGridMonth',
     buttonText: { listWeek: 'Agenda', dayGridMonth: 'Month', dayGridWeek: 'Week' },
     displayEventTime: false,
+    eventClassNames: function(arg) {
+      const today = new Date(); today.setHours(0,0,0,0);
+      const end = arg.event.end || arg.event.start;
+      return end < today ? ['event-past'] : [];
+    },
     headerToolbar: isMobile
       ? { left: 'prev,next', center: 'title', right: 'today' }
       : { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
