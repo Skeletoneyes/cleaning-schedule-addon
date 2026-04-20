@@ -1012,7 +1012,7 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
   .top-panel { display: none; }
   .top-panel.active { display: block; }
   .fc-event { cursor: pointer; }
-  .cancelled-stay { opacity: 0.45; }
+  .cancelled-stay { opacity: 0.7; }
   /* Past days: grey background and dimmed day numbers */
   .fc .fc-day-past:not(.fc-day-other) { background-color: #f0f0f0; }
   .fc .fc-day-past .fc-daygrid-day-number { color: #bbb; }
@@ -1371,8 +1371,16 @@ EDIT_TEMPLATE = """
   {% endif %}
 </div>
 
-<!-- Delete (only for manual/custom types) -->
-{% if deletable %}
+<!-- Dismiss (cancelled bookings) -->
+{% if booking.status == 'cancelled' %}
+<div class="delete-zone">
+  <h3>Dismiss</h3>
+  <p style="font-size:0.85rem;color:#666;margin-bottom:10px;">Remove this cancelled booking from the calendar.</p>
+  <form action="{{ prefix }}/delete/{{ uid }}" method="POST" onsubmit="return confirm('Dismiss this cancelled booking?');">
+    <button type="submit" class="btn-danger">Dismiss</button>
+  </form>
+</div>
+{% elif deletable %}
 <div class="delete-zone">
   <h3>Delete</h3>
   <p style="font-size:0.85rem;color:#666;margin-bottom:10px;">Permanently removes this entry. Cannot be undone.</p>
@@ -1778,7 +1786,7 @@ def edit(uid):
 def delete_booking(uid):
     data = load_data()
     booking = data["bookings"].get(uid)
-    if booking and booking.get("type") in ("custom_stay", "manual_cleaning"):
+    if booking and (booking.get("type") in ("custom_stay", "manual_cleaning") or booking.get("status") == "cancelled"):
         del data["bookings"][uid]
         save_data(data)
     return redirect(ingress_prefix() + "/")
