@@ -30,42 +30,31 @@ can't: WhatsApp review and (soon) conflict resolution.
 - iCal sync from Airbnb.
 - WhatsApp paste flow + inbound pipeline + Review tab + JID mapping + group
   labels.
-- Conflict detection (Python-side; GCal has no native overlap concept).
-- The legacy FullCalendar view at `/`. Still functional; no longer primary.
+- **Per-cleaner notify queue at `/`** — drift detection between
+  `cleaner_commitment` (last communicated state) and current truth.
+  Replaces the FullCalendar view entirely.
 
 ## What's next
 
-### TODO — Conflict-manager UI (future session)
+### Shipped — Per-cleaner notify queue (1.7.0)
 
-The FullCalendar view has always doubled as both "browse everything" and
-"resolve conflicts". Once cleaners and Michelle are on GCal, only the latter
-matters inside the add-on. Design goal: a single page that lists exactly the
-bookings where `conflict=true`, shows the overlapping pair(s), and offers
-the minimum set of actions to resolve each (dismiss, reassign cleaner,
-edit time/date, mark cancelled).
+`/` now renders a one-cleaner-at-a-time focus card listing every booking
+whose `cleaner_commitment` snapshot diverges from current truth (new
+assignment, date/time change, cancellation). "Mark notified" rewrites the
+commitment on every listed booking for that cleaner to match truth and
+advances to the next. An Unassigned bucket sits above the queue for
+active bookings without a cleaner. FullCalendar view retired.
 
-Open questions to settle when we pick this up:
-
-- Does the current FullCalendar home page get replaced entirely, or do we
-  keep a read-only month view alongside a dedicated `/conflicts` page?
-- Should the unassigned-cleanings list live on the same page as the
-  conflict list, or be its own view?
-- Do we need a resolved-conflict audit log, or is "it's no longer on the
-  list" sufficient feedback?
-- How do WhatsApp-driven changes (e.g. cleaner declines, re-assignment)
-  interact with conflict state — should the Review tab surface the
-  conflict badge, or link over to `/conflicts`?
-
-Until this is built, conflict resolution happens on the existing
-`/edit/<uid>` page after spotting the red ⚠️ event on GCal.
+GCal red `⚠️` signal is now driven by the same drift check
+(`_needs_notify`) rather than the deprecated `conflict` field.
 
 ### Other deferred work
 
 - **Print view.** Still lives at `/print?month=YYYY-MM`. No reason to
   retire it; Michelle occasionally prints a monthly sheet.
-- **FullCalendar view retirement.** Kept as a fallback. Can be removed
-  once the conflict-manager UI lands and nothing else depends on the `/`
-  route being a calendar.
+- **Resolved-notify audit log.** Not built; revisit if Michelle asks.
+- **Per-line-item notify ticking.** MVP resolves a whole cleaner at once;
+  revisit if partial notifies turn out to be common.
 - **Cleaner RSVP via GCal guest invites.** Skipped — WhatsApp pipeline
   already handles confirmations. Revisit only if cleaners ask for it.
 

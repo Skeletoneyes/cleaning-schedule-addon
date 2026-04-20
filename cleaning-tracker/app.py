@@ -90,8 +90,11 @@ def save_data(data):
         json.dump(data, f, indent=2, default=str)
     if GCAL_ENABLED:
         # Snapshot the data so the worker thread doesn't race with further
-        # mutations by the caller.
+        # mutations by the caller. Annotate bookings with drift state so gcal
+        # can flag them without re-deriving the logic.
         snapshot = json.loads(json.dumps(data, default=str))
+        for b in snapshot.get("bookings", {}).values():
+            b["_needs_notify"] = needs_notify(b)
         threading.Thread(target=_gcal_push, args=(snapshot,), daemon=True).start()
 
 
@@ -218,14 +221,6 @@ def sync_ical():
 
         if uid in data["bookings"]:
             b = data["bookings"][uid]
-            if b.get("cleaner") and (b["start"] != start_str or b["end"] != end_str):
-                if not b.get("conflict"):
-                    b["conflict"] = {
-                        "type": "dates_changed",
-                        "old_start": b["start"],
-                        "old_end": b["end"],
-                        "detected": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                    }
             b["start"] = start_str
             b["end"] = end_str
             b["status"] = "active"
@@ -250,93 +245,10 @@ def sync_ical():
                 b["status"] = "complete"
             else:
                 b["status"] = "cancelled"
-            if b.get("cleaner") and not b.get("conflict"):
-                b["conflict"] = {
-                    "type": "cancelled",
-                    "old_start": b["start"],
-                    "old_end": b["end"],
-                    "detected": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                }
 
     data["last_sync"] = datetime.now().isoformat()
     save_data(data)
     return data, None
-
-
-# ── WhatsApp parsing via LLM ────────────────────────────────────────────────
-
-def parse_whatsapp_with_llm(chat_text, bookings):
-    """Use Claude Haiku to parse WhatsApp chat and match to bookings."""
-    if not ANTHROPIC_API_KEY:
-        return None, "No Anthropic API key configured. Set it in the add-on options."
-
-    # Build a list of booking checkout dates for the LLM
-    today = date.today()
-    booking_list = []
-    for uid, b in bookings.items():
-        if b["status"] != "active":
-            continue
-        end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-        if end < today:
-            continue
-        start = datetime.strptime(b["start"], "%Y-%m-%d").date()
-        booking_list.append({
-            "uid": uid,
-            "checkin": b["start"],
-            "checkout": b["end"],
-            "label": f"{start.strftime('%b %d')} → {end.strftime('%b %d')}",
-        })
-
-    booking_list.sort(key=lambda x: x["checkout"])
-
-    prompt = f"""Parse this WhatsApp chat about cleaning schedules. Cleaning happens on booking checkout dates.
-
-Bookings (checkout = cleaning day):
-{json.dumps(booking_list)}
-
-Chat:
----
-{chat_text}
----
-
-Match each date in the chat to the nearest booking checkout (within 1 day). Status: "confirmed" if they gave a time or said yes, "declined" if "I'm full"/can't, else "unclear".
-
-Return ONLY valid JSON, no other text. Keep notes very short (under 10 words). Omit null fields:
-{{"matches":[{{"booking_uid":"uid","booking_label":"label","cleaning_date":"YYYY-MM-DD","cleaner_name":"name","status":"confirmed|declined|unclear","time":"time or omit","note":"short note"}}],"unmatched":[{{"cleaning_date":"YYYY-MM-DD","cleaner_name":"name","status":"...","note":"short"}}],"summary":"one line"}}"""
-
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 8192,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        text = result["content"][0]["text"]
-
-        # Extract JSON from response (handle markdown code blocks)
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0]
-        parsed = json.loads(text)
-        return parsed, None
-
-    except requests.exceptions.HTTPError as e:
-        return None, f"Anthropic API error: {e.response.status_code} - {e.response.text[:200]}"
-    except json.JSONDecodeError as e:
-        return None, f"Failed to parse LLM response as JSON: {e}"
-    except Exception as e:
-        return None, f"Error calling Anthropic API: {e}"
 
 
 # ── Inbound WhatsApp: message parsing with chat context ─────────────────────
@@ -570,20 +482,147 @@ def _apply_booking_change(data, booking_uid, cleaner_name, action, msg):
             booking["cleaner"] = cleaner_name
             booking["cleaner_since"] = now
         booking["confirmed"] = True
+        # Cleaner has confirmed via WhatsApp — record that as the notified state.
+        ack_notified(booking, via="whatsapp")
     elif action == "decline":
         # Clear the cleaner so the booking surfaces as "needs cleaner" again.
         # Preserve notes so the history of what the cleaner said is visible.
         if booking.get("cleaner") == cleaner_name:
             booking["cleaner"] = None
             booking["cleaner_since"] = None
+            booking.pop("cleaner_commitment", None)
         booking["confirmed"] = False
     # Record the message id that last mutated this booking.
     booking["last_wa_msg_id"] = msg.get("id")
 
 
+# ── Commitment / review queue ───────────────────────────────────────────────
+
+def cleaning_date_for(b):
+    """The date a cleaner would come, or None for custom stays."""
+    if b.get("type") == "custom_stay":
+        return None
+    return b.get("end")
+
+
+def _truth_tuple(b):
+    """Current (cleaner, date, clean_time) snapshot, or None if not a cleaning."""
+    d = cleaning_date_for(b)
+    if not d:
+        return None
+    return (b.get("cleaner"), d, b.get("clean_time"))
+
+
+def _commit_tuple(c):
+    if not c:
+        return None
+    return (c.get("cleaner"), c.get("date"), c.get("clean_time"))
+
+
+def review_item(uid, b):
+    """Diff description for one booking, or None if it's settled."""
+    if b.get("type") == "custom_stay":
+        return None
+    end_str = b.get("end")
+    if not end_str:
+        return None
+    try:
+        end_dt = datetime.strptime(end_str, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    today = date.today()
+    commitment = b.get("cleaner_commitment")
+    status = b.get("status", "active")
+
+    if status == "cancelled":
+        if not commitment:
+            return None
+        if end_dt < today - timedelta(days=1):
+            return None
+        return {
+            "uid": uid, "kind": "cancelled",
+            "cleaner": commitment.get("cleaner") or b.get("cleaner"),
+            "booking": b, "date": end_str,
+            "was": _commit_tuple(commitment), "now": None,
+        }
+
+    if end_dt < today:
+        return None
+
+    cleaner = b.get("cleaner")
+    if not cleaner:
+        if b.get("type", "airbnb") == "airbnb":
+            return {
+                "uid": uid, "kind": "unassigned", "cleaner": None,
+                "booking": b, "date": end_str, "was": None,
+                "now": _truth_tuple(b),
+            }
+        return None
+
+    if not commitment:
+        return {
+            "uid": uid, "kind": "new", "cleaner": cleaner, "booking": b,
+            "date": end_str, "was": None, "now": _truth_tuple(b),
+        }
+
+    if _commit_tuple(commitment) == _truth_tuple(b):
+        return None
+
+    return {
+        "uid": uid, "kind": "changed", "cleaner": cleaner, "booking": b,
+        "date": end_str,
+        "was": _commit_tuple(commitment), "now": _truth_tuple(b),
+    }
+
+
+def needs_notify(b):
+    """True if this booking has unresolved drift (used by gcal signalling)."""
+    return review_item(None, b) is not None
+
+
+def review_queue(data):
+    """(buckets, unassigned) where buckets = [{cleaner, items}, ...]."""
+    by_cleaner = {}
+    unassigned = []
+    for uid, b in data.get("bookings", {}).items():
+        item = review_item(uid, b)
+        if not item:
+            continue
+        if item["kind"] == "unassigned":
+            unassigned.append(item)
+        else:
+            by_cleaner.setdefault(item["cleaner"], []).append(item)
+    unassigned.sort(key=lambda x: x["date"])
+    buckets = []
+    for cleaner, items in sorted(by_cleaner.items(), key=lambda kv: (kv[0] or "")):
+        items.sort(key=lambda x: x["date"])
+        buckets.append({"cleaner": cleaner, "items": items})
+    return buckets, unassigned
+
+
+def ack_notified(booking, via):
+    """Stamp cleaner_commitment to match current truth. For cancelled bookings,
+    remove the commitment (the cleaner now knows it's off)."""
+    if booking.get("status") == "cancelled":
+        booking.pop("cleaner_commitment", None)
+        return
+    cleaner = booking.get("cleaner")
+    d = cleaning_date_for(booking)
+    if not cleaner or not d:
+        return
+    booking["cleaner_commitment"] = {
+        "cleaner": cleaner,
+        "date": d,
+        "clean_time": booking.get("clean_time"),
+        "communicated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "communicated_via": via,
+    }
+
+
 # ── HTML Templates ───────────────────────────────────────────────────────────
 
-# Shared CSS used by both the legacy TEMPLATE and the new CALENDAR_TEMPLATE.
+# Shared CSS used by FOCUS_TEMPLATE and other pages (add/edit/print).
 _SHARED_STYLES = """
   :root {
     --green: #d4edda; --red: #ffcccb; --yellow: #fff3cd;
@@ -706,399 +745,7 @@ _SHARED_STYLES = """
   }
 """
 
-# Body content shared between TEMPLATE and the List tab of CALENDAR_TEMPLATE.
-# Does NOT include <html>/<head>/<body> tags — those are supplied by the
-# wrapping template.
-LIST_PANEL_TEMPLATE = """
-<h1>Cleaning Schedule</h1>
-<p class="subtitle">
-  Last synced: {{ last_sync or "Never" }}
-  {% if error %}<span style="color:red"> | Sync error: {{ error }}</span>{% endif %}
-</p>
-
-{% if no_ical %}
-<div class="config-warning">
-  No iCal URL configured. Go to <strong>Settings &gt; Add-ons &gt; Cleaning Schedule Tracker &gt; Configuration</strong> and set your Airbnb calendar URL.
-</div>
-{% endif %}
-
-<div class="sync-bar">
-  <form action="{{ prefix }}/sync" method="POST">
-    <button type="submit" class="btn btn-primary">Sync Airbnb</button>
-  </form>
-  <a href="{{ prefix }}/add" class="btn btn-secondary">+ Manual Cleaning</a>
-</div>
-
-<!-- Stats -->
-<div class="stats">
-  <div class="stat">
-    <div class="stat-num" style="color:#dc3545">{{ needs_cleaner }}</div>
-    <div class="stat-label">Need Cleaner</div>
-  </div>
-  <div class="stat">
-    <div class="stat-num" style="color:#ffc107">{{ assigned_count }}</div>
-    <div class="stat-label">Assigned</div>
-  </div>
-  <div class="stat">
-    <div class="stat-num" style="color:#198754">{{ confirmed_count }}</div>
-    <div class="stat-label">Confirmed</div>
-  </div>
-  <div class="stat">
-    <div class="stat-num">{{ upcoming_count }}</div>
-    <div class="stat-label">Upcoming</div>
-  </div>
-  {% if conflicts_count %}
-  <div class="stat">
-    <div class="stat-num" style="color:#fd7e14">{{ conflicts_count }}</div>
-    <div class="stat-label">Needs Review</div>
-  </div>
-  {% endif %}
-</div>
-
-<!-- Conflict / Needs Review section -->
-{% if conflicts %}
-<div style="margin-bottom:16px;">
-  <h2 style="font-size:1.05rem;font-weight:700;color:#fd7e14;margin-bottom:10px;">&#9888; Needs Review</h2>
-  {% for b in conflicts %}
-  <div class="card conflicted">
-    <div class="card-header">
-      <div>
-        {% if b.conflict.type == 'dates_changed' %}
-        <div class="dates">{{ b.start_fmt }} &rarr; {{ b.end_fmt }}</div>
-        <div style="font-size:0.85rem;color:#fd7e14;margin-top:2px;">
-          Was: {{ b.conflict.old_start }} &rarr; {{ b.conflict.old_end }}
-        </div>
-        {% else %}
-        <div class="dates">{{ b.start_fmt }} &rarr; {{ b.end_fmt }}</div>
-        {% endif %}
-        <div style="font-size:0.85rem;margin-top:4px;">
-          <strong>{{ b.conflict_fmt }}</strong>
-        </div>
-        <div style="font-size:0.85rem;color:#666;margin-top:2px;">
-          Cleaner: <strong>{{ b.cleaner }}</strong>
-          {% if b.cleaner_since_fmt %}<span style="color:#999;"> · assigned {{ b.cleaner_since_fmt }}</span>{% endif %}
-        </div>
-      </div>
-      <span class="badge" style="background:#ffe8cc;color:#854d0e;">Review</span>
-    </div>
-    <div class="card-actions" style="margin-top:10px;">
-      <form action="{{ prefix }}/resolve/{{ b.uid }}" method="POST" style="display:inline;">
-        <input type="hidden" name="action" value="keep">
-        <button type="submit" class="btn btn-sm btn-success">Keep Cleaning</button>
-      </form>
-      <form action="{{ prefix }}/resolve/{{ b.uid }}" method="POST" style="display:inline;">
-        <input type="hidden" name="action" value="cancel">
-        <button type="submit" class="btn btn-sm btn-danger">Cancel Cleaning</button>
-      </form>
-      {% if b.conflict.type == 'dates_changed' %}
-      <form action="{{ prefix }}/resolve/{{ b.uid }}" method="POST" style="display:inline;">
-        <input type="hidden" name="action" value="move">
-        <button type="submit" class="btn btn-sm btn-warning">Move Cleaning</button>
-      </form>
-      {% endif %}
-    </div>
-  </div>
-  {% endfor %}
-</div>
-{% endif %}
-
-<!-- Tabs -->
-<div class="tabs">
-  <button class="tab active" onclick="showTab('upcoming')">Upcoming</button>
-  <button class="tab" onclick="showTab('past')">Past</button>
-  <button class="tab" onclick="showTab('whatsapp')">WhatsApp</button>
-</div>
-
-<!-- Upcoming Panel -->
-<div id="upcoming" class="panel active">
-  {% if not upcoming %}
-    <div class="empty">No upcoming bookings. Hit "Sync Airbnb" to fetch.</div>
-  {% endif %}
-  {% for b in upcoming %}
-  <div class="card {{ b.card_class }}">
-    <div class="card-header">
-      <div>
-        <div class="dates">{{ b.start_fmt }} → {{ b.end_fmt }}</div>
-        <div class="cleaning-date">Clean by: {{ b.end_fmt }} (checkout day)</div>
-        {% if b.nights %}
-        <div style="font-size:0.8rem;color:#666">{{ b.nights }} night{{ 's' if b.nights != 1 }} · {{ b.days_until }}</div>
-        {% endif %}
-      </div>
-      <span class="badge badge-{{ b.status }}">{{ b.status }}</span>
-    </div>
-    <div class="card-actions">
-      <form class="assign-form" action="{{ prefix }}/assign/{{ b.uid }}" method="POST" style="display:flex;gap:4px;align-items:center;">
-        <select name="cleaner">
-          <option value="">-- Assign --</option>
-          {% for c in cleaners %}
-          <option value="{{ c }}" {{ 'selected' if b.cleaner == c }}>{{ c }}</option>
-          {% endfor %}
-        </select>
-        <button type="submit" class="btn btn-sm btn-outline">Save</button>
-      </form>
-      {% if b.cleaner and not b.confirmed %}
-        <form action="{{ prefix }}/confirm/{{ b.uid }}" method="POST" style="display:inline;">
-          <button type="submit" class="btn btn-sm btn-success">Mark Confirmed</button>
-        </form>
-      {% endif %}
-      {% if b.cleaner and not b.paid %}
-        <form action="{{ prefix }}/pay/{{ b.uid }}" method="POST" style="display:inline;">
-          <button type="submit" class="btn btn-sm btn-warning">Mark Paid</button>
-        </form>
-      {% elif b.paid %}
-        <span class="badge" style="background:#d4edda;color:#155724">Paid</span>
-      {% endif %}
-    </div>
-    {% if b.notes %}
-    <div style="margin-top:6px;font-size:0.85rem;color:#666">{{ b.notes }}</div>
-    {% endif %}
-    {% if b.cleaner_since %}
-    <div style="margin-top:4px;font-size:0.75rem;color:#999">Assigned: {{ b.cleaner_since_fmt }}</div>
-    {% endif %}
-  </div>
-  {% endfor %}
-</div>
-
-<!-- Past Panel -->
-<div id="past" class="panel">
-  {% if not past %}
-    <div class="empty">No past bookings yet.</div>
-  {% endif %}
-  {% for b in past %}
-  <div class="card {{ b.card_class }}">
-    <div class="card-header">
-      <div>
-        <div class="dates">{{ b.start_fmt }} → {{ b.end_fmt }}</div>
-      </div>
-      <span class="badge badge-{{ b.status }}">{{ b.status }}</span>
-    </div>
-    <div style="font-size:0.85rem;color:#666;margin-top:4px;">
-      Cleaner: {{ b.cleaner or "None" }} ·
-      {{ "Paid" if b.paid else "Not Paid" }}
-    </div>
-  </div>
-  {% endfor %}
-</div>
-
-<!-- WhatsApp Panel -->
-<div id="whatsapp" class="panel">
-  <p style="margin-bottom:8px;font-size:0.9rem;">
-    Paste a WhatsApp chat below. An AI will parse the messages, match dates to bookings,
-    and detect confirmations or declines.
-  </p>
-  <form action="{{ prefix }}/whatsapp" method="POST">
-    <textarea name="chat" class="whatsapp-box" placeholder="Paste WhatsApp chat here — any format works.">{{ wa_text or "" }}</textarea>
-    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
-      <button type="submit" class="btn btn-primary">Parse Chat</button>
-      <label style="font-size:0.85rem;">
-        <input type="checkbox" name="auto_apply" value="1"> Auto-apply confirmations to bookings
-      </label>
-    </div>
-  </form>
-
-  {% if wa_error %}
-  <div class="error-box">{{ wa_error }}</div>
-  {% endif %}
-
-  {% if wa_parsed %}
-  <div class="wa-results">
-    {% if wa_parsed.summary %}
-    <div class="wa-summary">{{ wa_parsed.summary }}</div>
-    {% endif %}
-
-    {% if wa_parsed.matches %}
-    <h3 style="margin:12px 0 8px;">Matched to Bookings</h3>
-    {% for m in wa_parsed.matches %}
-    <div class="wa-match {{ m.status }}">
-      <div class="wa-date">
-        {{ m.booking_label }} — {{ m.cleaner_name }}
-        {% if m.time %} at {{ m.time }}{% endif %}
-      </div>
-      <span class="badge badge-{{ m.status }}" style="
-        {% if m.status == 'confirmed' %}background:#d4edda;color:#155724
-        {% elif m.status == 'declined' %}background:#ffcccb;color:#721c24
-        {% else %}background:#fff3cd;color:#856404{% endif %}
-      ">{{ m.status }}</span>
-      {% if m.note %}
-      <div class="wa-note">{{ m.note }}</div>
-      {% endif %}
-      {% if wa_booking_options %}
-      <form action="{{ prefix }}/apply-match" method="POST" style="display:flex;gap:4px;align-items:center;margin-top:6px;flex-wrap:wrap;">
-        <select name="booking_uid" style="padding:3px 6px;border-radius:4px;border:1px solid #ccc;font-size:0.8rem;">
-          {% for opt in wa_booking_options %}
-          <option value="{{ opt.uid }}" {{ 'selected' if opt.uid == m.booking_uid }}>{{ opt.label }}</option>
-          {% endfor %}
-        </select>
-        <input type="hidden" name="cleaner_name" value="{{ m.cleaner_name }}">
-        <input type="hidden" name="status" value="{{ m.status }}">
-        <input type="hidden" name="time" value="{{ m.time or '' }}">
-        <input type="hidden" name="note" value="{{ m.note or '' }}">
-        {% if m.status == 'declined' %}
-        <button type="submit" class="btn btn-sm btn-danger">Apply Decline</button>
-        {% elif m.status == 'confirmed' %}
-        <button type="submit" class="btn btn-sm btn-success">Apply</button>
-        {% else %}
-        <button type="submit" class="btn btn-sm btn-warning">Apply</button>
-        {% endif %}
-      </form>
-      {% endif %}
-    </div>
-    {% endfor %}
-    {% endif %}
-
-    {% if wa_parsed.unmatched %}
-    <h3 style="margin:12px 0 8px;">Unmatched Dates</h3>
-    {% for m in wa_parsed.unmatched %}
-    <div class="wa-match {{ m.status }}">
-      <div class="wa-date">{{ m.cleaning_date }} — {{ m.cleaner_name }}</div>
-      <span class="badge" style="
-        {% if m.status == 'confirmed' %}background:#d4edda;color:#155724
-        {% elif m.status == 'declined' %}background:#ffcccb;color:#721c24
-        {% else %}background:#fff3cd;color:#856404{% endif %}
-      ">{{ m.status }}</span>
-      {% if m.note %}
-      <div class="wa-note">{{ m.note }}</div>
-      {% endif %}
-      {% if wa_booking_options %}
-      <form action="{{ prefix }}/apply-match" method="POST" style="display:flex;gap:4px;align-items:center;margin-top:6px;flex-wrap:wrap;">
-        <select name="booking_uid" style="padding:3px 6px;border-radius:4px;border:1px solid #ccc;font-size:0.8rem;">
-          <option value="">-- Select booking --</option>
-          {% for opt in wa_booking_options %}
-          <option value="{{ opt.uid }}">{{ opt.label }}</option>
-          {% endfor %}
-        </select>
-        <input type="hidden" name="cleaner_name" value="{{ m.cleaner_name }}">
-        <input type="hidden" name="status" value="{{ m.status }}">
-        <input type="hidden" name="time" value="{{ m.time or '' }}">
-        <input type="hidden" name="note" value="{{ m.note or '' }}">
-        {% if m.status == 'declined' %}
-        <button type="submit" class="btn btn-sm btn-danger">Apply Decline</button>
-        {% elif m.status == 'confirmed' %}
-        <button type="submit" class="btn btn-sm btn-success">Apply</button>
-        {% else %}
-        <button type="submit" class="btn btn-sm btn-warning">Apply</button>
-        {% endif %}
-      </form>
-      {% endif %}
-    </div>
-    {% endfor %}
-    {% endif %}
-
-    {% if wa_applied %}
-    <div style="margin-top:12px;padding:10px;background:#d4edda;border-radius:8px;font-size:0.9rem;">
-      Auto-applied {{ wa_applied }} confirmation(s) to bookings.
-    </div>
-    {% endif %}
-  </div>
-  {% endif %}
-</div>
-
-<script>
-function showTab(name) {
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById(name).classList.add('active');
-  event.target.classList.add('active');
-}
-</script>
-"""
-
-# Legacy full-page template — still used by the /whatsapp POST route so the
-# WhatsApp results page continues to work standalone.
-TEMPLATE = (
-    "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
-    "<meta charset=\"utf-8\">\n"
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-    "<title>Cleaning Schedule</title>\n"
-    "<style>" + _SHARED_STYLES + "</style>\n"
-    "</head>\n<body>\n"
-    + LIST_PANEL_TEMPLATE +
-    "</body>\n</html>\n"
-)
-
-# ── Calendar template (new index page) ───────────────────────────────────────
-# Built by string concatenation so LIST_PANEL_TEMPLATE is spliced in directly,
-# avoiding the need for render_template_string include support.
-
-_CALENDAR_HEAD = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cleaning Schedule</title>
-<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
-<style>
-""" + _SHARED_STYLES + """
-  /* Calendar tab extras */
-  #calendar { margin-top: 8px; }
-  .top-tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #dee2e6; }
-  .top-tab {
-    padding: 8px 18px; cursor: pointer; border: none; background: none;
-    font-size: 1rem; border-bottom: 3px solid transparent; margin-bottom: -2px;
-  }
-  .top-tab.active { border-bottom-color: #0d6efd; font-weight: 600; color: #0d6efd; }
-  .top-panel { display: none; }
-  .top-panel.active { display: block; }
-  .fc-event { cursor: pointer; }
-  .cancelled-stay { opacity: 0.7; }
-  /* Past days: grey background and dimmed day numbers */
-  .fc .fc-day-past:not(.fc-day-other) { background-color: #f0f0f0; }
-  .fc .fc-day-past .fc-daygrid-day-number { color: #bbb; }
-  /* Past events: greyscale preserving brightness differences */
-  .fc .fc-day-past .fc-event,
-  .fc .event-past { filter: grayscale(100%); opacity: 0.6; }
-  /* Past day headings in agenda/list view */
-  .fc .fc-list-day-past th { background: #efefef; }
-  .fc .fc-list-day-past .fc-list-day-text,
-  .fc .fc-list-day-past .fc-list-day-side-text { color: #aaa; }
-  @media (max-width: 600px) {
-    .fc .fc-toolbar.fc-footer-toolbar { margin-top: 4px; }
-    .fc .fc-toolbar-title { font-size: 1.1rem; }
-  }
-</style>
-</head>
-<body>
-
-<h1>Cleaning Schedule</h1>
-<p class="subtitle">
-  Last synced: {{ last_sync or "Never" }}
-  {% if error %}<span style="color:red"> | Sync error: {{ error }}</span>{% endif %}
-</p>
-
-{% if no_ical %}
-<div class="config-warning">
-  No iCal URL configured. Go to <strong>Settings &gt; Add-ons &gt; Cleaning Schedule Tracker &gt; Configuration</strong> and set your Airbnb calendar URL.
-</div>
-{% endif %}
-
-<div class="sync-bar">
-  <form action="{{ prefix }}/sync" method="POST">
-    <button type="submit" class="btn btn-primary">Sync Airbnb</button>
-  </form>
-  <a href="{{ prefix }}/add" class="btn btn-secondary">+ Add Entry</a>
-  <a href="{{ prefix }}/print" class="btn btn-outline">Print Month</a>
-  {% if gcal_enabled %}
-  <form action="{{ prefix }}/gcal/sync" method="POST">
-    <button type="submit" class="btn btn-outline">Sync Google Calendar</button>
-  </form>
-  {% endif %}
-</div>
-
-<!-- Top-level tabs: Calendar / Review -->
-<div class="top-tabs">
-  <button class="top-tab active" onclick="showTopTab('calendar-tab', this)">Calendar</button>
-  <button class="top-tab" onclick="showTopTab('review-tab', this)" id="review-tab-btn">
-    Review{% if pending_count %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ pending_count }}</span>{% endif %}
-  </button>
-</div>
-
-<!-- Calendar panel -->
-<div id="calendar-tab" class="top-panel active">
-  <div id="calendar"></div>
-</div>
-
-<!-- Review panel -->
-<div id="review-tab" class="top-panel">
+_REVIEW_PANEL = """
   <h2 style="font-size:1.05rem;margin-bottom:8px;">WhatsApp Review Queue</h2>
   <p class="subtitle" style="margin-bottom:12px;">
     Inbound messages parsed by Haiku that need a human decision.
@@ -1190,70 +837,187 @@ _CALENDAR_HEAD = """<!DOCTYPE html>
     </form>
   </div>
   {% endfor %}
-</div>
-
 """
 
-_CALENDAR_FOOT = """
+
+FOCUS_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cleaning Schedule</title>
+<style>
+""" + _SHARED_STYLES + """
+  body { max-width: 560px; }
+  h1 { text-align: center; }
+  .subtitle { text-align: center; }
+  .sync-bar { justify-content: center; }
+  .tabs { justify-content: center; }
+  .focus-pager {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.85rem; color: #666; margin-bottom: 12px;
+  }
+  .focus-card {
+    background: #fff; border-radius: 14px; padding: 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 16px;
+  }
+  .focus-name { font-size: 1.5rem; font-weight: 700; margin-bottom: 14px; }
+  .diff-list { list-style: none; padding: 0; margin: 0 0 18px 0; }
+  .diff-item { padding: 10px 0; border-bottom: 1px solid #eef1f4; font-size: 0.95rem; }
+  .diff-item:last-child { border-bottom: none; }
+  .kind {
+    display: inline-block; font-size: 0.68rem; font-weight: 700;
+    padding: 2px 7px; border-radius: 10px; text-transform: uppercase;
+    margin-right: 6px; vertical-align: 1px; letter-spacing: 0.03em;
+  }
+  .kind.new { background: #cce5ff; color: #004085; }
+  .kind.changed { background: #fff3cd; color: #856404; }
+  .kind.cancelled { background: #ffcccb; color: #721c24; }
+  .diff-detail { color: #666; font-size: 0.82rem; margin-top: 3px; }
+  .focus-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .focus-actions .btn { flex: 1 1 auto; min-width: 140px; text-align: center; }
+  .empty-state { text-align: center; padding: 32px 12px; color: #666; }
+  .empty-state .check { font-size: 2.4rem; color: #198754; margin-bottom: 10px; }
+  .unassigned-card {
+    background: #fff; border-radius: 14px; padding: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 16px;
+    border-left: 4px solid #dc3545;
+  }
+  .unassigned-header { font-weight: 700; margin-bottom: 10px; font-size: 0.95rem; }
+  .unassigned-row {
+    display: flex; gap: 8px; align-items: center;
+    padding: 8px 0; border-bottom: 1px solid #f0f0f0; flex-wrap: wrap;
+  }
+  .unassigned-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .unassigned-row .date { font-weight: 600; flex: 0 0 90px; font-size: 0.9rem; }
+  .unassigned-row form { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+  .unassigned-row select {
+    flex: 1; min-width: 120px; padding: 5px 8px;
+    border-radius: 4px; border: 1px solid #ccc; font-size: 0.85rem;
+  }
+  .pager-link {
+    background: transparent; border: 1px solid #dee2e6; color: #333;
+    padding: 5px 12px; border-radius: 6px; text-decoration: none;
+    font-size: 0.85rem;
+  }
+  .pager-link.disabled { opacity: 0.35; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<h1>Cleaning Schedule</h1>
+<p class="subtitle">
+  Last synced: {{ last_sync or "Never" }}
+  {% if error %}<br><span style="color:red">Sync error: {{ error }}</span>{% endif %}
+</p>
+
+{% if no_ical %}
+<div class="config-warning">
+  No iCal URL configured. Go to <strong>Settings &gt; Add-ons &gt; Cleaning Schedule Tracker &gt; Configuration</strong> and set your Airbnb calendar URL.
+</div>
+{% endif %}
+
+<div class="sync-bar">
+  <form action="{{ prefix }}/sync" method="POST">
+    <button type="submit" class="btn btn-primary">Sync Airbnb</button>
+  </form>
+  <a href="{{ prefix }}/add" class="btn btn-outline">+ Add</a>
+  <a href="{{ prefix }}/print" class="btn btn-outline">Print</a>
+  {% if gcal_enabled %}
+  <form action="{{ prefix }}/gcal/sync" method="POST">
+    <button type="submit" class="btn btn-outline">Sync GCal</button>
+  </form>
+  {% endif %}
+</div>
+
+<div class="tabs">
+  <button class="tab active" onclick="showTab('notify-tab', this)" id="notify-tab-btn">
+    Notify{% if total_count %} <span style="background:#fd7e14;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ total_count }}</span>{% endif %}
+  </button>
+  <button class="tab" onclick="showTab('review-tab', this)" id="review-tab-btn">
+    WhatsApp{% if pending_count %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ pending_count }}</span>{% endif %}
+  </button>
+</div>
+
+<div id="notify-tab" class="panel active">
+  {% if unassigned %}
+  <div class="unassigned-card">
+    <div class="unassigned-header">Unassigned bookings ({{ unassigned|length }})</div>
+    {% for item in unassigned %}
+    <div class="unassigned-row">
+      <span class="date">{{ item.date_fmt }}</span>
+      <form action="{{ prefix }}/assign/{{ item.uid }}" method="POST">
+        <select name="cleaner" required>
+          <option value="">-- pick cleaner --</option>
+          {% for c in cleaners %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+        </select>
+        <button type="submit" class="btn btn-sm btn-primary">Assign</button>
+      </form>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if current_bucket %}
+  <div class="focus-pager">
+    <a class="pager-link {{ 'disabled' if prev_index is none }}"
+       href="{% if prev_index is not none %}{{ prefix }}/?i={{ prev_index }}{% else %}#{% endif %}">← Prev</a>
+    <span>Cleaner {{ current_index + 1 }} of {{ total_cleaners }}</span>
+    <a class="pager-link {{ 'disabled' if next_index is none }}"
+       href="{% if next_index is not none %}{{ prefix }}/?i={{ next_index }}{% else %}#{% endif %}">Skip →</a>
+  </div>
+  <div class="focus-card">
+    <div class="focus-name">{{ current_bucket.cleaner }}</div>
+    <ul class="diff-list">
+      {% for item in current_bucket.items %}
+      <li class="diff-item">
+        <span class="kind {{ item.kind }}">{{ item.kind }}</span>
+        {{ item.line }}
+        {% if item.detail %}<div class="diff-detail">{{ item.detail }}</div>{% endif %}
+        <div style="margin-top:4px;"><a href="{{ prefix }}/edit/{{ item.uid }}" style="font-size:0.8rem;color:#0d6efd;">Edit details</a></div>
+      </li>
+      {% endfor %}
+    </ul>
+    <div class="focus-actions">
+      <form action="{{ prefix }}/review/notify/{{ current_bucket.cleaner_slug }}" method="POST" style="flex:1 1 auto;">
+        <input type="hidden" name="i" value="{{ current_index }}">
+        <button type="submit" class="btn btn-success">Mark notified</button>
+      </form>
+    </div>
+  </div>
+  {% elif not unassigned %}
+  <div class="focus-card empty-state">
+    <div class="check">✓</div>
+    <div style="font-weight:700;font-size:1.1rem;margin-bottom:6px;">All cleaners up to date</div>
+    <div style="font-size:0.9rem;color:#666;">Nothing to notify. Changes will appear here when Airbnb or a cleaner updates.</div>
+  </div>
+  {% endif %}
+</div>
+
+<div id="review-tab" class="panel">
+""" + _REVIEW_PANEL + """
+</div>
+
 <script>
-function showTopTab(id, btn) {
-  document.querySelectorAll('.top-panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
+function showTab(id, btn) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   if (btn) btn.classList.add('active');
   history.replaceState(null, '', '#' + id.replace('-tab',''));
 }
-
-// Restore the active tab from the URL hash on load (e.g. #review).
 if (location.hash === '#review') {
   document.addEventListener('DOMContentLoaded', function() {
     var btn = document.getElementById('review-tab-btn');
-    showTopTab('review-tab', btn);
+    showTab('review-tab', btn);
   });
 }
-
-document.addEventListener('DOMContentLoaded', function() {
-  const calendarEl = document.getElementById('calendar');
-  const prefix = "{{ prefix }}";
-  const isMobile = window.innerWidth < 600;
-  const calendar = new FullCalendar.Calendar(calendarEl, {
-    initialView: isMobile ? 'listWeek' : 'dayGridMonth',
-    buttonText: { listWeek: 'Agenda', dayGridMonth: 'Month', dayGridWeek: 'Week' },
-    displayEventTime: false,
-    eventClassNames: function(arg) {
-      const today = new Date(); today.setHours(0,0,0,0);
-      const end = arg.event.end || arg.event.start;
-      return end < today ? ['event-past'] : [];
-    },
-    headerToolbar: isMobile
-      ? { left: 'prev,next', center: 'title', right: 'today' }
-      : { left: 'prev,next today', center: 'title', right: 'dayGridMonth,dayGridWeek,listWeek' },
-    footerToolbar: isMobile
-      ? { center: 'dayGridMonth,dayGridWeek,listWeek' }
-      : false,
-    height: 'auto',
-    eventSources: [ prefix + '/events.json' ],
-    eventClick: function(info) {
-      const p = info.event.extendedProps;
-      if (p.type === 'cleaning') {
-        window.location = prefix + '/edit/' + encodeURIComponent(p.uid);
-      } else if (p.type === 'airbnb' || p.type === 'custom_stay') {
-        window.location = prefix + '/edit/' + encodeURIComponent(p.uid);
-      }
-    },
-    dateClick: function(info) {
-      window.location = prefix + '/add?date=' + info.dateStr;
-    }
-  });
-  calendar.render();
-});
 </script>
 </body>
 </html>
 """
 
-# Concatenate at module load: head + list panel body + foot.
-CALENDAR_TEMPLATE = _CALENDAR_HEAD + _CALENDAR_FOOT
+
 
 ADD_TEMPLATE = """
 <!DOCTYPE html>
@@ -1347,7 +1111,7 @@ EDIT_TEMPLATE = """
 </style>
 </head>
 <body>
-<a href="{{ prefix }}/">&larr; Back to calendar</a>
+<a href="{{ prefix }}/">&larr; Back</a>
 <h2 style="margin-top:12px;">
   {% if booking.type == 'manual_cleaning' %}Manual Cleaning
   {% elif booking.type == 'custom_stay' %}Custom Stay
@@ -1512,145 +1276,6 @@ PRINT_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-# ── View helpers ─────────────────────────────────────────────────────────────
-
-def _fmt_timestamp(ts):
-    """Format an ISO timestamp to a short human-readable string."""
-    if not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts)
-        return dt.strftime("%b %d, %I:%M %p")
-    except (ValueError, TypeError):
-        return ts
-
-
-def format_booking(uid, b):
-    start = datetime.strptime(b["start"], "%Y-%m-%d").date()
-    end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-    today = date.today()
-    nights = (end - start).days
-    days_until = (end - today).days
-
-    if days_until < 0:
-        days_label = f"{abs(days_until)}d ago"
-    elif days_until == 0:
-        days_label = "TODAY"
-    elif days_until == 1:
-        days_label = "TOMORROW"
-    else:
-        days_label = f"in {days_until}d"
-
-    if b["status"] == "cancelled":
-        card_class = "cancelled"
-    elif b["status"] == "complete":
-        card_class = "complete"
-    elif b.get("confirmed"):
-        card_class = "confirmed"
-    elif b.get("cleaner"):
-        card_class = "assigned"
-    else:
-        card_class = "needs-cleaner"
-        if 0 <= days_until <= 3:
-            card_class += " urgent"
-
-    conflict = b.get("conflict")
-    conflict_fmt = None
-    if conflict:
-        old_end = conflict.get("old_end", "")
-        if conflict["type"] == "dates_changed":
-            try:
-                old_end_dt = datetime.strptime(old_end, "%Y-%m-%d").date()
-                conflict_fmt = f"Checkout moved from {old_end_dt.strftime('%b %d')} to {end.strftime('%b %d')}"
-            except ValueError:
-                conflict_fmt = "Dates changed"
-        else:
-            conflict_fmt = "Booking cancelled"
-
-    return {
-        "uid": uid,
-        "start_fmt": start.strftime("%b %d"),
-        "end_fmt": end.strftime("%b %d"),
-        "start": b["start"],
-        "end": b["end"],
-        "nights": nights,
-        "days_until": days_label,
-        "cleaner": b.get("cleaner"),
-        "paid": b.get("paid", False),
-        "confirmed": b.get("confirmed", False),
-        "status": b["status"],
-        "card_class": card_class,
-        "notes": b.get("notes", ""),
-        "cleaner_since": b.get("cleaner_since"),
-        "cleaner_since_fmt": _fmt_timestamp(b.get("cleaner_since")),
-        "conflict": conflict,
-        "conflict_fmt": conflict_fmt,
-    }
-
-
-def build_view_data(data):
-    """Build the template context from booking data."""
-    bookings = data.get("bookings", {})
-    today = date.today()
-
-    upcoming = []
-    past = []
-    conflicts = []
-    needs_cleaner = 0
-    assigned_count = 0
-    confirmed_count = 0
-
-    for uid, b in bookings.items():
-        fb = format_booking(uid, b)
-        end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-
-        if fb["conflict"]:
-            conflicts.append(fb)
-
-        if b["status"] == "cancelled":
-            if not fb["conflict"]:
-                past.append(fb)
-            continue
-
-        if end >= today and b["status"] == "active":
-            upcoming.append(fb)
-            if not b.get("cleaner"):
-                needs_cleaner += 1
-            elif b.get("confirmed"):
-                confirmed_count += 1
-            else:
-                assigned_count += 1
-        else:
-            past.append(fb)
-
-    upcoming.sort(key=lambda x: x["end"])
-    past.sort(key=lambda x: x["end"], reverse=True)
-    conflicts.sort(key=lambda x: x["end"])
-
-    last_sync = data.get("last_sync")
-    if last_sync:
-        try:
-            ls = datetime.fromisoformat(last_sync)
-            last_sync = ls.strftime("%b %d, %I:%M %p")
-        except (ValueError, TypeError):
-            pass
-
-    return {
-        "upcoming": upcoming,
-        "past": past[:30],
-        "conflicts": conflicts,
-        "conflicts_count": len(conflicts),
-        "needs_cleaner": needs_cleaner,
-        "assigned_count": assigned_count,
-        "confirmed_count": confirmed_count,
-        "upcoming_count": len(upcoming),
-        "last_sync": last_sync,
-        "cleaners": cleaner_names(),
-        "prefix": ingress_prefix(),
-        "no_ical": not ICAL_URL,
-        "gcal_enabled": GCAL_ENABLED,
-    }
-
 
 # ── Print-view helper ────────────────────────────────────────────────────────
 
@@ -1748,15 +1373,131 @@ def build_print_data(month_str: str, bookings: dict) -> dict:
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+def _fmt_date_short(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date().strftime("%b %d")
+    except (ValueError, TypeError):
+        return s
+
+
+def _fmt_time_12h(t):
+    if not t:
+        return None
+    try:
+        return datetime.strptime(t, "%H:%M:%S").strftime("%I:%M %p").lstrip("0")
+    except ValueError:
+        return t
+
+
+def _describe_item(item):
+    """Turn a review_queue item into {line, detail} strings for the focus view."""
+    kind = item["kind"]
+    date_fmt = _fmt_date_short(item["date"])
+    now = item.get("now")
+    was = item.get("was")
+
+    if kind == "new":
+        time_fmt = _fmt_time_12h(now[2]) if now else None
+        line = f"{date_fmt}"
+        if time_fmt:
+            line += f" at {time_fmt}"
+        return {"line": line, "detail": "New cleaning — first-time notify."}
+
+    if kind == "changed":
+        parts = []
+        if was and now:
+            if was[0] != now[0]:
+                parts.append(f"cleaner: {was[0]} → {now[0]}")
+            if was[1] != now[1]:
+                parts.append(f"date: {_fmt_date_short(was[1])} → {_fmt_date_short(now[1])}")
+            if was[2] != now[2]:
+                parts.append(
+                    f"time: {_fmt_time_12h(was[2]) or '—'} → {_fmt_time_12h(now[2]) or '—'}"
+                )
+        time_fmt = _fmt_time_12h(now[2]) if now else None
+        line = f"{date_fmt}" + (f" at {time_fmt}" if time_fmt else "")
+        return {"line": line, "detail": "; ".join(parts) or "Details changed."}
+
+    if kind == "cancelled":
+        was_time = _fmt_time_12h(was[2]) if was else None
+        line = f"{date_fmt}" + (f" at {was_time}" if was_time else "")
+        return {"line": line, "detail": "Cleaning cancelled — tell the cleaner."}
+
+    # unassigned never reaches this path — handled separately
+    return {"line": date_fmt, "detail": None}
+
+
+def _cleaner_slug(name):
+    """URL-safe slug for a cleaner name. Handles unicode by lowercasing ASCII and
+    replacing anything non-alphanumeric with a dash."""
+    if not name:
+        return "none"
+    out = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower()
+    return out or "none"
+
+
+def build_focus_context(data, requested_index):
+    """Build the full template context for the focus view."""
+    buckets, unassigned = review_queue(data)
+
+    # Annotate items with display strings.
+    for bk in buckets:
+        bk["cleaner_slug"] = _cleaner_slug(bk["cleaner"])
+        for it in bk["items"]:
+            it.update(_describe_item(it))
+    for it in unassigned:
+        it["date_fmt"] = _fmt_date_short(it["date"])
+
+    total_cleaners = len(buckets)
+    try:
+        idx = max(0, int(requested_index))
+    except (TypeError, ValueError):
+        idx = 0
+    if total_cleaners == 0:
+        idx = 0
+        current_bucket = None
+        prev_index = None
+        next_index = None
+    else:
+        idx = min(idx, total_cleaners - 1)
+        current_bucket = buckets[idx]
+        prev_index = idx - 1 if idx > 0 else None
+        next_index = idx + 1 if idx < total_cleaners - 1 else None
+
+    total_count = sum(len(bk["items"]) for bk in buckets) + len(unassigned)
+
+    last_sync = data.get("last_sync")
+    if last_sync:
+        try:
+            last_sync = datetime.fromisoformat(last_sync).strftime("%b %d, %I:%M %p")
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "buckets": buckets,
+        "unassigned": unassigned,
+        "current_bucket": current_bucket,
+        "current_index": idx,
+        "prev_index": prev_index,
+        "next_index": next_index,
+        "total_cleaners": total_cleaners,
+        "total_count": total_count,
+        "last_sync": last_sync,
+        "cleaners": cleaner_names(),
+        "prefix": ingress_prefix(),
+        "no_ical": not ICAL_URL,
+        "gcal_enabled": GCAL_ENABLED,
+    }
+
+
 @app.route("/")
 def index():
     data = load_data()
-    ctx = build_view_data(data)
+    ctx = build_focus_context(data, request.args.get("i", 0))
     review = _build_review_context(data)
     return render_template_string(
-        CALENDAR_TEMPLATE, error=request.args.get("error"),
-        wa_text=None, wa_parsed=None, wa_error=None, wa_applied=0,
-        wa_booking_options=[],
+        FOCUS_TEMPLATE,
+        error=request.args.get("error"),
         **ctx,
         **review,
     )
@@ -1777,6 +1518,8 @@ def gcal_sync():
     if not GCAL_ENABLED:
         return redirect(prefix + "/?error=Google+Calendar+is+not+enabled")
     data = load_data()
+    for b in data.get("bookings", {}).values():
+        b["_needs_notify"] = needs_notify(b)
     stats, error = gcal_mod.sync_to_gcal(
         data, GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID,
     )
@@ -1898,113 +1641,32 @@ def add():
     return redirect(ingress_prefix() + "/")
 
 
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp():
-    data = load_data()
-    bookings = data.get("bookings", {})
-    chat_text = request.form.get("chat", "")
-    auto_apply = request.form.get("auto_apply") == "1"
-
-    parsed, error = parse_whatsapp_with_llm(chat_text, bookings)
-
-    # Auto-apply confirmed matches to bookings
-    applied_count = 0
-    if parsed and auto_apply:
-        for match in parsed.get("matches", []):
-            uid = match.get("booking_uid")
-            if uid and uid in bookings and match.get("status") == "confirmed":
-                cleaner_name = match.get("cleaner_name", "")
-                if cleaner_name:
-                    if not bookings[uid].get("cleaner"):
-                        bookings[uid]["cleaner"] = cleaner_name
-                        bookings[uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                    bookings[uid]["confirmed"] = True
-                    note_parts = []
-                    if match.get("time"):
-                        note_parts.append(f"Time: {match['time']}")
-                    if match.get("note"):
-                        note_parts.append(match["note"])
-                    if note_parts and not bookings[uid].get("notes"):
-                        bookings[uid]["notes"] = " | ".join(note_parts)
-                    applied_count += 1
+@app.route("/review/notify/<slug>", methods=["POST"])
+def review_notify(slug):
+    """Mark every current review item for this cleaner as notified — i.e.
+    rewrite cleaner_commitment to match current truth on each booking in
+    that cleaner's bucket. Advances the focus pager to the next cleaner."""
+    try:
+        next_idx = max(0, int(request.form.get("i", 0)))
+    except ValueError:
+        next_idx = 0
+    with DATA_LOCK:
+        data = load_data()
+        buckets, _unassigned = review_queue(data)
+        target = None
+        for bk in buckets:
+            if _cleaner_slug(bk["cleaner"]) == slug:
+                target = bk
+                break
+        if target:
+            for item in target["items"]:
+                b = data["bookings"].get(item["uid"])
+                if b:
+                    ack_notified(b, via="manual")
         save_data(data)
-
-    ctx = build_view_data(data)
-
-    today = date.today()
-    wa_booking_options = []
-    for uid, b in bookings.items():
-        if b["status"] != "active":
-            continue
-        end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-        if end < today:
-            continue
-        start = datetime.strptime(b["start"], "%Y-%m-%d").date()
-        wa_booking_options.append({
-            "uid": uid,
-            "label": f"{start.strftime('%b %d')} \u2192 {end.strftime('%b %d')}",
-        })
-    wa_booking_options.sort(key=lambda x: x["label"])
-
-    return render_template_string(
-        TEMPLATE, error=None,
-        wa_text=chat_text,
-        wa_parsed=parsed,
-        wa_error=error,
-        wa_applied=applied_count,
-        wa_booking_options=wa_booking_options,
-        **ctx,
-    )
-
-
-@app.route("/apply-match", methods=["POST"])
-def apply_match():
-    data = load_data()
-    bookings = data.get("bookings", {})
-    uid = request.form.get("booking_uid", "").strip()
-    cleaner_name = request.form.get("cleaner_name", "").strip()
-    status = request.form.get("status", "").strip()
-    time_val = request.form.get("time", "").strip()
-    note = request.form.get("note", "").strip()
-
-    if uid and uid in bookings:
-        if cleaner_name and not bookings[uid].get("cleaner"):
-            bookings[uid]["cleaner"] = cleaner_name
-            bookings[uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        if status == "confirmed":
-            bookings[uid]["confirmed"] = True
-        elif status == "declined":
-            bookings[uid]["confirmed"] = False
-        note_parts = []
-        if time_val:
-            note_parts.append(f"Time: {time_val}")
-        if note:
-            note_parts.append(note)
-        if note_parts and not bookings[uid].get("notes"):
-            bookings[uid]["notes"] = " | ".join(note_parts)
-        save_data(data)
-
-    return redirect(ingress_prefix() + "/")
-
-
-@app.route("/resolve/<path:uid>", methods=["POST"])
-def resolve(uid):
-    data = load_data()
-    if uid in data["bookings"]:
-        b = data["bookings"][uid]
-        action = request.form.get("action", "keep")
-        if action == "keep":
-            b.pop("conflict", None)
-        elif action == "cancel":
-            b.pop("conflict", None)
-            b["cleaner"] = None
-            b["cleaner_since"] = None
-            b["confirmed"] = False
-        elif action == "move":
-            b.pop("conflict", None)
-            b["confirmed"] = False
-        save_data(data)
-    return redirect(ingress_prefix() + "/")
+    # After writing, the current bucket collapses — stay on the same index so
+    # the next cleaner slides into view.
+    return redirect(ingress_prefix() + f"/?i={next_idx}")
 
 
 @app.route("/internal/whatsapp/inbound", methods=["POST"])
@@ -2228,114 +1890,6 @@ def review_map_sender():
     for mid in requeue:
         enqueue_message(mid)
     return redirect(ingress_prefix() + "/#review")
-
-
-@app.route("/events.json")
-def events_json():
-    data = load_data()
-    bookings = data.get("bookings", {})
-
-    raw_start = request.args.get("start")
-    raw_end = request.args.get("end")
-    win_start = date.fromisoformat(raw_start[:10]) if raw_start else None
-    win_end = date.fromisoformat(raw_end[:10]) if raw_end else None
-
-    events = []
-
-    for uid, b in bookings.items():
-        btype = b.get("type", "airbnb")
-        status = b.get("status", "active")
-        b_start = date.fromisoformat(b["start"])
-        b_end = date.fromisoformat(b["end"])
-
-        # ── Stay events ───────────────────────────────────────────────────────
-        if btype in ("airbnb", "custom_stay"):
-            fc_end = b_end + timedelta(days=1)
-            in_window = (win_start is None) or (b_start < win_end and fc_end > win_start)
-            if in_window:
-                if status == "cancelled":
-                    bg = "#e9ecef"
-                elif btype == "custom_stay":
-                    bg = "#d1e7dd"
-                else:
-                    bg = "#cfe2ff"
-
-                border = "#fd7e14" if (b.get("conflict") and status != "cancelled") else bg
-
-                stay_title = "Airbnb" if btype == "airbnb" else (b.get("notes") or "Custom stay")
-                if btype == "airbnb":
-                    ev_start = f"{b['start']}T15:00:00"
-                    ev_end = f"{b['end']}T11:00:00"
-                    all_day = False
-                else:
-                    ev_start = b["start"]
-                    ev_end = fc_end.isoformat()
-                    all_day = True
-                event = {
-                    "id": f"stay-{uid}",
-                    "title": stay_title,
-                    "start": ev_start,
-                    "end": ev_end,
-                    "allDay": all_day,
-                    "display": "block",
-                    "backgroundColor": bg,
-                    "borderColor": border,
-                    "extendedProps": {
-                        "type": btype,
-                        "uid": uid,
-                        "status": status,
-                        "cancelled": status == "cancelled",
-                    },
-                }
-                if status == "cancelled":
-                    event["classNames"] = ["cancelled-stay"]
-                events.append(event)
-
-        # ── Cleaning events ───────────────────────────────────────────────────
-        if status == "cancelled":
-            continue
-        if btype == "custom_stay":
-            continue
-
-        clean_date = b_end  # checkout day for airbnb; same as start for manual_cleaning
-        in_window = (win_start is None) or (win_start <= clean_date < win_end)
-        if not in_window:
-            continue
-
-        cleaner = b.get("cleaner")
-        confirmed = b.get("confirmed", False)
-        bg_clean = cleaner_color(cleaner) if cleaner else "#dc3545"
-        border_clean = "#198754" if confirmed else bg_clean
-
-        clean_time = b.get("clean_time") or _parse_clean_time(b.get("notes", ""))
-        clean_start = f"{clean_date.isoformat()}T{clean_time}" if clean_time else clean_date.isoformat()
-        clean_label = cleaner if cleaner else "Needs cleaner"
-        if clean_time:
-            try:
-                t = datetime.strptime(clean_time, "%H:%M:%S")
-                clean_label += f" · {t.strftime('%I:%M %p').lstrip('0')}"
-            except ValueError:
-                pass
-        events.append({
-            "id": f"clean-{uid}",
-            "title": clean_label,
-            "start": clean_start,
-            "allDay": not bool(clean_time),
-            "display": "block",
-            "backgroundColor": bg_clean,
-            "borderColor": border_clean,
-            "textColor": "#fff",
-            "extendedProps": {
-                "type": "cleaning",
-                "uid": uid,
-                "cleaner": cleaner,
-                "confirmed": confirmed,
-                "paid": b.get("paid", False),
-                "status": status,
-            },
-        })
-
-    return jsonify(events)
 
 
 @app.route("/print")

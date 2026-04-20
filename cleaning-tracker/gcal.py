@@ -94,7 +94,7 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
         if b_end < win_start or b_start > win_end:
             continue
 
-        conflict = bool(b.get("conflict"))
+        conflict = bool(b.get("_needs_notify"))
 
         # ── Stay event ───────────────────────────────────────────────────
         if btype in ("airbnb", "custom_stay"):
