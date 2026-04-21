@@ -946,7 +946,7 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
 <div id="notify-tab" class="panel active">
   {% if unassigned %}
   <div class="unassigned-card">
-    <div class="unassigned-header">Unassigned bookings ({{ unassigned|length }})</div>
+    <div class="unassigned-header">Unassigned bookings ({{ unassigned|length }}) · <a href="{{ prefix }}/backfill" style="font-weight:500;font-size:0.85rem;">Backfill from chat</a></div>
     {% for item in unassigned %}
     <div class="unassigned-row">
       <span class="date">{{ item.date_fmt }}</span>
@@ -1897,6 +1897,230 @@ def review_map_sender():
     for mid in requeue:
         enqueue_message(mid)
     return redirect(ingress_prefix() + "/#review")
+
+
+def _unassigned_active_bookings(bookings):
+    """All active bookings with no cleaner. No date window — backfill may span
+    arbitrary history."""
+    out = []
+    for uid, b in bookings.items():
+        if b.get("status") != "active":
+            continue
+        if b.get("cleaner"):
+            continue
+        try:
+            start = datetime.strptime(b["start"], "%Y-%m-%d").date()
+            end = datetime.strptime(b["end"], "%Y-%m-%d").date()
+        except (ValueError, TypeError, KeyError):
+            continue
+        out.append({
+            "uid": uid,
+            "checkin": b["start"],
+            "checkout": b["end"],
+            "label": f"{start.strftime('%b %d, %Y')} → {end.strftime('%b %d, %Y')}",
+        })
+    out.sort(key=lambda x: x["checkout"])
+    return out
+
+
+def _backfill_haiku(transcript, unassigned, known_cleaners, group_hint):
+    """Ask Haiku to match unassigned bookings against a pasted chat transcript.
+
+    Returns (proposals, None) or (None, error). proposals is a list of
+    {uid, cleaner, clean_time, confidence, evidence} — one entry per booking
+    it could match. Bookings with no match are omitted.
+    """
+    if not ANTHROPIC_API_KEY:
+        return None, "No Anthropic API key configured."
+
+    prompt = f"""You are backfilling cleaner assignments from a WhatsApp chat export.
+
+Known cleaners: {json.dumps(known_cleaners)}
+Group hint: {group_hint or "(not provided)"}
+
+Unassigned bookings (checkout date = cleaning day):
+{json.dumps(unassigned)}
+
+Chat transcript:
+---
+{transcript}
+---
+
+For each booking, scan the transcript for a message where a cleaner clearly
+commits to that specific cleaning date (e.g. "yes I can do Aug 17",
+"confirmed for the 17th", or the host proposing a date that the cleaner
+then accepts). Only propose an assignment if a single cleaner's confirmation
+is unambiguous — skip bookings with no clear match, conflicting confirmations,
+or only a host-side proposal that was never accepted. If a specific cleaning
+time is mentioned (e.g. "11am"), include it as "HH:MM:SS"; otherwise null.
+
+Return ONLY valid JSON, no other text. Shape:
+{{"proposals":[{{"uid":"...","cleaner":"...","clean_time":"HH:MM:SS or null","confidence":0.0,"evidence":"one-sentence quote or paraphrase from the transcript"}}]}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        text = resp.json()["content"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        parsed = json.loads(text)
+        return parsed.get("proposals", []), None
+    except requests.exceptions.HTTPError as e:
+        return None, f"Anthropic API error: {e.response.status_code} - {e.response.text[:200]}"
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        return None, f"Failed to parse LLM response: {e}"
+    except Exception as e:
+        return None, f"Error calling Anthropic API: {e}"
+
+
+BACKFILL_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Backfill Assignments</title>
+<style>{{ shared_styles|safe }}
+.proposal { padding: 10px; border: 1px solid #dee2e6; border-radius: 6px; margin-bottom: 8px; background: #fff; }
+.proposal .meta { font-size: 0.85rem; color: #666; }
+.proposal .evidence { font-style: italic; color: #555; margin-top: 4px; font-size: 0.88rem; }
+.conf-high { border-left: 4px solid #198754; }
+.conf-mid { border-left: 4px solid #ffc107; }
+.conf-low { border-left: 4px solid #dc3545; }
+textarea { width: 100%; min-height: 280px; padding: 10px; border-radius: 6px; border: 1px solid #ccc; font-family: monospace; font-size: 0.85rem; }
+label.inline { display: inline-flex; align-items: center; gap: 6px; margin-right: 12px; }
+</style></head><body>
+<h1>Backfill cleaner assignments</h1>
+<p class="subtitle"><a href="{{ prefix }}/">← Back to queue</a></p>
+
+{% if error %}<div class="card" style="border-left-color:#dc3545;"><strong>Error:</strong> {{ error }}</div>{% endif %}
+
+{% if not proposals %}
+<div class="card">
+  <p>Paste a WhatsApp chat export (Settings → Export chat → Without media). Haiku will scan it against your <strong>{{ unassigned_count }} unassigned bookings</strong> and propose matches for your review. Nothing is written until you confirm.</p>
+</div>
+<form method="POST" action="{{ prefix }}/backfill">
+  <label>Group hint (optional): <input type="text" name="group_hint" placeholder="e.g. Maria group" style="padding:6px;border-radius:4px;border:1px solid #ccc;width:260px;"></label>
+  <div style="margin-top:10px;"><textarea name="transcript" placeholder="Paste full transcript here..."></textarea></div>
+  <button type="submit" class="btn btn-primary" style="margin-top:10px;">Analyse</button>
+</form>
+{% else %}
+<div class="card"><strong>{{ proposals|length }} proposal{{ 's' if proposals|length != 1 else '' }}</strong> from Haiku. Tick the ones to apply; override cleaner name if needed. Applying will also stamp the commitment so these won't appear in the notify queue.</div>
+<form method="POST" action="{{ prefix }}/backfill/apply">
+  {% for p in proposals %}
+  <div class="proposal {% if p.confidence >= 0.85 %}conf-high{% elif p.confidence >= 0.6 %}conf-mid{% else %}conf-low{% endif %}">
+    <label class="inline"><input type="checkbox" name="apply_{{ p.uid }}" value="1" {% if p.confidence >= 0.85 %}checked{% endif %}> Apply</label>
+    <strong>{{ p.label }}</strong>
+    <span class="meta">— confidence {{ '%.2f'|format(p.confidence) }}</span>
+    <div style="margin-top:6px;">
+      <label class="inline">Cleaner:
+        <select name="cleaner_{{ p.uid }}">
+          {% for c in cleaners %}<option value="{{ c }}" {% if c == p.cleaner %}selected{% endif %}>{{ c }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="inline">Time:
+        <input type="time" name="clean_time_{{ p.uid }}" value="{{ p.clean_time_hhmm or '' }}">
+      </label>
+    </div>
+    <div class="evidence">“{{ p.evidence }}”</div>
+  </div>
+  {% endfor %}
+  <div style="margin-top:14px;">
+    <button type="submit" class="btn btn-success">Apply selected</button>
+    <a href="{{ prefix }}/backfill" class="btn btn-outline">Discard &amp; restart</a>
+  </div>
+</form>
+{% endif %}
+</body></html>
+"""
+
+
+@app.route("/backfill", methods=["GET", "POST"])
+def backfill():
+    data = load_data()
+    bookings = data.get("bookings", {})
+    unassigned = _unassigned_active_bookings(bookings)
+
+    if request.method == "GET":
+        return render_template_string(
+            BACKFILL_TEMPLATE, prefix=ingress_prefix(), shared_styles=_SHARED_STYLES,
+            proposals=None, unassigned_count=len(unassigned), cleaners=CLEANERS, error=None,
+        )
+
+    transcript = (request.form.get("transcript") or "").strip()
+    group_hint = (request.form.get("group_hint") or "").strip()
+    if not transcript:
+        return render_template_string(
+            BACKFILL_TEMPLATE, prefix=ingress_prefix(), shared_styles=_SHARED_STYLES,
+            proposals=None, unassigned_count=len(unassigned), cleaners=CLEANERS,
+            error="Paste a transcript first.",
+        )
+
+    proposals, err = _backfill_haiku(transcript, unassigned, CLEANERS, group_hint)
+    if err:
+        return render_template_string(
+            BACKFILL_TEMPLATE, prefix=ingress_prefix(), shared_styles=_SHARED_STYLES,
+            proposals=None, unassigned_count=len(unassigned), cleaners=CLEANERS, error=err,
+        )
+
+    uid_to_label = {u["uid"]: u["label"] for u in unassigned}
+    enriched = []
+    for p in proposals:
+        uid = p.get("uid")
+        if uid not in uid_to_label:
+            continue
+        ct = p.get("clean_time")
+        hhmm = ct[:5] if ct and isinstance(ct, str) and len(ct) >= 5 else ""
+        enriched.append({
+            "uid": uid,
+            "label": uid_to_label[uid],
+            "cleaner": p.get("cleaner") or "",
+            "clean_time": ct,
+            "clean_time_hhmm": hhmm,
+            "confidence": float(p.get("confidence") or 0),
+            "evidence": p.get("evidence") or "",
+        })
+    enriched.sort(key=lambda x: (-x["confidence"], x["label"]))
+
+    return render_template_string(
+        BACKFILL_TEMPLATE, prefix=ingress_prefix(), shared_styles=_SHARED_STYLES,
+        proposals=enriched, unassigned_count=len(unassigned), cleaners=CLEANERS, error=None,
+    )
+
+
+@app.route("/backfill/apply", methods=["POST"])
+def backfill_apply():
+    applied = 0
+    with DATA_LOCK:
+        data = load_data()
+        bookings = data.get("bookings", {})
+        for key, val in request.form.items():
+            if not key.startswith("apply_") or val != "1":
+                continue
+            uid = key[len("apply_"):]
+            booking = bookings.get(uid)
+            if not booking or booking.get("status") != "active":
+                continue
+            cleaner = (request.form.get(f"cleaner_{uid}") or "").strip()
+            clean_time = (request.form.get(f"clean_time_{uid}") or "").strip()
+            if not cleaner:
+                continue
+            booking["cleaner"] = cleaner
+            booking["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            booking["clean_time"] = (clean_time + ":00") if clean_time else None
+            ack_notified(booking, via="backfill")
+            applied += 1
+        if applied:
+            save_data(data)
+    return redirect(ingress_prefix() + "/")
 
 
 @app.route("/print")
