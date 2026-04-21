@@ -1834,6 +1834,231 @@ def admin_reprocess_facts():
     })
 
 
+# ── Transcript ingest (historical backfill into facts layer) ────────────────
+#
+# /admin/ingest-transcript takes a pasted WhatsApp export and threads each
+# line through the same pipeline the live sidecar uses — but with an `apply`
+# switch. apply=false (historical catch-up): facts only, no parse, no
+# auto-apply. apply=true (future bulk adds): full process_message path.
+
+_TRANSCRIPT_LINE_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2}),\s+(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\]\s+([^:]+?):\s?(.*)$"
+)
+
+INGEST_LOCK = threading.Lock()
+INGEST_STATUS = {"running": False, "total": 0, "done": 0, "errors": 0, "apply": False}
+
+
+def _parse_whatsapp_transcript(text):
+    """Parse a WhatsApp export into [{timestamp, sender, text}, ...].
+
+    Handles multi-line messages by appending continuation lines to the
+    previous entry. Silently drops lines before the first timestamped entry
+    (export headers, "Messages and calls are end-to-end encrypted", etc).
+    """
+    out = []
+    for raw in text.splitlines():
+        m = _TRANSCRIPT_LINE_RE.match(raw)
+        if m:
+            date_s, time_s, sender, body = m.group(1), m.group(2), m.group(3).strip(), m.group(4)
+            try:
+                ts = datetime.strptime(f"{date_s} {time_s.upper().replace('  ', ' ')}", "%Y-%m-%d %I:%M:%S %p")
+            except ValueError:
+                try:
+                    ts = datetime.strptime(f"{date_s} {time_s.upper().replace('  ', ' ')}", "%Y-%m-%d %I:%M %p")
+                except ValueError:
+                    try:
+                        ts = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        try:
+                            ts = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M")
+                        except ValueError:
+                            continue
+            out.append({
+                "timestamp": ts.isoformat(timespec="seconds"),
+                "sender": sender,
+                "text": body,
+            })
+        else:
+            if out and raw.strip():
+                out[-1]["text"] += "\n" + raw
+    return out
+
+
+def _resolve_sender_jid(data, sender_name):
+    """Reverse-lookup cleaner_jids by name. Unknown senders get a stable
+    backfill:<slug> placeholder so facts still attribute consistently."""
+    for name, jids in cleaner_jid_map(data).items():
+        if name.strip().lower() == sender_name.strip().lower() and jids:
+            return jids[0]
+    slug = re.sub(r"[^a-z0-9]+", "-", sender_name.lower()).strip("-") or "unknown"
+    return f"backfill:{slug}"
+
+
+def _ingest_msg_id(ts, sender, text):
+    h = hashlib.sha1(f"{ts}|{sender}|{text}".encode("utf-8")).hexdigest()[:16]
+    return f"backfill-{h}"
+
+
+def _ingest_facts_only(msg_id):
+    """Facts extraction only — skip parse/auto-apply. Marks message parsed
+    with a sentinel so Review tab never surfaces it and the live pipeline
+    won't re-touch it."""
+    with DATA_LOCK:
+        data = load_data()
+        msg = _find_message(data, msg_id)
+        if not msg or msg.get("parsed"):
+            return
+        history = [m for m in data["messages"] if m.get("id") != msg_id]
+        known = cleaner_names()
+        labels = dict(data.get("group_labels", {}))
+
+    facts_list, facts_err = facts_mod.extract_facts(
+        ANTHROPIC_API_KEY, msg, history, known, labels,
+    )
+
+    with DATA_LOCK:
+        data = load_data()
+        msg = _find_message(data, msg_id)
+        if not msg:
+            return
+        msg["parsed"] = True
+        msg["parse_error"] = None
+        msg["haiku_result"] = {"action": "none", "backfill_ingest": True}
+        msg["review_state"] = "ignored"
+        if facts_list is not None:
+            data.setdefault("message_facts", {})[msg_id] = facts_mod.build_record(
+                facts_list, msg.get("sender") or "",
+            )
+        save_data(data)
+    return facts_err
+
+
+def _ingest_worker(msg_ids, apply):
+    global INGEST_STATUS
+    INGEST_STATUS = {"running": True, "total": len(msg_ids), "done": 0, "errors": 0, "apply": apply}
+    try:
+        for mid in msg_ids:
+            try:
+                if apply:
+                    process_message(mid)
+                else:
+                    err = _ingest_facts_only(mid)
+                    if err:
+                        INGEST_STATUS["errors"] += 1
+            except Exception as e:
+                print(f"[ingest] error on {mid}: {e}")
+                INGEST_STATUS["errors"] += 1
+            INGEST_STATUS["done"] += 1
+    finally:
+        INGEST_STATUS["running"] = False
+
+
+@app.route("/admin/ingest-transcript", methods=["POST"])
+def admin_ingest_transcript():
+    """Parse a pasted WhatsApp transcript into the messages log and extract
+    facts. Body: {transcript, group_jid, apply}. Loopback or X-Shared-Secret.
+    Returns immediately; progress at /admin/ingest-status."""
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or request.form
+    transcript = (payload.get("transcript") or "").strip()
+    group_jid = (payload.get("group_jid") or "backfill-group").strip()
+    apply_flag = str(payload.get("apply") or "").lower() in ("1", "true", "yes", "on")
+
+    if not transcript:
+        return jsonify({"error": "missing transcript"}), 400
+    if INGEST_LOCK.locked() or INGEST_STATUS.get("running"):
+        return jsonify({"error": "ingest already running"}), 409
+
+    entries = _parse_whatsapp_transcript(transcript)
+    if not entries:
+        return jsonify({"error": "no messages parsed from transcript"}), 400
+
+    inserted_ids = []
+    skipped = 0
+    with DATA_LOCK:
+        data = load_data()
+        for e in entries:
+            mid = _ingest_msg_id(e["timestamp"], e["sender"], e["text"])
+            if _find_message(data, mid):
+                skipped += 1
+                continue
+            sender_jid = _resolve_sender_jid(data, e["sender"])
+            data["messages"].append({
+                "id": mid,
+                "timestamp": e["timestamp"],
+                "sender": sender_jid,
+                "sender_name_raw": e["sender"],
+                "group": group_jid,
+                "text": e["text"],
+                "parsed": False,
+                "applied_uid": None,
+                "review_state": "pending",
+                "source": "backfill",
+            })
+            inserted_ids.append(mid)
+        save_data(data)
+
+    def _run():
+        with INGEST_LOCK:
+            if apply_flag:
+                ensure_workers_started()
+            _ingest_worker(inserted_ids, apply_flag)
+
+    threading.Thread(target=_run, daemon=True, name="ingest-worker").start()
+
+    return jsonify({
+        "inserted": len(inserted_ids),
+        "skipped": skipped,
+        "parsed_entries": len(entries),
+        "apply": apply_flag,
+        "status_url": f"{ingress_prefix()}/admin/ingest-status",
+    })
+
+
+@app.route("/admin/ingest-status", methods=["GET"])
+def admin_ingest_status():
+    _require_local_or_secret()
+    return jsonify(dict(INGEST_STATUS))
+
+
+_INGEST_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><title>Transcript ingest</title>
+<style>{{ shared_styles|safe }}
+textarea { width: 100%; min-height: 320px; font-family: monospace; font-size: 12px; }
+.row { margin: 12px 0; }
+</style></head><body>
+<div class=\"container\">
+<h1>Transcript ingest</h1>
+<p><a href=\"{{ prefix }}/\">← back</a></p>
+<p>Paste a WhatsApp chat export. Each line
+<code>[YYYY-MM-DD, HH:MM:SS AM/PM] Sender: text</code> becomes a message
+in the log. Facts are extracted for every inserted message.</p>
+<form method=\"POST\" action=\"{{ prefix }}/admin/ingest-transcript\">
+  <div class=\"row\">
+    <label>Group JID (optional tag): <input type=\"text\" name=\"group_jid\" value=\"backfill-group\" /></label>
+  </div>
+  <div class=\"row\">
+    <label><input type=\"checkbox\" name=\"apply\" value=\"1\" /> Apply (run full parse + auto-apply — leave unchecked for historical backfill)</label>
+  </div>
+  <div class=\"row\"><textarea name=\"transcript\" placeholder=\"[2026-04-15, 10:23:00 AM] Itzel: si puedo\"></textarea></div>
+  <div class=\"row\"><button type=\"submit\">Ingest</button></div>
+</form>
+<p>After submitting, poll <a href=\"{{ prefix }}/admin/ingest-status\">/admin/ingest-status</a> to watch progress.
+Inspect extracted facts at <a href=\"{{ prefix }}/admin/facts\">/admin/facts</a>.</p>
+</div>
+</body></html>
+"""
+
+
+@app.route("/admin/ingest", methods=["GET"])
+def admin_ingest_form():
+    _require_local_or_secret()
+    return render_template_string(
+        _INGEST_TEMPLATE, prefix=ingress_prefix(), shared_styles=_SHARED_STYLES,
+    )
+
+
 # ── Review queue routes ─────────────────────────────────────────────────────
 
 def _build_review_context(data):
