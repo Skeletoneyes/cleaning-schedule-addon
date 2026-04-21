@@ -1849,8 +1849,39 @@ def admin_reprocess_facts():
 # auto-apply. apply=true (future bulk adds): full process_message path.
 
 _TRANSCRIPT_LINE_RE = re.compile(
-    r"^\[(\d{4}-\d{2}-\d{2}),\s+(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\]\s+([^:]+?):\s?(.*)$"
+    r"^\[([^\]]+)\]\s+([^:]+?):\s?(.*)$"
 )
+
+_TS_FORMATS = [
+    "%Y-%m-%d %I:%M:%S %p",
+    "%Y-%m-%d %I:%M %p",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%m/%d/%Y %I:%M:%S %p",
+    "%m/%d/%Y %I:%M %p",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%y %I:%M %p",
+    "%d/%m/%Y %I:%M %p",
+]
+
+
+def _parse_transcript_ts(bracket):
+    """Try every known WhatsApp export timestamp layout. Handles both
+    [YYYY-MM-DD, HH:MM:SS AM/PM] and [H:MM AM/PM, M/D/YYYY] (and variants
+    with/without seconds, 24h, dashes/slashes)."""
+    parts = [p.strip() for p in bracket.split(",", 1)]
+    if len(parts) != 2:
+        return None
+    a, b = parts
+    for date_s, time_s in ((a, b), (b, a)):
+        candidate = f"{date_s} {time_s.upper().replace('  ', ' ')}"
+        for fmt in _TS_FORMATS:
+            try:
+                return datetime.strptime(candidate, fmt)
+            except ValueError:
+                continue
+    return None
 
 INGEST_LOCK = threading.Lock()
 INGEST_STATUS = {"running": False, "total": 0, "done": 0, "errors": 0, "apply": False}
@@ -1866,25 +1897,12 @@ def _parse_whatsapp_transcript(text):
     out = []
     for raw in text.splitlines():
         m = _TRANSCRIPT_LINE_RE.match(raw)
-        if m:
-            date_s, time_s, sender, body = m.group(1), m.group(2), m.group(3).strip(), m.group(4)
-            try:
-                ts = datetime.strptime(f"{date_s} {time_s.upper().replace('  ', ' ')}", "%Y-%m-%d %I:%M:%S %p")
-            except ValueError:
-                try:
-                    ts = datetime.strptime(f"{date_s} {time_s.upper().replace('  ', ' ')}", "%Y-%m-%d %I:%M %p")
-                except ValueError:
-                    try:
-                        ts = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        try:
-                            ts = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M")
-                        except ValueError:
-                            continue
+        ts = _parse_transcript_ts(m.group(1)) if m else None
+        if m and ts:
             out.append({
                 "timestamp": ts.isoformat(timespec="seconds"),
-                "sender": sender,
-                "text": body,
+                "sender": m.group(2).strip(),
+                "text": m.group(3),
             })
         else:
             if out and raw.strip():
