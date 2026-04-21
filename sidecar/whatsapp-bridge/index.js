@@ -28,6 +28,8 @@ const GROUP_ALLOWLIST = new Set(
 );
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 const DROP_HISTORY = process.env.DROP_HISTORY !== "0";
+const BACKFILL_PER_GROUP = parseInt(process.env.BACKFILL_PER_GROUP || "0", 10);
+const BACKFILL_WINDOW_MS = parseInt(process.env.BACKFILL_WINDOW_MS || "15000", 10);
 const LIST_GROUPS = process.argv.includes("--list-groups");
 const STARTED_AT_SEC = Math.floor(Date.now() / 1000);
 
@@ -115,30 +117,73 @@ async function start() {
     }
   });
 
+  const backfillEnabled = BACKFILL_PER_GROUP > 0;
+  const backfillBuf = new Map(); // groupJid -> array of {msg, ts}
+  let backfillDone = !backfillEnabled;
+  const seenIds = new Set();
+
+  function buildPayload(msg) {
+    const remoteJid = msg.key.remoteJid || "";
+    const ts = Number(msg.messageTimestamp || 0);
+    const text = extractText(msg).trim();
+    if (!text) return null;
+    const sender = msg.key.participant || remoteJid;
+    return {
+      id: msg.key.id,
+      timestamp: new Date(ts * 1000).toISOString(),
+      sender_jid: sender,
+      group_jid: remoteJid,
+      text,
+    };
+  }
+
+  if (backfillEnabled) {
+    setTimeout(async () => {
+      backfillDone = true;
+      let total = 0;
+      for (const [groupJid, buf] of backfillBuf) {
+        buf.sort((a, b) => a.ts - b.ts);
+        const slice = buf.slice(-BACKFILL_PER_GROUP);
+        for (const { msg } of slice) {
+          if (seenIds.has(msg.key.id)) continue;
+          seenIds.add(msg.key.id);
+          const payload = buildPayload(msg);
+          if (payload) {
+            await forward(payload);
+            total++;
+          }
+        }
+        log.info({ group: groupJid, forwarded: slice.length, buffered: buf.length }, "backfill");
+      }
+      backfillBuf.clear();
+      log.info({ total }, "backfill complete — switching to live mode");
+    }, BACKFILL_WINDOW_MS);
+  }
+
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
     for (const msg of messages) {
       if (!msg.message) continue;
       if (msg.key.fromMe) continue;
 
       const remoteJid = msg.key.remoteJid || "";
-      if (!remoteJid.endsWith("@g.us")) continue; // groups only
+      if (!remoteJid.endsWith("@g.us")) continue;
       if (GROUP_ALLOWLIST.size > 0 && !GROUP_ALLOWLIST.has(remoteJid)) continue;
 
       const ts = Number(msg.messageTimestamp || 0);
+
+      if (!backfillDone) {
+        if (!backfillBuf.has(remoteJid)) backfillBuf.set(remoteJid, []);
+        backfillBuf.get(remoteJid).push({ msg, ts });
+        continue;
+      }
+
+      if (type !== "notify") continue;
       if (DROP_HISTORY && ts && ts < STARTED_AT_SEC) continue;
+      if (seenIds.has(msg.key.id)) continue;
+      seenIds.add(msg.key.id);
 
-      const text = extractText(msg).trim();
-      if (!text) continue;
-
-      const sender = msg.key.participant || remoteJid;
-      await forward({
-        id: msg.key.id,
-        timestamp: new Date(ts * 1000).toISOString(),
-        sender_jid: sender,
-        group_jid: remoteJid,
-        text,
-      });
+      const payload = buildPayload(msg);
+      if (payload) await forward(payload);
     }
   });
 }
