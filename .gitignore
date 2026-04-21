@@ -11,3 +11,8 @@ GCalOauth/
 scripts/client_secret*.json
 
 .secrets/
+
+.playwright-mcp/
+scripts/_*.py
+scripts/_*.png
+scripts/_*.html
