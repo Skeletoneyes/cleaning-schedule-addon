@@ -18,6 +18,7 @@ from pathlib import Path
 import requests
 from flask import Flask, render_template_string, request, redirect, jsonify, abort
 
+import facts as facts_mod
 import gcal as gcal_mod
 
 app = Flask(__name__)
@@ -86,6 +87,7 @@ def load_data():
     data.setdefault("messages", [])
     data.setdefault("cleaner_jids", {})
     data.setdefault("group_labels", {})
+    data.setdefault("message_facts", {})
     return data
 
 
@@ -426,6 +428,11 @@ def process_message(msg_id):
         labels = dict(data.get("group_labels", {}))
 
     result, error = parse_whatsapp_message(msg, history, bookings, known, sender_cleaner, labels)
+    # Facts extraction runs independently of parse routing. An empty facts list
+    # is a valid result (chitchat) — only facts_err means retry via reprocess.
+    facts_list, facts_err = facts_mod.extract_facts(
+        ANTHROPIC_API_KEY, msg, history, known, labels,
+    )
 
     with DATA_LOCK:
         data = load_data()
@@ -435,6 +442,11 @@ def process_message(msg_id):
         msg["parsed"] = True
         msg["parse_error"] = error
         msg["haiku_result"] = result
+
+        if facts_list is not None:
+            data.setdefault("message_facts", {})[msg_id] = facts_mod.build_record(
+                facts_list, msg.get("sender") or "",
+            )
 
         if error or not result:
             msg["review_state"] = "pending"
@@ -1673,6 +1685,36 @@ def review_notify(slug):
     return redirect(ingress_prefix() + f"/?i={next_idx}")
 
 
+@app.route("/internal/snapshot", methods=["GET"])
+def internal_snapshot():
+    """Return data.json plus non-secret option fields for off-host reconciliation.
+
+    Same auth model as the WhatsApp inbound endpoint: loopback is open, remote
+    callers must present X-Shared-Secret. API keys and the GCal service-account
+    JSON are never returned; the Airbnb iCal URL is returned so the caller can
+    pull the upstream feed itself.
+    """
+    remote = request.remote_addr or ""
+    if remote not in ("127.0.0.1", "::1"):
+        provided = request.headers.get("X-Shared-Secret", "")
+        if not WHATSAPP_SHARED_SECRET or provided != WHATSAPP_SHARED_SECRET:
+            abort(403)
+
+    with DATA_LOCK:
+        data = load_data()
+
+    return jsonify({
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "options": {
+            "ical_url": ICAL_URL,
+            "cleaners": CLEANERS,
+            "gcal_enabled": GCAL_ENABLED,
+            "gcal_calendar_id": GCAL_CALENDAR_ID,
+        },
+        "data": data,
+    })
+
+
 @app.route("/internal/whatsapp/inbound", methods=["POST"])
 def whatsapp_inbound():
     """Accept a single WhatsApp message from the Baileys sidecar.
@@ -1716,6 +1758,80 @@ def whatsapp_inbound():
     ensure_workers_started()
     enqueue_message(msg_id)
     return jsonify({"status": "queued", "id": msg_id})
+
+
+def _require_local_or_secret():
+    """Gate: loopback open, otherwise X-Shared-Secret must match. Aborts 403."""
+    remote = request.remote_addr or ""
+    if remote in ("127.0.0.1", "::1"):
+        return
+    provided = request.headers.get("X-Shared-Secret", "")
+    if not WHATSAPP_SHARED_SECRET or provided != WHATSAPP_SHARED_SECRET:
+        abort(403)
+
+
+@app.route("/admin/facts", methods=["GET"])
+def admin_facts():
+    """Dump stored message_facts for inspection. Loopback / shared-secret only."""
+    _require_local_or_secret()
+    data = load_data()
+    return jsonify({
+        "prompt_version": facts_mod.FACTS_PROMPT_VERSION,
+        "model_version": facts_mod.FACTS_MODEL,
+        "count": len(data.get("message_facts", {})),
+        "message_facts": data.get("message_facts", {}),
+    })
+
+
+@app.route("/admin/reprocess-facts", methods=["POST"])
+def admin_reprocess_facts():
+    """Re-extract facts for any message whose record is missing or stale.
+
+    Idempotent: running repeatedly is safe. The reconciler only reads
+    current-version facts, so a half-complete reprocess can't corrupt results.
+    """
+    _require_local_or_secret()
+
+    with DATA_LOCK:
+        data = load_data()
+        all_messages = list(data.get("messages", []))
+        existing = dict(data.get("message_facts", {}))
+        known = cleaner_names()
+        labels = dict(data.get("group_labels", {}))
+
+    stale = []
+    for m in all_messages:
+        msg_id = m.get("id")
+        if not msg_id:
+            continue
+        rec = existing.get(msg_id)
+        if rec is None or rec.get("prompt_version") != facts_mod.FACTS_PROMPT_VERSION:
+            stale.append(m)
+
+    extracted = 0
+    errors = 0
+    for m in stale:
+        history = [h for h in all_messages if h.get("id") != m.get("id")]
+        facts_list, err = facts_mod.extract_facts(
+            ANTHROPIC_API_KEY, m, history, known, labels,
+        )
+        if err or facts_list is None:
+            errors += 1
+            continue
+        with DATA_LOCK:
+            data = load_data()
+            data.setdefault("message_facts", {})[m["id"]] = facts_mod.build_record(
+                facts_list, m.get("sender") or "",
+            )
+            save_data(data)
+        extracted += 1
+
+    return jsonify({
+        "stale": len(stale),
+        "extracted": extracted,
+        "errors": errors,
+        "prompt_version": facts_mod.FACTS_PROMPT_VERSION,
+    })
 
 
 # ── Review queue routes ─────────────────────────────────────────────────────
