@@ -49,7 +49,6 @@ sidecar/whatsapp-bridge/     # Baileys sidecar — EXTERNAL Node process, not in
 ├── .env.example             # Config template (HA_URL, SHARED_SECRET, GROUP_ALLOWLIST, BACKFILL_*)
 └── README.md                # Setup, test→prod swap, operational notes
 scripts/
-├── whatsapp_fixture.py      # Synthetic inbound-message harness (pre-sidecar testing)
 ├── reconcile_pull.py        # Off-host puller for the reconcile-cleaning-schedule skill
 └── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
 RECONCILER_PLAN.md           # Forward-looking plan: facts layer (shipped) + Conflicts tab (next)
@@ -209,8 +208,6 @@ line numbers; the file grows.
 - Review tab UI: pending-message queue with accept/override/ignore; group
   label editor; unmapped-sender flow (map to existing cleaner OR create new,
   then re-queue that sender's pending messages).
-- Scripted harness: `scripts/whatsapp_fixture.py` POSTs synthetic messages
-  (confirm / decline / ambiguous / unmapped / chitchat).
 
 ### Facts layer (`facts.py`, `data.message_facts`)
 - Separate from parse. Parse answers "route this message to one booking?";
