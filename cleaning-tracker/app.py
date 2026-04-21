@@ -45,6 +45,10 @@ GCAL_ENABLED = bool(OPTIONS.get("gcal_enabled", False))
 GCAL_CALENDAR_ID = OPTIONS.get("gcal_calendar_id", "")
 GCAL_SERVICE_ACCOUNT_JSON = OPTIONS.get("gcal_service_account_json", "")
 
+WHATSAPP_SHARED_SECRET = OPTIONS.get(
+    "whatsapp_shared_secret", os.environ.get("WHATSAPP_SHARED_SECRET", "")
+)
+
 
 def _gcal_push(data):
     """Fire-and-forget GCal projection after a write. Errors are swallowed so
@@ -1671,14 +1675,17 @@ def review_notify(slug):
 
 @app.route("/internal/whatsapp/inbound", methods=["POST"])
 def whatsapp_inbound():
-    """Accept a single WhatsApp message from the local Baileys sidecar.
+    """Accept a single WhatsApp message from the Baileys sidecar.
 
-    Loopback-only. Dedups on message id (Baileys replays on reconnect).
-    Appends to data.messages and enqueues for the parse worker.
+    Auth: loopback requests are always allowed (same-host sidecar). Remote
+    requests must present X-Shared-Secret matching WHATSAPP_SHARED_SECRET.
+    Dedups on message id (Baileys replays on reconnect).
     """
     remote = request.remote_addr or ""
     if remote not in ("127.0.0.1", "::1"):
-        abort(403)
+        provided = request.headers.get("X-Shared-Secret", "")
+        if not WHATSAPP_SHARED_SECRET or provided != WHATSAPP_SHARED_SECRET:
+            abort(403)
 
     payload = request.get_json(silent=True) or {}
     msg_id = (payload.get("id") or "").strip()

@@ -1,5 +1,5 @@
 name: Cleaning Schedule Tracker
-version: "1.7.2"
+version: "1.8.0"
 slug: cleaning-tracker
 description: Airbnb cleaning schedule tracker with iCal sync and AI-powered WhatsApp parsing
 init: false
@@ -19,6 +19,7 @@ options:
   gcal_enabled: false
   gcal_calendar_id: ""
   gcal_service_account_json: ""
+  whatsapp_shared_secret: ""
 schema:
   ical_url: url
   anthropic_api_key: password
@@ -27,3 +28,4 @@ schema:
   gcal_enabled: bool
   gcal_calendar_id: str?
   gcal_service_account_json: password?
+  whatsapp_shared_secret: password?
