@@ -4,9 +4,10 @@
 
 Home Assistant add-on that tracks Airbnb cleaning schedules. It syncs bookings
 from an Airbnb iCal feed, lets you assign cleaners to checkout dates, and uses
-Claude Haiku to interpret WhatsApp conversations with cleaners (both pasted
-text and, via Phase 3, a read-only bot account) to detect confirmations and
-declines.
+Claude Haiku to interpret WhatsApp conversations with cleaners (live traffic
+via a Baileys linked-device sidecar on the user's PC, plus a `/backfill`
+paste page for catching up on historical assignments) to detect confirmations
+and declines.
 
 ## Architecture
 
@@ -33,14 +34,19 @@ cleaning-tracker/
 ├── config.yaml              # Add-on config: name, version, options schema
 ├── Dockerfile               # python:3.12-slim, pip install, runs app.py
 ├── requirements.txt         # flask, requests, icalendar, anthropic, google-api-*
-├── app.py                   # Entire application (Flask routes, templates, logic) — ~1900 lines
+├── app.py                   # Entire application (Flask routes, templates, logic) — ~2100 lines
 └── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
+sidecar/whatsapp-bridge/     # Baileys sidecar — EXTERNAL Node process, not in the add-on container
+├── index.js                 # Pairs as a WhatsApp linked device; POSTs group messages to the add-on
+├── package.json
+├── .env.example             # Config template (HA_URL, SHARED_SECRET, GROUP_ALLOWLIST, BACKFILL_*)
+└── README.md                # Setup, test→prod swap, operational notes
 scripts/
-├── whatsapp_fixture.py      # Synthetic inbound-message harness for Phase 3
+├── whatsapp_fixture.py      # Synthetic inbound-message harness (pre-sidecar testing)
 └── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
 GCAL_VIEW_SKETCH.md          # Current direction: GCal-as-view. Shipped state + TODOs
 PHASE_1_PLAN.md              # Historical: FullCalendar-first UI. Superseded; kept only as archaeology
-PHASE_3_SKETCH.md            # WhatsApp automation — Step 1 shipped, Steps 2–3 pending
+PHASE_3_SKETCH.md            # WhatsApp automation — Steps 1 and 3 shipped in test mode; Step 2 (bot number) still pending
 ```
 
 Tests / doc-builder helpers live under `scripts/` and are not shipped in the
@@ -68,6 +74,10 @@ resulting in an empty base image.
   calendar's "Share with specific people" list with "Make changes to events"
   permission. Use `scripts/gcal_auth.py` to validate a downloaded key and
   print the exact sharing email.
+- `whatsapp_shared_secret` — shared token authenticating the Baileys sidecar's
+  `POST /internal/whatsapp/inbound` calls. Required for any non-loopback
+  caller; loopback (same-host) calls bypass auth. Must match
+  `SHARED_SECRET` in `sidecar/whatsapp-bridge/.env`.
 
 ## Data model (`/data/data.json`)
 
@@ -149,15 +159,28 @@ Helpers: `review_item(uid, b)`, `review_queue(data)`, `needs_notify(b)`,
   print-optimized CSS. Black borders, colour bars for stays, cleaner + time
   on checkout cells.
 
-### WhatsApp — paste flow
-- User pastes a chat transcript; Haiku is given the transcript plus the list
-  of upcoming checkout dates and known cleaners.
-- Output: structured JSON of confirm/decline per date with inferred cleaner
-  and time. Optional auto-apply checkbox writes directly to bookings.
+### WhatsApp — backfill page (`/backfill`, added 1.9.0)
+- User pastes a WhatsApp chat export (phone: group → Export chat → Without
+  media). Haiku receives the transcript + the **full list of active unassigned
+  bookings** (no date window) + known cleaners + an optional group-hint
+  string.
+- Returns per-booking proposals: `{uid, cleaner, clean_time, confidence,
+  evidence}`. The review page renders each with confidence-coloured border
+  (green ≥ 0.85, yellow 0.6–0.85, red < 0.6), editable cleaner dropdown,
+  time input, and a checkbox pre-ticked at ≥ 0.85.
+- `POST /backfill/apply` writes approved assignments and calls
+  `ack_notified(booking, via="backfill")` so they skip the notify queue.
+- Purpose: one-shot catch-up after install, or for reviving historical
+  assignments that predate the linked-device sync window. Live traffic
+  goes through the inbound pipeline instead.
+- Entry point: "Backfill from chat" link in the Unassigned bookings card
+  on `/`. Supersedes the older paste flow described in earlier docs — that
+  older flow's routes no longer exist in the code.
 
-### WhatsApp — inbound pipeline (Phase 3 Step 1, shipped; Steps 2–3 pending a bot account)
-- `POST /internal/whatsapp/inbound` (loopback-only): dedups on message id,
-  enqueues to a 2-thread worker pool.
+### WhatsApp — inbound pipeline (Phase 3 Step 1, shipped)
+- `POST /internal/whatsapp/inbound`: dedups on message id, enqueues to a
+  2-thread worker pool. Loopback calls bypass auth; non-loopback callers
+  must present `X-Shared-Secret` matching `whatsapp_shared_secret`.
 - Parse worker hands Haiku the full cross-group archive + booking list +
   known cleaners + sender hint. Returns
   `{action, booking_uid, cleaner, confidence, reason}`.
@@ -168,8 +191,40 @@ Helpers: `review_item(uid, b)`, `review_queue(data)`, `needs_notify(b)`,
   then re-queue that sender's pending messages).
 - Scripted harness: `scripts/whatsapp_fixture.py` POSTs synthetic messages
   (confirm / decline / ambiguous / unmapped / chitchat).
-- The Baileys sidecar that would feed real WhatsApp traffic is not built yet
-  (blocked on user procuring a bot account; see PHASE_3_SKETCH.md).
+
+### WhatsApp — Baileys sidecar (Phase 3 Step 3, test mode shipped 1.8.x)
+- **Lives outside the add-on container** at `sidecar/whatsapp-bridge/`,
+  runs as a Node process on the user's Windows PC. This deliberately dodges
+  the `init: false` → `init: true` flip that an in-container sidecar would
+  have forced. Tradeoff: the PC must stay awake (Settings → Power → "Never
+  sleep while plugged in"). Promoting the sidecar to run on the HA host
+  itself is possible later — same code, loopback URL, no secret needed.
+- Pairs as a WhatsApp **linked device** via QR scan. **Test mode** pairs
+  against the user's personal WhatsApp (ban risk eats the personal account;
+  tolerated for a test). **Production path**: delete
+  `sidecar/whatsapp-bridge/auth/`, re-pair against a dedicated bot number
+  (SpeakOut $125/yr plan is the planned number — Step 2 still pending).
+- **Read-only.** `index.js` never calls `sendMessage`. Confirmations and
+  corrections still flow through the Review tab in the add-on UI, not back
+  into the chat.
+- Filters: `key.fromMe` dropped, non-group dropped, group not in
+  `GROUP_ALLOWLIST` dropped, empty text dropped. In-process `seenIds` set
+  layered on top of the add-on's id dedup.
+- **Network path.** Sidecar → `http://<ha-lan-ip>:5000/internal/whatsapp/inbound`
+  with `X-Shared-Secret` header. Requires port 5000 exposed via `ports:` in
+  `config.yaml` AND the Network section in HA's Configuration UI must have
+  the host port set to `5000` (it doesn't bind from `config.yaml` alone).
+  **Windows gotcha**: `homeassistant.local` often resolves to an IPv6
+  link-local (`fe80::...%22`) first, causing `Connection was reset`; use
+  the direct IPv4 in `.env`.
+- **Startup backfill** (`BACKFILL_PER_GROUP`, `BACKFILL_WINDOW_MS`): buffer
+  messages Baileys delivers during a startup window, forward the N most
+  recent per group, then switch to live mode. In practice returns zero on
+  reconnects to an already-synced auth state — WhatsApp's servers don't
+  replay history on linked devices that think they're caught up. For deep
+  history, use `/backfill` (the paste-flow route) instead.
+- `--list-groups` mode prints every group the paired account is in, for
+  populating `GROUP_ALLOWLIST`.
 
 ### Google Calendar projection (primary view, `gcal_enabled`)
 - One-way sync: `data.json` → GCal. Cleaners don't edit the calendar; they
@@ -227,8 +282,17 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
   caches add-on configs, and updates for an existing slug only take effect
   on a version bump.
 - `init: false` in `config.yaml` is required — without it, the HA base
-  image's s6-overlay conflicts with a bare `CMD`. Phase 3 Step 3 may need
-  to revisit this when adding the Node.js sidecar; document the flip there.
+  image's s6-overlay conflicts with a bare `CMD`. The Baileys sidecar was
+  originally scoped as in-container (which would have forced a flip to
+  `init: true` + s6-overlay). The external-sidecar decision in `sidecar/`
+  means this constraint still holds; the flip is not needed.
+- **Port 5000 is exposed on the LAN** via the `ports:` mapping in
+  `config.yaml` so the external sidecar can reach `/internal/whatsapp/inbound`.
+  Non-loopback callers must authenticate via `X-Shared-Secret`
+  (`whatsapp_shared_secret`). All other routes on port 5000 are the normal
+  Flask app — same routes ingress serves, minus the `X-Ingress-Path`
+  prefix. If you add a route that should be ingress-only, gate it
+  explicitly (check `request.remote_addr` or a header).
 - Do NOT use Samba for iterative add-on development on HAOS from Windows —
   SMB write caching makes files stale.
 - For local development, the app falls back to reading `options.json` from

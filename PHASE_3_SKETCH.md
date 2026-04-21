@@ -1,11 +1,20 @@
 # Phase 3 Plan — WhatsApp automation
 
-> **Status (2026-04-20): Step 1 still current, Steps 2–3 deferred.** The
-> WhatsApp paste flow + inbound pipeline + Review tab are still the way the
-> add-on earns its keep — none of that was affected by the move to Google
-> Calendar as the shared view (see `GCAL_VIEW_SKETCH.md`). Steps 2 and 3
-> (Baileys sidecar, real WhatsApp traffic) remain blocked on procuring a
-> bot account.
+> **Status (2026-04-20): Steps 1 and 3 shipped in test mode (add-on 1.8.x);
+> Step 2 still pending.** The inbound pipeline + Review tab are live. The
+> Baileys sidecar is built and running at `sidecar/whatsapp-bridge/`,
+> paired against the user's personal WhatsApp as a linked device (test
+> mode). Real messages from the two allowlisted cleaner groups are flowing
+> into the Review tab. **Pivot from the original plan:** the sidecar runs
+> **outside** the add-on container, as a Node process on the user's PC —
+> avoids the `init: true` / s6-overlay flip that an in-container sidecar
+> would have forced. Step 2 (procure dedicated SpeakOut bot number) still
+> blocks the promotion to unattended production operation; swapping to
+> that account is a `rm -rf sidecar/whatsapp-bridge/auth/` + re-pair.
+>
+> **New in 1.9.0:** `/backfill` page — paste a WhatsApp chat export to
+> match unassigned bookings against historical messages. Covers the
+> history that linked-device sync can't reach.
 
 ## Current status (2026-04-19)
 
@@ -149,7 +158,29 @@ User, not assistant:
 
 Nothing technical on the add-on side during this step.
 
-### Step 3 — Wire Baileys to the supplied account  ⏳ blocked on Step 2
+### Step 3 — Wire Baileys  ✅ DONE in test mode (external sidecar); bot-account swap blocked on Step 2
+
+> **Reality check (2026-04-20):** shipped at `sidecar/whatsapp-bridge/`
+> (repo-root, not under `cleaning-tracker/`) as an **external** Node
+> process on the user's PC, not an in-container service. The Dockerfile
+> changes + `init: true` / s6-overlay flip described below were NOT done —
+> the external-sidecar decision made them unnecessary. What was built:
+>
+> - Pairs as linked device via QR scan (`npm run list-groups` on first run
+>   prints groups; subsequent `npm start` uses persisted auth in `./auth/`).
+> - Read-only: never calls `sendMessage`.
+> - POSTs to `<HA_URL>/internal/whatsapp/inbound` with `X-Shared-Secret`
+>   matching the `whatsapp_shared_secret` option (exposed via `ports:` in
+>   `config.yaml`; HA Network section must set host port = 5000).
+> - Filters: fromMe dropped, non-group dropped, `GROUP_ALLOWLIST` enforced.
+> - `BACKFILL_PER_GROUP` / `BACKFILL_WINDOW_MS` for a one-shot startup
+>   backfill window — forwards the N most recent per group from whatever
+>   history Baileys delivers during the window. Often returns zero on
+>   reconnects (linked devices already synced don't get replays).
+> - `/backfill` page in the add-on handles deeper historical matching
+>   via paste-a-chat-export + Haiku.
+>
+> The original in-container plan below is preserved as archaeology.
 
 User supplies the new number/account; assistant does the integration.
 

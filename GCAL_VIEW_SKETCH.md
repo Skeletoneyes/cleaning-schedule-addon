@@ -43,8 +43,9 @@ FullCalendar view is retired. `/events.json` is gone. The deprecated
 
 - `data.json` (source of truth).
 - iCal sync from Airbnb.
-- WhatsApp paste flow + inbound pipeline + Review tab + JID mapping +
-  group labels.
+- WhatsApp inbound pipeline (Baileys sidecar → `/internal/whatsapp/inbound`)
+  + Review tab + JID mapping + group labels + `/backfill` paste page for
+  historical catch-up (1.9.0; replaces the older generic paste flow).
 - Per-cleaner notify queue — drift detection driving both `/` and the
   GCal `⚠️` signal.
 
