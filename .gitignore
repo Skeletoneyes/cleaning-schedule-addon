@@ -9,3 +9,5 @@ __pycache__/
 
 GCalOauth/
 scripts/client_secret*.json
+
+.secrets/

@@ -267,7 +267,11 @@ def sync_to_gcal(data, service_account_json, calendar_id):
         for uid, body in desired.items():
             if uid in existing:
                 if not _events_equal(existing[uid], body):
-                    service.events().patch(
+                    # update (PUT) rather than patch (MERGE): when a cleaning
+                    # flips between all-day and timed, patch leaves the old
+                    # start.date / start.dateTime behind and GCal rejects the
+                    # event with "Invalid start time."
+                    service.events().update(
                         calendarId=calendar_id,
                         eventId=existing[uid]["id"],
                         body=body,

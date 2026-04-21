@@ -23,8 +23,7 @@ cleaners. The add-on UI's job is to handle everything GCal can't — the
 per-cleaner notify queue (see below) and WhatsApp review.
 
 The FullCalendar view is gone. `/` now renders a per-cleaner **notify
-queue** driven by `cleaner_commitment` drift — see
-`GCAL_VIEW_SKETCH.md` for rationale and shipped state.
+queue** driven by `cleaner_commitment` drift.
 
 ### Key Files
 
@@ -44,8 +43,6 @@ sidecar/whatsapp-bridge/     # Baileys sidecar — EXTERNAL Node process, not in
 scripts/
 ├── whatsapp_fixture.py      # Synthetic inbound-message harness (pre-sidecar testing)
 └── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
-GCAL_VIEW_SKETCH.md          # Current direction: GCal-as-view. Shipped state + TODOs
-PHASE_1_PLAN.md              # Historical: FullCalendar-first UI. Superseded; kept only as archaeology
 PHASE_3_SKETCH.md            # WhatsApp automation — Steps 1 and 3 shipped in test mode; Step 2 (bot number) still pending
 ```
 
@@ -300,3 +297,19 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 - UI changes should be verified in a local Playwright (Chromium) run before
   being reported as done. Playwright is a dev-only dependency — do **not**
   add it to the add-on `requirements.txt`.
+
+## Open questions / deferred
+
+- **First-run notify-queue noise.** Legacy data has no `cleaner_commitment`
+  anywhere, so on install every assigned booking appears as `new`.
+  Resolution is one "Mark notified" per cleaner. Revisit with a one-shot
+  "trust current state" admin action if Michelle finds the initial flood
+  painful.
+- **Playwright coverage for the notify queue.** Mobile viewport (375×667),
+  empty state, pager, Mark notified, Unassigned-card assignment, plus a
+  WhatsApp auto-apply leg that writes `communicated_via="whatsapp"`. Not
+  yet run end-to-end.
+- **Rejected / deferred:** resolved-notify audit log, per-line-item notify
+  ticking (MVP resolves a whole cleaner at once), GCal guest-invite RSVPs
+  (WhatsApp pipeline covers it), split stays-vs-cleanings calendars,
+  retiring `/print` (Michelle still uses it).
