@@ -1852,6 +1852,14 @@ _TRANSCRIPT_LINE_RE = re.compile(
     r"^\[([^\]]+)\]\s+([^:]+?):\s?(.*)$"
 )
 
+# Android export: "2026-03-13, 9:58 a.m. - Sender: text" (no brackets, ` - `
+# separator, dotted am/pm). System lines ("Michelle Groves added you") share
+# the prefix but have no `Sender:` body — handled in _parse_whatsapp_transcript.
+_ANDROID_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2},\s+\d{1,2}:\d{2}(?::\d{2})?\s+[aApP]\.?[mM]\.?)\s+-\s+(.+)$"
+)
+_ANDROID_BODY_RE = re.compile(r"^([^:]+?):\s?(.*)$")
+
 _TS_FORMATS = [
     "%Y-%m-%d %I:%M:%S %p",
     "%Y-%m-%d %I:%M %p",
@@ -1870,7 +1878,10 @@ def _parse_transcript_ts(bracket):
     """Try every known WhatsApp export timestamp layout. Handles both
     [YYYY-MM-DD, HH:MM:SS AM/PM] and [H:MM AM/PM, M/D/YYYY] (and variants
     with/without seconds, 24h, dashes/slashes)."""
-    parts = [p.strip() for p in bracket.split(",", 1)]
+    normalized = (bracket
+                  .replace("a.m.", "AM").replace("p.m.", "PM")
+                  .replace("A.M.", "AM").replace("P.M.", "PM"))
+    parts = [p.strip() for p in normalized.split(",", 1)]
     if len(parts) != 2:
         return None
     a, b = parts
@@ -1897,16 +1908,31 @@ def _parse_whatsapp_transcript(text):
     out = []
     for raw in text.splitlines():
         m = _TRANSCRIPT_LINE_RE.match(raw)
-        ts = _parse_transcript_ts(m.group(1)) if m else None
-        if m and ts:
-            out.append({
-                "timestamp": ts.isoformat(timespec="seconds"),
-                "sender": m.group(2).strip(),
-                "text": m.group(3),
-            })
-        else:
-            if out and raw.strip():
-                out[-1]["text"] += "\n" + raw
+        if m:
+            ts = _parse_transcript_ts(m.group(1))
+            if ts:
+                out.append({
+                    "timestamp": ts.isoformat(timespec="seconds"),
+                    "sender": m.group(2).strip(),
+                    "text": m.group(3),
+                })
+                continue
+        m2 = _ANDROID_LINE_RE.match(raw)
+        if m2:
+            ts = _parse_transcript_ts(m2.group(1))
+            if ts:
+                body = _ANDROID_BODY_RE.match(m2.group(2))
+                if body:
+                    out.append({
+                        "timestamp": ts.isoformat(timespec="seconds"),
+                        "sender": body.group(1).strip(),
+                        "text": body.group(2),
+                    })
+                # No body match = system line ("X added you"); skip without
+                # polluting the previous message.
+                continue
+        if out and raw.strip():
+            out[-1]["text"] += "\n" + raw
     return out
 
 
