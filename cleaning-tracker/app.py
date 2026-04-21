@@ -1761,9 +1761,16 @@ def whatsapp_inbound():
 
 
 def _require_local_or_secret():
-    """Gate: loopback open, otherwise X-Shared-Secret must match. Aborts 403."""
+    """Gate: loopback and HA ingress open, otherwise X-Shared-Secret must match.
+
+    Ingress traffic arrives from the Supervisor's docker bridge (172.30.x.x)
+    and carries an X-Ingress-Path header set by the proxy — we trust that
+    as proof the caller went through HA's auth layer.
+    """
     remote = request.remote_addr or ""
     if remote in ("127.0.0.1", "::1"):
+        return
+    if request.headers.get("X-Ingress-Path"):
         return
     provided = request.headers.get("X-Shared-Secret", "")
     if not WHATSAPP_SHARED_SECRET or provided != WHATSAPP_SHARED_SECRET:
