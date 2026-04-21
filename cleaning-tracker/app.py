@@ -958,7 +958,7 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
 <div id="notify-tab" class="panel active">
   {% if unassigned %}
   <div class="unassigned-card">
-    <div class="unassigned-header">Unassigned bookings ({{ unassigned|length }}) · <a href="{{ prefix }}/backfill" style="font-weight:500;font-size:0.85rem;">Backfill from chat</a></div>
+    <div class="unassigned-header">Unassigned bookings ({{ unassigned|length }}) · <a href="{{ prefix }}/backfill" style="font-weight:500;font-size:0.85rem;">Backfill from chat</a> · <a href="{{ prefix }}/admin/ingest" style="font-weight:500;font-size:0.85rem;">Ingest transcript</a></div>
     {% for item in unassigned %}
     <div class="unassigned-row">
       <span class="date">{{ item.date_fmt }}</span>
