@@ -1971,10 +1971,13 @@ def _ingest_worker(msg_ids, apply):
                     err = _ingest_facts_only(mid)
                     if err:
                         INGEST_STATUS["errors"] += 1
+                        INGEST_STATUS["last_error"] = str(err)[:200]
             except Exception as e:
                 print(f"[ingest] error on {mid}: {e}")
                 INGEST_STATUS["errors"] += 1
+                INGEST_STATUS["last_error"] = str(e)[:200]
             INGEST_STATUS["done"] += 1
+            time.sleep(0.8)  # pace against Anthropic TPM limit
     finally:
         INGEST_STATUS["running"] = False
 
