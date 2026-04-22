@@ -409,6 +409,25 @@ def ensure_workers_started(pool_size=2):
         _WORKERS_STARTED = True
 
 
+# Facts extraction prompts carry recent context so the model can resolve
+# "yes", "that date", and spot re-posted lists. Unbounded history was fine
+# at the 33-message test corpus but blows up in bulk backfill (quadratic
+# tokens, TPM ceilings, 429 backoff storms). Window to the 30 most recent
+# same-group messages strictly preceding the target.
+FACTS_HISTORY_WINDOW = 30
+
+
+def _facts_history(messages, target):
+    tgt_group = target.get("group")
+    tgt_ts = target.get("timestamp") or ""
+    same = [
+        m for m in messages
+        if m.get("group") == tgt_group and (m.get("timestamp") or "") < tgt_ts
+    ]
+    same.sort(key=lambda m: m.get("timestamp") or "")
+    return same[-FACTS_HISTORY_WINDOW:]
+
+
 def process_message(msg_id):
     """Parse one inbound message with Haiku; auto-apply or flag for review."""
     with DATA_LOCK:
@@ -418,20 +437,20 @@ def process_message(msg_id):
             return
         if msg.get("parsed"):
             return
-        # Snapshot everything we need, then release the lock while we call the
-        # API. Re-acquire on write. Volume is low, so pass the full archive
-        # across all groups rather than a per-group window.
-        history = [m for m in data["messages"] if m.get("id") != msg_id]
+        # Snapshot everything we need, then release the lock while we call
+        # the API. Re-acquire on write.
+        all_messages = [m for m in data["messages"] if m.get("id") != msg_id]
         bookings = dict(data.get("bookings", {}))
         known = cleaner_names()
         sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
         labels = dict(data.get("group_labels", {}))
 
-    result, error = parse_whatsapp_message(msg, history, bookings, known, sender_cleaner, labels)
+    # Parse keeps full history for now (single-message live path, not bulk).
+    result, error = parse_whatsapp_message(msg, all_messages, bookings, known, sender_cleaner, labels)
     # Facts extraction runs independently of parse routing. An empty facts list
     # is a valid result (chitchat) — only facts_err means retry via reprocess.
     facts_list, facts_err = facts_mod.extract_facts(
-        ANTHROPIC_API_KEY, msg, history, known, labels,
+        ANTHROPIC_API_KEY, msg, _facts_history(all_messages, msg), known, labels,
     )
 
     with DATA_LOCK:
@@ -1818,7 +1837,9 @@ def admin_reprocess_facts():
     extracted = 0
     errors = 0
     for m in stale:
-        history = [h for h in all_messages if h.get("id") != m.get("id")]
+        history = _facts_history(
+            [h for h in all_messages if h.get("id") != m.get("id")], m,
+        )
         facts_list, err = facts_mod.extract_facts(
             ANTHROPIC_API_KEY, m, history, known, labels,
         )
@@ -1960,7 +1981,9 @@ def _ingest_facts_only(msg_id):
         msg = _find_message(data, msg_id)
         if not msg or msg.get("parsed"):
             return
-        history = [m for m in data["messages"] if m.get("id") != msg_id]
+        history = _facts_history(
+            [m for m in data["messages"] if m.get("id") != msg_id], msg,
+        )
         known = cleaner_names()
         labels = dict(data.get("group_labels", {}))
 
