@@ -16,21 +16,23 @@ ingress. No database — data lives in `/data/data.json` (persists across
 rebuilds). Configuration is read from `/data/options.json` (populated by HA
 from `config.yaml` options).
 
-**Current direction (1.13.x):** the add-on is the **brain**, Google Calendar
+**Current direction (1.15.x):** the add-on is the **brain**, Google Calendar
 is the **shared view**. `data.json` is the source of truth; `gcal.py` pushes
 a one-way projection to a GCal calendar shared with Michelle and the
 cleaners. The add-on UI's job is to handle everything GCal can't — the
-per-cleaner notify queue, WhatsApp review, and (next) a Conflicts tab
-backed by the versioned facts layer.
+per-cleaner notify queue, WhatsApp review, and the Conflicts tab backed by
+the versioned facts layer + structural detectors.
 
-The FullCalendar view is gone. `/` now renders a per-cleaner **notify
-queue** driven by `cleaner_commitment` drift.
+The FullCalendar view is gone. `/` now renders three tabs: Notify queue
+(per-cleaner `cleaner_commitment` drift), WhatsApp review, and Conflicts
+(reconciler findings).
 
-Work in progress: an LLM-driven reconciler that cross-checks `data.json`,
-Airbnb iCal, GCal, and the WhatsApp archive. Step 1 (versioned facts
-extraction via `facts.py`) is shipped and validated. See
-`RECONCILER_PLAN.md` for step 2 (structural detectors + Conflicts tab)
-and the open questions.
+The reconciler cross-checks `data.json`, Airbnb iCal, GCal, and the
+WhatsApp archive. Step 1 (versioned facts extraction via `facts.py`) and
+step 2 slices 1 + 2 (detectors 3/4/5/6 in `reconcile.py` + Conflicts tab
+UI with dismiss mechanism) are shipped. Detectors 1 (Airbnb iCal ⇄
+bookings) and 2 (bookings ⇄ GCal) still pending — they need external
+iCal fetches. See `RECONCILER_PLAN.md`.
 
 ### Key Files
 
@@ -38,11 +40,12 @@ and the open questions.
 repository.yaml              # HA custom repo metadata
 cleaning-tracker/
 ├── config.yaml              # Add-on config: name, version, options schema
-├── Dockerfile               # python:3.12-slim, COPY app.py gcal.py facts.py ./
+├── Dockerfile               # python:3.12-slim, COPY app.py gcal.py facts.py reconcile.py ./
 ├── requirements.txt         # flask, requests, icalendar, anthropic, google-api-*
-├── app.py                   # Flask routes, templates, logic — ~2300 lines
+├── app.py                   # Flask routes, templates, logic — ~2800 lines
 ├── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
-└── facts.py                 # Versioned structured-fact extractor (Haiku, FACTS_PROMPT_VERSION)
+├── facts.py                 # Versioned structured-fact extractor (Haiku, FACTS_PROMPT_VERSION)
+└── reconcile.py             # Pure-function reconciler: detectors → ranked findings
 sidecar/whatsapp-bridge/     # Baileys sidecar — EXTERNAL Node process, not in the add-on container
 ├── index.js                 # Pairs as a WhatsApp linked device; POSTs group messages to the add-on
 ├── package.json
@@ -127,6 +130,14 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
 - `cleaner_jids` — `{jid: cleaner_name}` map built from Review-tab mappings.
 - `group_labels` — `{group_jid: label}` so the UI shows "Maria group" instead
   of a raw JID.
+- `dismissed_findings` — `{finding_id: {dismissed_at, reason}}`. Set via
+  `POST /reconcile/dismiss` when a human decides a reconciler finding is
+  resolved out-of-band. `reconcile.run()` filters these before sorting.
+  Undo via `POST /reconcile/undismiss`.
+
+The latest reconciler output is cached to `/data/reconciler_last.json`
+(not in `data.json`). Written by `POST /reconcile/run`; read by the
+Conflicts tab and `GET /reconcile/last`.
 
 ## How it works
 
@@ -156,8 +167,10 @@ the commitment on every listed booking for that cleaner to match current
 truth and advances to the next bucket. There's no per-line ticking —
 unit of work is one cleaner = one WhatsApp message.
 
-Empty state: "All cleaners up to date ✓". The WhatsApp Review tab lives
-as a second panel on the same page (tab-switched, not a separate route).
+Empty state: "All cleaners up to date ✓". The WhatsApp Review and
+Conflicts panels live as sibling tabs on the same page (tab-switched,
+not separate routes). Tab hashes persist via `location.hash`
+(`#review`, `#conflicts`).
 
 Helpers: `review_item(uid, b)`, `review_queue(data)`, `needs_notify(b)`,
 `ack_notified(booking, via)` in `app.py` — grep rather than relying on
@@ -219,6 +232,12 @@ line numbers; the file grows.
 - Prompt is **role-tagged** — each history line is `<host>` or
   `<cleaner:Name>`, and `schedule_assertion` is host-only while
   `confirm`/`decline`/`time_proposal`/`date_proposal` are cleaner-only.
+- **History window**: `_facts_history(messages, target)` passes only the
+  most recent `FACTS_HISTORY_WINDOW = 30` messages from the **same group**,
+  sorted by timestamp. Without this cap, bulk reprocess blows through the
+  Anthropic TPM budget (one stalled ingest sat at 284/952 for 5 hours
+  before the cap was added). Only the facts path uses the window; the
+  parse path keeps full history.
 - `FACTS_PROMPT_VERSION` (currently `facts-v2`) stamps every stored
   record. The reconciler reads only current-version facts, so
   half-reprocessed state is safe. Bump the version after any prompt
@@ -227,6 +246,44 @@ line numbers; the file grows.
   with exponential backoff honouring `retry-after`. Bulk ingest paces
   at 0.8s/call.
 
+### Reconciler (`reconcile.py`, `/reconcile/*`)
+Pure-function detectors that join `data.json` + `message_facts` into a
+ranked list of findings with `{id, detector, kind, severity, booking_uid,
+cleaner, date, why, evidence, quote}`. Severity tiers: `needs-attention`
+(drift, decline-still-assigned, contested cleaner, host schedule vs
+booking mismatch), `suggest` (unrecorded confirmation, schedule vs
+unassigned booking), `informational` (confirm with no booking,
+changed-mind timeline). Findings dedup on stable id so re-runs are
+idempotent.
+
+**Shipped detectors**:
+- `_drift` — reshapes the notify-queue into findings (new / changed /
+  cancelled / unassigned).
+- `_facts_vs_bookings` — confirm/decline facts ⇄ booking state; emits
+  `unrecorded_confirmation`, `contested_cleaner`,
+  `decline_still_assigned`, `confirm_no_booking`.
+- `_fact_timeline` — `changed_mind` when a cleaner said both confirm and
+  decline on the same date (latest wins).
+- `_schedule_vs_bookings` — host `schedule_assertion` ⇄ booking cleaner
+  (emits `schedule_mismatch` / `schedule_unassigned`).
+
+**Pending**: detector 1 (Airbnb iCal ⇄ bookings) and detector 2
+(bookings ⇄ GCal) — both need external iCal fetches wired into
+`/reconcile/run`.
+
+**Routes** (all `_require_local_or_secret`-gated):
+- `POST /reconcile/run` — recompute + persist to `reconciler_last.json`.
+  Accepts form posts (redirects to `/#conflicts`) or JSON (returns body).
+- `GET /reconcile/last` — serve cached JSON.
+- `POST /reconcile/dismiss` — body `{finding_id, reason?}`. Appends to
+  `data.dismissed_findings` and re-runs the cache.
+- `POST /reconcile/undismiss` — inverse.
+
+**Conflicts tab** on `/`: renders the cached findings grouped by
+severity with one-click actions — `Assign <cleaner>` for
+`unrecorded_confirmation` / `schedule_unassigned`, `Edit booking`,
+`Dismiss`. Badge count on the tab = `needs-attention` count.
+
 ### Admin routes (loopback / ingress / shared-secret only)
 - `GET /admin/facts` — dump `message_facts` for inspection.
 - `POST /admin/reprocess-facts` — re-extract every message whose stored
@@ -234,13 +291,19 @@ line numbers; the file grows.
 - `POST /admin/ingest-transcript` — paste a WhatsApp chat export, parse
   each line into the messages log, run facts extraction (or full
   `process_message` if `apply=true`) in a background thread. Body:
-  `{transcript, group_jid, apply}`. Parser handles both
-  `[YYYY-MM-DD, HH:MM:SS AM/PM]` and `[H:MM AM/PM, M/D/YYYY]` bracket
-  formats. Stable ids (`backfill-<sha1(ts|sender|text)[:16]>`) make
-  re-runs idempotent and dedup against live messages.
+  `{transcript, group_jid, apply}`. Parser handles three formats:
+  `[YYYY-MM-DD, HH:MM:SS AM/PM]`, `[H:MM AM/PM, M/D/YYYY]`, and Android
+  `YYYY-MM-DD, H:MM a.m./p.m. - Sender: text`. Stable ids
+  (`backfill-<sha1(ts|sender|text)[:16]>`) make re-runs idempotent and
+  dedup against live messages.
 - `GET /admin/ingest-status` — progress + `last_error`.
 - `GET /admin/ingest` — HTML paste form, linked from the home page's
   Unassigned card ("Ingest transcript").
+- `POST /admin/remap-group` — bulk-rewrite `group` on messages and
+  update `group_labels`. Body: `{mapping: {old_jid: new_jid}, labels:
+  {jid: label}}`. Useful when a paste-ingested transcript used a
+  placeholder group JID that you later want to consolidate with the
+  live group's real JID.
 
 Auth for all `/admin/*` and `/internal/snapshot` routes goes through
 `_require_local_or_secret()`. Accepts: loopback, HA ingress (presence
@@ -363,19 +426,19 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 
 ## Open questions / deferred
 
-- **Reconciler step 2** — structural detectors + Conflicts tab. Plan
-  lives in `RECONCILER_PLAN.md`; facts layer is shipped and validated,
-  next is deterministic joins across Airbnb / GCal / bookings /
-  `message_facts` and a UI that surfaces findings with one-click
-  resolutions.
-- **Ingest the full historical WhatsApp archive.** User has a backlog
-  beyond the 33 messages already validated. `/admin/ingest` handles any
-  size; budget ~45 min per 3000 messages at 0.8s/call pacing.
+- **Reconciler detectors 1 + 2** — Airbnb iCal ⇄ bookings and bookings
+  ⇄ GCal. Both need external iCal fetches wired into `/reconcile/run`
+  (or into a separate pull step that enriches the input bundle). The
+  reconciler core, facts layer, UI, and detectors 3/4/5/6 all ship as
+  of 1.15.0.
+- **Reconciler step 3 (daily digest)** — cron-triggered "here's what
+  changed since yesterday" notification. Out of scope until detectors
+  1/2 land and the findings list is trusted.
 - **Facts dedup.** Nothing currently collapses duplicate assertions
   across messages ("Itzel May 19" asserted twice = two facts). The
-  reconciler is expected to group by `(cleaner, target_date)` and pick
-  the latest. Revisit with a `fact_groups` materialized view only if
-  this gets painful.
+  reconciler groups by `(cleaner, target_date)` in `_fact_timeline`
+  and `_schedule_vs_bookings` but not across detectors. Revisit with a
+  `fact_groups` materialized view only if this gets painful.
 - **Josh-as-host signal.** Jokey / narrative messages from Josh still
   over-extract at facts-v2. Possible fix: allow-list the actual host in
   config and treat other host-bucket senders as background chat.
@@ -384,10 +447,11 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
   Resolution is one "Mark notified" per cleaner. Revisit with a one-shot
   "trust current state" admin action if Michelle finds the initial flood
   painful.
-- **Playwright coverage for the notify queue.** Mobile viewport (375×667),
-  empty state, pager, Mark notified, Unassigned-card assignment, plus a
-  WhatsApp auto-apply leg that writes `communicated_via="whatsapp"`. Not
-  yet run end-to-end.
+- **Playwright coverage for the notify queue + Conflicts tab.** Mobile
+  viewport (375×667), empty state, pager, Mark notified, Unassigned-card
+  assignment, Conflicts-tab dismiss + Assign actions, plus a WhatsApp
+  auto-apply leg that writes `communicated_via="whatsapp"`. Not yet run
+  end-to-end.
 - **Rejected / deferred:** resolved-notify audit log, per-line-item notify
   ticking (MVP resolves a whole cleaner at once), GCal guest-invite RSVPs
   (WhatsApp pipeline covers it), split stays-vs-cleanings calendars,

@@ -7,9 +7,14 @@ description: Pull the HA add-on snapshot, Airbnb iCal, GCal iCal, and WhatsApp a
 
 ## What this does
 
-Pulls four data sources and cross-checks them for drift:
+Pulls four data sources and cross-checks them for drift. Use this skill
+when you need cross-source findings that the in-add-on reconciler
+doesn't yet cover (Airbnb iCal ⇄ bookings and bookings ⇄ GCal — detectors
+1 and 2). For the detectors that *are* shipped (drift, facts⇄bookings,
+fact timeline, schedule⇄bookings), prefer `POST /reconcile/run` and read
+`/reconcile/last` — it's faster and the output feeds the Conflicts tab.
 
-1. **HA add-on snapshot** — `data.json` plus non-secret options, via authenticated `GET /internal/snapshot`. Includes the **WhatsApp message archive** (`data.messages`) and the **structured facts** extracted from each message (`data.message_facts` — per-message list of `{kind, target_date, target_time, cleaner, confidence, tentative, evidence}` stamped with `prompt_version`). Only facts matching the current `prompt_version` are trustworthy; see `RECONCILER_PLAN.md`.
+1. **HA add-on snapshot** — `data.json` plus non-secret options, via authenticated `GET /internal/snapshot`. Includes the **WhatsApp message archive** (`data.messages`), the **structured facts** (`data.message_facts` — per-message list of `{kind, target_date, target_time, cleaner, confidence, tentative, evidence}` stamped with `prompt_version`; only current-`prompt_version` facts are trustworthy), and `data.dismissed_findings` (the human-dismissed finding ids — filter these out before reporting). See `RECONCILER_PLAN.md`.
 2. **Airbnb iCal** — upstream feed fetched directly from the URL stored in the add-on options.
 3. **GCal iCal** — the shared calendar's secret iCal URL (configured in `.secrets/urls.json`).
 
@@ -29,15 +34,21 @@ Pulls four data sources and cross-checks them for drift:
    - `gcal.ics` — raw iCal.
    - `manifest.json` — summary + errors.
 
-3. Reconcile. At minimum check:
-   - **Airbnb vs `data.bookings`**: every `VEVENT` with `SUMMARY: Reserved` in the iCal should have a matching UID in `data.bookings` with `type=airbnb`. Flag bookings present in one but not the other.
-   - **`data.bookings` vs GCal**: every active booking with a cleaner assigned should project into GCal. An event titled `⚠️ <cleaner>` means drift the add-on already knows about.
+3. Reconcile. The add-on already runs detectors 3–6; call
+   `POST /reconcile/run` (with `X-Shared-Secret`) or read
+   `GET /reconcile/last` to retrieve the current findings and
+   start from there. Then extend with what the in-process reconciler
+   can't see:
+   - **Airbnb vs `data.bookings`** *(detector 1, add-on can't do this)*: every `VEVENT` with `SUMMARY: Reserved` in the iCal should have a matching UID in `data.bookings` with `type=airbnb`. Flag bookings present in one but not the other.
+   - **`data.bookings` vs GCal** *(detector 2, add-on can't do this)*: every active booking with a cleaner assigned should project into GCal. An event titled `⚠️ <cleaner>` means drift the add-on already knows about.
    - **`data.messages` coverage**: check whether recent confirmation-style messages auto-applied (`review_state=auto`) or are stuck pending. Flag sustained pending counts.
-   - **`data.message_facts` ⇄ bookings**: for each `confirm` fact with `(target_date, cleaner)` matching an active booking, check whether the booking reflects it — if the cleaner is absent or different, that's a candidate auto-apply the pipeline missed. For each `decline` fact matching a booking's current cleaner, that's a "cleaner said no but is still assigned" finding.
-   - **Fact timeline**: a later `decline` on the same `(cleaner, target_date)` as an earlier `confirm` means the cleaner changed their mind; latest wins.
-   - **Commitment drift**: for each booking, compare `cleaner_commitment` to current `(cleaner, date, clean_time)` — these are what the add-on's notify queue surfaces.
+   - **Cross-check the cached findings**: fetch `GET /reconcile/last` to see what the add-on's in-process reconciler currently reports. If your pull surfaces something the cache doesn't (e.g. Airbnb dropped a booking), flag it.
 
-4. Report findings as a short punch list grouped by source, with UIDs and dates. Don't just summarize counts — name the specific bookings/messages that need attention.
+4. Report findings as a short punch list grouped by source, with UIDs
+   and dates. Don't just summarize counts — name the specific
+   bookings/messages that need attention. Exclude anything in
+   `data.dismissed_findings`: the user already handled those
+   out-of-band.
 
 ## Setup (one-time)
 

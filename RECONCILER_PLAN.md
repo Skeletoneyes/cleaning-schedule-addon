@@ -1,8 +1,10 @@
 # Reconciler — LLM-driven conflict detection across sources
 
-> **Status (2026-04-21, add-on 1.13.0):** Step 1 (versioned facts extraction)
-> is shipped and validated against real traffic. Step 2 (structural
-> detectors + Conflicts tab) is the next concrete work.
+> **Status (2026-04-22, add-on 1.15.0):** Step 1 (versioned facts
+> extraction) and Step 2 slices 1 + 2 are shipped. Detectors 3/4/5/6
+> run in `reconcile.py`; Conflicts tab with dismiss mechanism is live.
+> Detectors 1 (Airbnb iCal ⇄ bookings) and 2 (bookings ⇄ GCal) remain —
+> both require external iCal fetches.
 
 ## Goal
 
@@ -112,80 +114,90 @@ ingress (via `X-Ingress-Path`), or matching `X-Shared-Secret`.
   low-confidence confirms. Reconciler is expected to dedup/filter; don't
   keep tightening the extractor.
 
-## Step 2 — Structural detectors + Conflicts tab (next)
+## Step 2 — Structural detectors + Conflicts tab
 
 Goal: turn the four sources + facts into a ranked list of specific
 contradictions a human can resolve in one click each.
 
-**Data plane**:
+### Slice 1 — core + detectors 3/4/5 (shipped, 1.14.0)
 
-- A pull step that snapshots Airbnb iCal, GCal iCal, `data.json`, and
-  `data.message_facts` into a single in-memory bundle. Reuse
-  `scripts/reconcile_pull.py` for the external off-host variant; add a
-  loopback-only `/reconcile/pull` that produces the same structure
-  in-process so the detector can run inside the add-on without a second
-  round-trip.
-- Persist the latest detector run to `/data/reconciler_last.json` so the
-  Conflicts tab can render without recomputing. Stamp with
-  `{generated_at, prompt_version, inputs_hash}`. Re-run on demand
-  (`POST /reconcile/run`) and on a daily schedule.
+`reconcile.py` is pure-function: `run(data, drift_items, today=None)`
+returns `{generated_at, version, findings, counts}`. Caller (app.py's
+`/reconcile/run`) supplies `drift_items` from `review_queue` to avoid a
+circular import.
 
-**Detectors** (deterministic — no LLM; facts are the LLM output, detectors
-are plain joins):
+**Finding schema** — `{id, detector, kind, severity, booking_uid,
+cleaner, date, why, evidence: [msg_ids], quote?}`. Severity tiers:
+`needs-attention`, `suggest`, `informational`. Stable ids (e.g.
+`contested_cleaner:<uid>:<cleaner>`) mean re-runs dedup cleanly.
 
-1. **Airbnb ⇄ bookings** — `VEVENT Reserved` present in one but not the
-   other. Already partially covered by iCal sync's sweep; lift the logic
-   into a reusable detector and emit one finding per UID.
-2. **Bookings ⇄ GCal** — every active booking with a cleaner should
-   project into GCal. Missing projection or stale title is a finding.
-   `gcal.py::sync_to_gcal` already converges; the detector should flag
-   when the last sync reported errors or was skipped.
-3. **Commitment drift** — `needs_notify(b)` per booking. Already shipped
-   in the notify queue; the reconciler exposes the same signal as a
-   finding so it shows up in the one unified list.
-4. **Facts ⇄ bookings** — for each (target_date, cleaner) in `confirm`
-   facts, find the booking. If confidence ≥ 0.85, known cleaner, known
-   booking, and no existing commitment → this is an auto-apply candidate
-   the live pipeline missed (or historical paste-ingest found). Surface
-   as a "suggest applying" finding. For `decline` facts that match a
-   booking's current cleaner → "cleaner said no but is still assigned".
-5. **Fact ⇄ fact** — a `confirm` followed by a later `decline` on the
-   same (cleaner, date) means the cleaner changed their mind. The
-   latest fact wins; surface if the booking still reflects the earlier
-   state.
-6. **Schedule ⇄ facts** — host `schedule_assertion` with a cleaner
-   named, but the booking's `cleaner` is unset or different → "host
-   said X, booking says Y".
+Cached to `/data/reconciler_last.json` after every `/reconcile/run`.
+Conflicts tab reads the cache — no recompute on page load.
 
-**Conflicts tab UI**:
+### Slice 2 — Conflicts tab + detector 6 (shipped, 1.15.0)
 
-- Third panel on `/` alongside Notify queue and Review.
-- Findings grouped by severity: `needs-attention` (cleaner said no,
-  missing projection, Airbnb drift), `suggest` (auto-apply candidate
-  from historical facts), `informational` (fact-fact timeline notes).
-- Each finding has a primary action ("Apply Itzel to 2026-05-19 11:00",
-  "Dismiss — I handled this in WhatsApp", "Re-sync GCal"). Actions
-  mutate `data.json` / GCal directly and mark the finding resolved in
-  the next `/reconcile/run`.
+- Third panel on `/` alongside Notify queue and Review. Renders the
+  cached findings grouped by severity with one-click actions:
+  `Assign <cleaner>` (for `unrecorded_confirmation` and
+  `schedule_unassigned`), `Edit booking`, `Dismiss`. Re-run button
+  recomputes the cache. Badge count = `needs-attention` findings.
+- **Dismiss mechanism**: `POST /reconcile/dismiss` writes `{finding_id,
+  reason}` into `data.dismissed_findings`. `reconcile.run()` filters
+  these out before sorting and reports the count. `POST
+  /reconcile/undismiss` is the inverse. Both endpoints accept JSON or
+  form-encoded and trigger a re-run of the cache.
+- Detector 6 (`_schedule_vs_bookings`): host `schedule_assertion` names
+  a cleaner for a date where the booking is unassigned (`suggest`,
+  `schedule_unassigned`) or assigned to someone else (`needs-attention`,
+  `schedule_mismatch`).
+
+### Detectors
+
+1. **Airbnb ⇄ bookings** *(pending)* — `VEVENT Reserved` present in
+   one but not the other. Partially covered by iCal sync's sweep;
+   lift the logic into a reusable detector and emit one finding per
+   UID. Needs external iCal fetch wired into `/reconcile/run`.
+2. **Bookings ⇄ GCal** *(pending)* — every active booking with a
+   cleaner should project into GCal. Missing projection or stale title
+   is a finding. Needs GCal iCal fetch.
+3. **Commitment drift** *(`_drift`)* — `needs_notify(b)` per booking.
+   Reshapes `review_queue` output into findings so the notify queue
+   and Conflicts tab agree.
+4. **Facts ⇄ bookings** *(`_facts_vs_bookings`)* — emits
+   `confirm_no_booking`, `unrecorded_confirmation`,
+   `contested_cleaner`, `decline_still_assigned`. Only considers future
+   dates and `confidence >= CONFIRM_THRESHOLD` (0.85) for confirms.
+5. **Fact ⇄ fact** *(`_fact_timeline`)* — a `confirm` followed by a
+   later `decline` on the same (cleaner, date) emits `changed_mind`
+   (informational). Latest-wins; detector 4 separately handles the
+   action-worthy case via `decline_still_assigned`.
+6. **Schedule ⇄ facts** *(`_schedule_vs_bookings`)* — host
+   `schedule_assertion` with a cleaner named, but the booking's
+   `cleaner` is unset (`schedule_unassigned`, suggest) or different
+   (`schedule_mismatch`, needs-attention).
 
 ## Step 3 — Daily digest (deferred; discuss before building)
 
 Concept from the original Full-LLM-Control sketch: once the facts layer
 and detectors are solid, wire a cron to post a "here's what changed
 since yesterday" digest somewhere (HA notification? email? WhatsApp
-back-channel to the host only?). Out of scope until Step 2 is trusted.
+back-channel to the host only?). Out of scope until detectors 1/2 land
+and the findings list is trusted in production.
 
 ## Open questions
 
-- **First-pass ingestion of the full historical WhatsApp archive.** User
-  has a backlog beyond the 33 messages already tested. Paste-ingest via
-  `/admin/ingest` handles any size; pace at 0.8s/call means ~45 min per
-  3000 messages. Acceptable. Reprocess cost is similar.
+- **Historical archive ingestion — done.** 1022 messages across Itzel,
+  Daria, and two other groups are ingested (1134 facts extracted). The
+  `_facts_history` window (30 messages, same-group, timestamp-sorted)
+  was added after an unbounded history stalled a 952-message ingest at
+  284/5h under TPM pressure. Current observed rate: ~3s/call with
+  history window; ~0.8s nominal without facts.
 - **Facts dedup.** Nothing currently dedupes across messages — if
-  Michelle asserts "Itzel, May 19" twice, that's two facts. The
-  reconciler is expected to group facts by `(cleaner, target_date)`
-  and pick the latest. If this turns out to be painful, consider a
-  `fact_groups` materialized view.
+  Michelle asserts "Itzel, May 19" twice, that's two facts. Detectors
+  4 and 6 group by `(uid, cleaner)` / `(cleaner, target_date)` at
+  emit-time via stable ids, so the same underlying issue doesn't double
+  up in the findings list. A `fact_groups` view is still deferred
+  until this actually hurts.
 - **Cleaner name vs JID canonicalisation.** `facts.cleaner` stores a
   canonical cleaner name, not a JID. That's right for cross-source
   joining (JIDs don't appear in iCal or GCal), but means a rename of a
@@ -195,22 +207,36 @@ back-channel to the host only?). Out of scope until Step 2 is trusted.
   booked this one 😂") that the v2 prompt still over-extracts. Possible
   fix: pass a `hosts: ["Michelle Groves"]` allow-list, let the prompt
   treat other host-bucket senders as "background chat". Not critical.
+- **Confirm_no_booking noise.** Paste-ingested historical facts often
+  reference dates where the booking has since rolled off the Airbnb
+  feed. These become `informational` `confirm_no_booking` findings
+  forever. Dismissible, but bulk-dismiss-by-kind would save clicks if
+  the count stays high.
 
-## Files touched by the facts layer
+## Files touched
 
 ```
 cleaning-tracker/
 ├── facts.py                    # Extractor + retry/backoff + prompt (facts-v2)
+├── reconcile.py                # Pure-function detectors → findings
 ├── app.py
 │   ├── process_message         # Live: parse + facts in parallel
+│   ├── _facts_history          # 30-message same-group window for facts
 │   ├── _ingest_facts_only      # Paste-ingest facts-only path
 │   ├── _ingest_worker          # Background queue for paste-ingest
-│   ├── _parse_whatsapp_transcript  # Handles [YYYY-MM-DD,...] and [H:MM AM/PM, M/D/YYYY]
+│   ├── _parse_whatsapp_transcript  # 3 formats: iOS, legacy, Android
+│   ├── _build_conflicts_context    # Reads reconciler_last.json for the tab
+│   ├── _rerun_reconcile_cached     # Helper called after dismiss/undismiss
 │   ├── /admin/facts            # GET dump
 │   ├── /admin/reprocess-facts  # POST re-extract stale records
 │   ├── /admin/ingest-transcript  # POST paste ingest
 │   ├── /admin/ingest-status    # GET progress
-│   └── /admin/ingest           # GET HTML paste form
+│   ├── /admin/ingest           # GET HTML paste form
+│   ├── /admin/remap-group      # POST bulk group JID + label rewrite
+│   ├── /reconcile/run          # POST recompute + persist cache
+│   ├── /reconcile/last         # GET cached JSON
+│   ├── /reconcile/dismiss      # POST add to dismissed_findings
+│   └── /reconcile/undismiss    # POST remove from dismissed_findings
 └── config.yaml                 # current version lives here
 ```
 
