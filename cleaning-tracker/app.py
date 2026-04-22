@@ -1862,6 +1862,40 @@ def admin_reprocess_facts():
     })
 
 
+@app.route("/admin/remap-group", methods=["POST"])
+def admin_remap_group():
+    """Bulk-rewrite `group` on messages and update `group_labels`.
+
+    Body: {"mapping": {"old_jid": "new_jid", ...},
+           "labels":  {"jid": "label", ...}}
+
+    Used to promote placeholder group IDs (e.g. `itzel-group`) to the real
+    WhatsApp JIDs once they're known. Safe against concurrent writes via
+    DATA_LOCK.
+    """
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or {}
+    mapping = payload.get("mapping") or {}
+    labels = payload.get("labels") or {}
+    if not isinstance(mapping, dict) or not isinstance(labels, dict):
+        return jsonify({"error": "mapping and labels must be objects"}), 400
+
+    changed = 0
+    with DATA_LOCK:
+        data = load_data()
+        for m in data.get("messages", []):
+            g = m.get("group")
+            if g in mapping:
+                m["group"] = mapping[g]
+                changed += 1
+        gl = data.setdefault("group_labels", {})
+        for jid, label in labels.items():
+            gl[jid] = label
+        save_data(data)
+
+    return jsonify({"messages_updated": changed, "labels_set": len(labels)})
+
+
 # ── Transcript ingest (historical backfill into facts layer) ────────────────
 #
 # /admin/ingest-transcript takes a pasted WhatsApp export and threads each
