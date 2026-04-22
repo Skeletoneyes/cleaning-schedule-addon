@@ -938,6 +938,28 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
     font-size: 0.85rem;
   }
   .pager-link.disabled { opacity: 0.35; pointer-events: none; }
+  .conflict-card {
+    background: #fff; border-radius: 10px; padding: 12px 14px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.06); margin-bottom: 10px;
+    border-left: 4px solid #ccc;
+  }
+  .conflict-card.conflict-needs-attention { border-left-color: #dc3545; }
+  .conflict-card.conflict-suggest { border-left-color: #fd7e14; }
+  .conflict-card.conflict-informational { border-left-color: #6c757d; }
+  .conflict-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .sev {
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.04em;
+    padding: 2px 7px; border-radius: 10px; text-transform: uppercase;
+  }
+  .sev-needs-attention { background: #f8d7da; color: #721c24; }
+  .sev-suggest { background: #ffe4c4; color: #7a4a00; }
+  .sev-informational { background: #e9ecef; color: #495057; }
+  .conflict-kind { font-family: ui-monospace, monospace; font-size: 0.78rem; color: #555; }
+  .conflict-date { margin-left: auto; font-size: 0.82rem; color: #666; }
+  .conflict-why { font-size: 0.93rem; margin-bottom: 4px; }
+  .conflict-quote { font-size: 0.82rem; color: #666; font-style: italic; margin-bottom: 8px; }
+  .conflict-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .conflict-actions .btn { font-size: 0.82rem; padding: 4px 10px; }
 </style>
 </head>
 <body>
@@ -973,6 +995,9 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
   </button>
   <button class="tab" onclick="showTab('review-tab', this)" id="review-tab-btn">
     WhatsApp{% if pending_count %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ pending_count }}</span>{% endif %}
+  </button>
+  <button class="tab" onclick="showTab('conflicts-tab', this)" id="conflicts-tab-btn">
+    Conflicts{% if conflicts_attn %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ conflicts_attn }}</span>{% endif %}
   </button>
 </div>
 
@@ -1035,6 +1060,54 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
 """ + _REVIEW_PANEL + """
 </div>
 
+<div id="conflicts-tab" class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+    <div style="font-size:0.85rem;color:#666;">
+      {% if conflicts_generated_at %}Last run: {{ conflicts_generated_at }}{% else %}Never run{% endif %}
+      {% if conflicts_total is not none %} · {{ conflicts_total }} open{% endif %}
+      {% if conflicts_dismissed %} · {{ conflicts_dismissed }} dismissed{% endif %}
+    </div>
+    <form action="{{ prefix }}/reconcile/run" method="POST">
+      <button type="submit" class="btn btn-sm btn-primary">Re-run</button>
+    </form>
+  </div>
+
+  {% if conflicts_findings %}
+    {% for f in conflicts_findings %}
+    <div class="conflict-card conflict-{{ f.severity }}">
+      <div class="conflict-head">
+        <span class="sev sev-{{ f.severity }}">{{ f.severity }}</span>
+        <span class="conflict-kind">{{ f.kind }}</span>
+        {% if f.date %}<span class="conflict-date">{{ f.date }}</span>{% endif %}
+      </div>
+      <div class="conflict-why">{{ f.why }}</div>
+      {% if f.quote %}<div class="conflict-quote">&ldquo;{{ f.quote }}&rdquo;</div>{% endif %}
+      <div class="conflict-actions">
+        {% if f.kind in ('unrecorded_confirmation', 'schedule_unassigned') and f.booking_uid and f.cleaner %}
+        <form action="{{ prefix }}/assign/{{ f.booking_uid }}" method="POST" style="display:inline;">
+          <input type="hidden" name="cleaner" value="{{ f.cleaner }}">
+          <button type="submit" class="btn btn-sm btn-success">Assign {{ f.cleaner }}</button>
+        </form>
+        {% endif %}
+        {% if f.booking_uid %}
+        <a href="{{ prefix }}/edit/{{ f.booking_uid }}" class="btn btn-sm btn-outline">Edit booking</a>
+        {% endif %}
+        <form action="{{ prefix }}/reconcile/dismiss" method="POST" style="display:inline;">
+          <input type="hidden" name="finding_id" value="{{ f.id }}">
+          <button type="submit" class="btn btn-sm btn-outline">Dismiss</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="focus-card empty-state">
+      <div class="check">✓</div>
+      <div style="font-weight:700;font-size:1.1rem;margin-bottom:6px;">No open conflicts</div>
+      <div style="font-size:0.9rem;color:#666;">Re-run to refresh.</div>
+    </div>
+  {% endif %}
+</div>
+
 <script>
 function showTab(id, btn) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -1045,8 +1118,11 @@ function showTab(id, btn) {
 }
 if (location.hash === '#review') {
   document.addEventListener('DOMContentLoaded', function() {
-    var btn = document.getElementById('review-tab-btn');
-    showTab('review-tab', btn);
+    showTab('review-tab', document.getElementById('review-tab-btn'));
+  });
+} else if (location.hash === '#conflicts') {
+  document.addEventListener('DOMContentLoaded', function() {
+    showTab('conflicts-tab', document.getElementById('conflicts-tab-btn'));
   });
 }
 </script>
@@ -1532,12 +1608,49 @@ def index():
     data = load_data()
     ctx = build_focus_context(data, request.args.get("i", 0))
     review = _build_review_context(data)
+    conflicts = _build_conflicts_context()
     return render_template_string(
         FOCUS_TEMPLATE,
         error=request.args.get("error"),
         **ctx,
         **review,
+        **conflicts,
     )
+
+
+def _build_conflicts_context():
+    """Read the cached reconciler_last.json. Does not recompute — the Re-run
+    button / POST /reconcile/run refreshes the cache."""
+    if not RECONCILER_LAST_FILE.exists():
+        return {
+            "conflicts_findings": [],
+            "conflicts_total": None,
+            "conflicts_attn": 0,
+            "conflicts_dismissed": 0,
+            "conflicts_generated_at": None,
+        }
+    try:
+        result = json.loads(RECONCILER_LAST_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {
+            "conflicts_findings": [], "conflicts_total": None,
+            "conflicts_attn": 0, "conflicts_dismissed": 0,
+            "conflicts_generated_at": None,
+        }
+    findings = result.get("findings", [])
+    counts = result.get("counts", {})
+    gen = result.get("generated_at", "")
+    try:
+        gen = datetime.fromisoformat(gen).strftime("%b %d, %I:%M %p")
+    except (ValueError, TypeError):
+        pass
+    return {
+        "conflicts_findings": findings,
+        "conflicts_total": counts.get("total", len(findings)),
+        "conflicts_attn": counts.get("needs-attention", 0),
+        "conflicts_dismissed": counts.get("dismissed", 0),
+        "conflicts_generated_at": gen,
+    }
 
 
 @app.route("/sync", methods=["POST"])
@@ -1879,6 +1992,8 @@ def reconcile_run():
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
     except OSError as e:
         print(f"[reconcile] failed to persist: {e}")
+    if request.form:
+        return redirect(ingress_prefix() + "/#conflicts")
     return jsonify(result)
 
 
@@ -1895,7 +2010,7 @@ def reconcile_dismiss():
     """Mark a finding id dismissed so future reconciler runs filter it out.
     Body: {"finding_id": "...", "reason": "optional note"}"""
     _require_local_or_secret()
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True) or request.form or {}
     finding_id = payload.get("finding_id")
     reason = payload.get("reason") or ""
     if not finding_id:
@@ -1907,14 +2022,31 @@ def reconcile_dismiss():
             "reason": reason,
         }
         save_data(data)
+    # Re-run immediately so the cached findings reflect the dismissal.
+    _rerun_reconcile_cached()
+    if request.form:
+        return redirect(ingress_prefix() + "/#conflicts")
     return jsonify({"dismissed": finding_id})
+
+
+def _rerun_reconcile_cached():
+    """Recompute and persist reconciler_last.json. Best-effort."""
+    try:
+        with DATA_LOCK:
+            data = load_data()
+        buckets, unassigned = review_queue(data)
+        drift_items = [it for bk in buckets for it in bk["items"]] + unassigned
+        result = reconcile_mod.run(data, drift_items)
+        RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
+    except Exception as e:
+        print(f"[reconcile] re-run failed: {e}")
 
 
 @app.route("/reconcile/undismiss", methods=["POST"])
 def reconcile_undismiss():
     """Remove a finding id from dismissed_findings so it surfaces again."""
     _require_local_or_secret()
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True) or request.form or {}
     finding_id = payload.get("finding_id")
     if not finding_id:
         return jsonify({"error": "missing finding_id"}), 400
@@ -1922,6 +2054,7 @@ def reconcile_undismiss():
         data = load_data()
         removed = (data.get("dismissed_findings") or {}).pop(finding_id, None)
         save_data(data)
+    _rerun_reconcile_cached()
     return jsonify({"undismissed": finding_id, "was_dismissed": bool(removed)})
 
 
