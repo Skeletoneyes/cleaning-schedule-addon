@@ -278,6 +278,21 @@ The cached result stores `findings_raw` (pre-dismiss) alongside
 re-filter used by `_rerun_reconcile_cached` after dismiss/undismiss
 — those paths never re-fetch iCal/GCal.
 
+**Known issues from first live run (2026-04-22, see `RECONCILER_PLAN.md`
+Next steps):**
+- Detector 2 over-fires `gcal_stale_event` on every projected event.
+  Root cause is in `gcal._events_equal`: `_desired_events` writes
+  `dateTime` without an offset, GCal returns it with `-07:00` after
+  round-trip, string compare always fails. Same bug makes
+  `sync_to_gcal` silently run `events.update()` on every event on
+  every save. Fix by normalising dateTime comparison before trusting
+  detector 2's signal.
+- Detector 6 (`_schedule_vs_bookings`) doesn't collapse stale host
+  assertions. A latest-wins pass over `(cleaner, target_date)` keyed
+  by message timestamp would drop the Mar/Apr backfilled-host-message
+  mismatches we're currently seeing.
+- Detector 1 looks healthy — zero findings on first run.
+
 **Routes** (all `_require_local_or_secret`-gated):
 - `POST /reconcile/run` — recompute + persist to `reconciler_last.json`.
   Accepts form posts (redirects to `/#conflicts`) or JSON (returns body).
@@ -434,8 +449,10 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 ## Open questions / deferred
 
 - **Reconciler step 3 (daily digest)** — cron-triggered "here's what
-  changed since yesterday" notification. Unblocked by 1.16.0; revisit
-  once the findings list has a week or two of real traffic behind it.
+  changed since yesterday" notification. Blocked on fixing the
+  `_events_equal` dateTime bug + detector 6 latest-wins collapse (see
+  `RECONCILER_PLAN.md` Next steps 1 + 3); digest is worse than
+  useless while detector 2 floods.
 - **Facts dedup.** Nothing currently collapses duplicate assertions
   across messages ("Itzel May 19" asserted twice = two facts). The
   reconciler groups by `(cleaner, target_date)` in `_fact_timeline`

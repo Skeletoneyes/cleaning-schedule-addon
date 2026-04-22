@@ -7,6 +7,28 @@
 > inline — fetch failures propagate as 500s rather than being papered
 > over. Dismiss / undismiss re-uses the cached `findings_raw` list so
 > those actions never re-fetch.
+>
+> **Known issues from first live run (2026-04-22):**
+> 1. **Detector 2 over-fires `gcal_stale_event` on every projected
+>    event** (59/59 in the live run). `_events_equal` in `gcal.py`
+>    compares `dateTime` by string, but `_desired_events` writes
+>    `"2026-04-24T15:00:00"` (no offset) while GCal returns
+>    `"2026-04-24T15:00:00-07:00"` after round-trip — so every timed
+>    event looks different. Same bug silently makes `sync_to_gcal`
+>    run `events.update()` on every tagged event on every save; it
+>    succeeds, so it's been invisible. Fix: normalise both sides
+>    (parse dateTime + timeZone semantically, or strip the offset
+>    before comparing) in `_events_equal`. Detector 2 shouldn't be
+>    trusted until this lands.
+> 2. **Detector 6 doesn't collapse host `schedule_assertion` history.**
+>    Live run surfaced 9 `schedule_mismatch` findings, all "host said
+>    Itzel, booking is Daria" from Mar/Apr host messages. If the host
+>    reassigned later, detector 6 still re-asserts the earlier name
+>    because it doesn't do latest-wins the way detector 5 does for
+>    cleaner facts. Consider a parallel collapse on
+>    `(cleaner, target_date)` keyed by host-message timestamp.
+> 3. **Detector 1 reported zero findings** on first run — Airbnb
+>    iCal aligned perfectly with local bookings. Looks healthy.
 
 ## Goal
 
@@ -186,6 +208,40 @@ Conflicts tab reads the cache — no recompute on page load.
    `schedule_assertion` with a cleaner named, but the booking's
    `cleaner` is unset (`schedule_unassigned`, suggest) or different
    (`schedule_mismatch`, needs-attention).
+
+## Next steps (pick up here)
+
+In rough priority order:
+
+1. **Fix `_events_equal` dateTime-offset mismatch** (`cleaning-tracker/gcal.py`).
+   This is the blocker for detector 2. A working comparison should
+   treat `"2026-04-24T15:00:00"` + `timeZone="America/Vancouver"`
+   as equal to `"2026-04-24T15:00:00-07:00"` + same timeZone. Easy
+   options: (a) parse both sides with `datetime.fromisoformat` and
+   compare the resulting aware datetimes, (b) strip a trailing
+   `±HH:MM` before string compare. Option (a) is more robust
+   against DST/off-by-one. Side benefit: `sync_to_gcal` stops doing
+   a pointless update-per-event on every save.
+2. **Re-run `/reconcile/run` after #1** and re-assess detector 2's
+   signal. A healthy state should show `gcal_stale_event` counts
+   near zero during normal operation — non-zero means sync genuinely
+   hasn't converged (e.g. credentials rotated, network blip).
+3. **Tighten detector 6 with a latest-host-assertion collapse.**
+   Group `schedule_assertion` facts by `(cleaner, target_date)`,
+   keep only the latest by source-message timestamp, then compare
+   against the booking. Mirrors what `_fact_timeline` does for
+   cleaner confirm/decline. Expected drop in `schedule_mismatch`
+   noise; expected surface of the *latest* mismatch only.
+4. **Bulk-dismiss-by-kind.** `confirm_no_booking` and historical
+   `schedule_mismatch` findings both trend toward "dismiss the
+   whole batch and move on." A `POST /reconcile/dismiss-kind`
+   endpoint + UI button would pay for itself in one use.
+5. **Playwright coverage for the Conflicts tab.** Specifically the
+   new finding kinds (`ical_*`, `gcal_*`) rendering, and the
+   already-shipped Assign / Edit / Dismiss buttons against fixture
+   data.
+6. **Step 3 daily digest** — only after #1 and #3. The digest is
+   worse than useless if detector 2 still floods it.
 
 ## Step 3 — Daily digest (deferred; discuss before building)
 
