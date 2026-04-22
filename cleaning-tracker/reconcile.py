@@ -35,6 +35,8 @@ def run(data, drift_items, today=None):
     facts_records = data.get("message_facts", {})
     messages_by_id = {m["id"]: m for m in data.get("messages", []) if m.get("id")}
 
+    dismissed = data.get("dismissed_findings", {}) or {}
+
     findings = []
     findings.extend(_drift(drift_items))
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
@@ -46,13 +48,17 @@ def run(data, drift_items, today=None):
     for f in findings:
         seen.setdefault(f["id"], f)
     findings = list(seen.values())
+
+    dismissed_count = sum(1 for f in findings if f["id"] in dismissed)
+    findings = [f for f in findings if f["id"] not in dismissed]
+
     findings.sort(key=lambda f: (
         _SEVERITY_RANK.get(f["severity"], 99),
         f.get("date") or "",
         f["id"],
     ))
 
-    counts = {"total": len(findings)}
+    counts = {"total": len(findings), "dismissed": dismissed_count}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
     for f in findings:

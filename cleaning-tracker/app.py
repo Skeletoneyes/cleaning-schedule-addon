@@ -1890,6 +1890,41 @@ def reconcile_last():
     return Response(RECONCILER_LAST_FILE.read_text(), mimetype="application/json")
 
 
+@app.route("/reconcile/dismiss", methods=["POST"])
+def reconcile_dismiss():
+    """Mark a finding id dismissed so future reconciler runs filter it out.
+    Body: {"finding_id": "...", "reason": "optional note"}"""
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or {}
+    finding_id = payload.get("finding_id")
+    reason = payload.get("reason") or ""
+    if not finding_id:
+        return jsonify({"error": "missing finding_id"}), 400
+    with DATA_LOCK:
+        data = load_data()
+        data.setdefault("dismissed_findings", {})[finding_id] = {
+            "dismissed_at": datetime.now().isoformat(timespec="seconds"),
+            "reason": reason,
+        }
+        save_data(data)
+    return jsonify({"dismissed": finding_id})
+
+
+@app.route("/reconcile/undismiss", methods=["POST"])
+def reconcile_undismiss():
+    """Remove a finding id from dismissed_findings so it surfaces again."""
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or {}
+    finding_id = payload.get("finding_id")
+    if not finding_id:
+        return jsonify({"error": "missing finding_id"}), 400
+    with DATA_LOCK:
+        data = load_data()
+        removed = (data.get("dismissed_findings") or {}).pop(finding_id, None)
+        save_data(data)
+    return jsonify({"undismissed": finding_id, "was_dismissed": bool(removed)})
+
+
 @app.route("/admin/remap-group", methods=["POST"])
 def admin_remap_group():
     """Bulk-rewrite `group` on messages and update `group_labels`.
