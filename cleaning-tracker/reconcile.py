@@ -28,7 +28,7 @@ CONFIRM_THRESHOLD = 0.85
 _SEVERITY_RANK = {"needs-attention": 0, "suggest": 1, "informational": 2}
 
 
-def run(data, drift_items, today=None):
+def run(data, drift_items, ical_events=None, gcal_events=None, today=None):
     today = today or date.today()
     today_str = today.isoformat()
     bookings = data.get("bookings", {})
@@ -42,6 +42,10 @@ def run(data, drift_items, today=None):
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
     findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str))
+    if ical_events is not None:
+        findings.extend(_ical_vs_bookings(bookings, ical_events, today_str))
+    if gcal_events is not None:
+        findings.extend(_bookings_vs_gcal(data, gcal_events, today_str))
 
     # Stable dedup on id — a later detector shouldn't re-emit what an earlier
     # one already claimed.
@@ -50,25 +54,37 @@ def run(data, drift_items, today=None):
         seen.setdefault(f["id"], f)
     findings = list(seen.values())
 
-    dismissed_count = sum(1 for f in findings if f["id"] in dismissed)
-    findings = [f for f in findings if f["id"] not in dismissed]
+    return filter_and_sort({
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "version": RECONCILER_VERSION,
+        "findings_raw": findings,
+    }, dismissed)
 
-    findings.sort(key=lambda f: (
+
+def filter_and_sort(result, dismissed):
+    """Re-apply dismissed filter + sort + count over a cached raw result.
+
+    Used both by the fresh run() path and by the dismiss/undismiss path so a
+    dismiss doesn't require re-fetching iCal / GCal. The raw pre-filter list
+    lives in `findings_raw`; `findings` + `counts` are derived each call.
+    """
+    raw = list(result.get("findings_raw") or result.get("findings") or [])
+    dismissed_count = sum(1 for f in raw if f["id"] in dismissed)
+    kept = [f for f in raw if f["id"] not in dismissed]
+    kept.sort(key=lambda f: (
         _SEVERITY_RANK.get(f["severity"], 99),
         f.get("date") or "",
         f["id"],
     ))
-
-    counts = {"total": len(findings), "dismissed": dismissed_count}
-    for f in findings:
+    counts = {"total": len(kept), "dismissed": dismissed_count}
+    for f in kept:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
-    for f in findings:
         counts[f["kind"]] = counts.get(f["kind"], 0) + 1
-
     return {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "version": RECONCILER_VERSION,
-        "findings": findings,
+        "generated_at": result.get("generated_at") or datetime.now().isoformat(timespec="seconds"),
+        "version": result.get("version") or RECONCILER_VERSION,
+        "findings": kept,
+        "findings_raw": raw,
         "counts": counts,
     }
 
@@ -296,4 +312,168 @@ def _schedule_vs_bookings(bookings, facts_records, today_str):
                         "evidence": [msg_id],
                         "quote": quote,
                     })
+    return out
+
+
+# ── Detector 1: Airbnb iCal ⇄ bookings ──────────────────────────────────────
+# Caller parses the feed and passes a list of {uid, start, end} dicts. Three
+# shapes of drift: an iCal UID the local data has never seen, an active local
+# airbnb booking that's gone from the feed, and matching UIDs whose dates
+# disagree. All filtered to checkouts >= today — historical drift is not
+# action-worthy.
+
+def _ical_vs_bookings(bookings, ical_events, today_str):
+    out = []
+    ical_by_uid = {e["uid"]: e for e in ical_events if e.get("uid")}
+
+    for uid, ev in ical_by_uid.items():
+        end = ev.get("end") or ""
+        if end < today_str:
+            continue
+        b = bookings.get(uid)
+        if b is None:
+            out.append({
+                "id": f"ical_missing_booking:{uid}",
+                "detector": "ical_vs_bookings",
+                "kind": "ical_missing_booking",
+                "severity": "needs-attention",
+                "booking_uid": uid,
+                "cleaner": None,
+                "date": end,
+                "why": f"Airbnb iCal has reservation {uid} ({ev.get('start')}→{end}) but local bookings do not — sync may be stale",
+                "evidence": [],
+            })
+            continue
+        if b.get("status") == "cancelled":
+            out.append({
+                "id": f"ical_resurrected:{uid}",
+                "detector": "ical_vs_bookings",
+                "kind": "ical_resurrected",
+                "severity": "needs-attention",
+                "booking_uid": uid,
+                "cleaner": b.get("cleaner"),
+                "date": end,
+                "why": f"booking is cancelled locally but still present in Airbnb iCal ({ev.get('start')}→{end})",
+                "evidence": [],
+            })
+            continue
+        if b.get("start") != ev.get("start") or b.get("end") != end:
+            out.append({
+                "id": f"ical_date_mismatch:{uid}",
+                "detector": "ical_vs_bookings",
+                "kind": "ical_date_mismatch",
+                "severity": "needs-attention",
+                "booking_uid": uid,
+                "cleaner": b.get("cleaner"),
+                "date": end,
+                "why": (
+                    f"dates differ — local {b.get('start')}→{b.get('end')}, "
+                    f"iCal {ev.get('start')}→{end}"
+                ),
+                "evidence": [],
+            })
+
+    for uid, b in bookings.items():
+        if b.get("type", "airbnb") != "airbnb":
+            continue
+        if b.get("status") != "active":
+            continue
+        end = b.get("end") or ""
+        if end < today_str:
+            continue
+        if uid in ical_by_uid:
+            continue
+        out.append({
+            "id": f"booking_not_in_ical:{uid}",
+            "detector": "ical_vs_bookings",
+            "kind": "booking_not_in_ical",
+            "severity": "needs-attention",
+            "booking_uid": uid,
+            "cleaner": b.get("cleaner"),
+            "date": end,
+            "why": f"active airbnb booking {b.get('start')}→{end} not present in current Airbnb iCal — cancelled upstream?",
+            "evidence": [],
+        })
+    return out
+
+
+# ── Detector 2: bookings ⇄ GCal ─────────────────────────────────────────────
+# Caller fetches tagged GCal events via gcal._list_existing and passes them as
+# {uid: event_dict} (uid = the private.uid tag, e.g. "clean:<booking_uid>").
+# We rebuild the desired projection with gcal._desired_events and diff. This
+# mirrors what sync_to_gcal converges to on every save — these findings mean
+# either sync hasn't run successfully since the last change, or GCal is out of
+# reach.
+
+def _bookings_vs_gcal(data, gcal_events, today_str):
+    try:
+        from gcal import _desired_events, _events_equal
+    except ImportError:
+        return []
+
+    desired = _desired_events(data)
+    existing = gcal_events or {}
+    out = []
+
+    def _event_date(uid, body):
+        start = body.get("start") or {}
+        return start.get("date") or (start.get("dateTime") or "")[:10] or ""
+
+    for uid, body in desired.items():
+        d = _event_date(uid, body)
+        if d and d < today_str:
+            continue
+        booking_uid = ((body.get("extendedProperties") or {}).get("private") or {}).get("booking_uid")
+        kind = ((body.get("extendedProperties") or {}).get("private") or {}).get("kind")
+        ex = existing.get(uid)
+        if ex is None:
+            out.append({
+                "id": f"gcal_missing_event:{uid}",
+                "detector": "bookings_vs_gcal",
+                "kind": "gcal_missing_event",
+                "severity": "needs-attention",
+                "booking_uid": booking_uid,
+                "cleaner": (data.get("bookings", {}).get(booking_uid, {}) or {}).get("cleaner"),
+                "date": d or None,
+                "why": f"{kind} event for {booking_uid} missing from Google Calendar — sync has not run",
+                "evidence": [],
+            })
+            continue
+        if not _events_equal(ex, body):
+            out.append({
+                "id": f"gcal_stale_event:{uid}",
+                "detector": "bookings_vs_gcal",
+                "kind": "gcal_stale_event",
+                "severity": "suggest",
+                "booking_uid": booking_uid,
+                "cleaner": (data.get("bookings", {}).get(booking_uid, {}) or {}).get("cleaner"),
+                "date": d or None,
+                "why": f"Google Calendar {kind} for {booking_uid} is out of date — sync has not converged",
+                "evidence": [],
+            })
+
+    for uid, ev in existing.items():
+        if uid in desired:
+            continue
+        priv = (ev.get("extendedProperties") or {}).get("private") or {}
+        booking_uid = priv.get("booking_uid")
+        d = (ev.get("start") or {}).get("date") or ((ev.get("start") or {}).get("dateTime") or "")[:10] or ""
+        if d and d < today_str:
+            continue
+        bookings = data.get("bookings", {})
+        b = bookings.get(booking_uid) if booking_uid else None
+        if b is not None and b.get("status") != "cancelled":
+            # Sync would patch, not delete — skip.
+            continue
+        out.append({
+            "id": f"gcal_orphan:{uid}",
+            "detector": "bookings_vs_gcal",
+            "kind": "gcal_orphan",
+            "severity": "suggest",
+            "booking_uid": booking_uid,
+            "cleaner": None,
+            "date": d or None,
+            "why": f"Google Calendar has tagged event {uid} with no matching active local booking — sync has not cleaned up",
+            "evidence": [],
+        })
     return out

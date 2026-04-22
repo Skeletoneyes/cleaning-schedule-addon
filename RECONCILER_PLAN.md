@@ -1,10 +1,12 @@
 # Reconciler — LLM-driven conflict detection across sources
 
-> **Status (2026-04-22, add-on 1.15.0):** Step 1 (versioned facts
-> extraction) and Step 2 slices 1 + 2 are shipped. Detectors 3/4/5/6
-> run in `reconcile.py`; Conflicts tab with dismiss mechanism is live.
-> Detectors 1 (Airbnb iCal ⇄ bookings) and 2 (bookings ⇄ GCal) remain —
-> both require external iCal fetches.
+> **Status (2026-04-22, add-on 1.16.0):** Step 1 (versioned facts
+> extraction) and Step 2 are fully shipped. All six detectors run in
+> `reconcile.py`; Conflicts tab with dismiss mechanism is live.
+> `/reconcile/run` now fetches the Airbnb iCal and tagged GCal events
+> inline — fetch failures propagate as 500s rather than being papered
+> over. Dismiss / undismiss re-uses the cached `findings_raw` list so
+> those actions never re-fetch.
 
 ## Goal
 
@@ -153,13 +155,22 @@ Conflicts tab reads the cache — no recompute on page load.
 
 ### Detectors
 
-1. **Airbnb ⇄ bookings** *(pending)* — `VEVENT Reserved` present in
-   one but not the other. Partially covered by iCal sync's sweep;
-   lift the logic into a reusable detector and emit one finding per
-   UID. Needs external iCal fetch wired into `/reconcile/run`.
-2. **Bookings ⇄ GCal** *(pending)* — every active booking with a
-   cleaner should project into GCal. Missing projection or stale title
-   is a finding. Needs GCal iCal fetch.
+1. **Airbnb ⇄ bookings** *(`_ical_vs_bookings`, shipped 1.16.0)* —
+   `/reconcile/run` fetches the iCal feed and passes parsed
+   `{uid, start, end}` rows. Emits `ical_missing_booking` (iCal UID
+   local hasn't seen — sync stale), `ical_resurrected` (local cancelled
+   but feed still has it), `ical_date_mismatch` (same UID, dates differ),
+   `booking_not_in_ical` (active airbnb booking dropped upstream).
+   Filtered to `end >= today`.
+2. **Bookings ⇄ GCal** *(`_bookings_vs_gcal`, shipped 1.16.0)* —
+   `/reconcile/run` calls `gcal.fetch_tagged_events` to pull every
+   event tagged `source=cleaning-tracker` keyed by its private `uid`
+   tag. Detector rebuilds the desired projection via
+   `gcal._desired_events` (on a `_needs_notify`-annotated snapshot, to
+   match what sync would produce) and diffs. Emits
+   `gcal_missing_event` (needs-attention), `gcal_stale_event` (suggest
+   — content diverges), `gcal_orphan` (suggest — tagged event points
+   at a booking that's gone or cancelled).
 3. **Commitment drift** *(`_drift`)* — `needs_notify(b)` per booking.
    Reshapes `review_queue` output into findings so the notify queue
    and Conflicts tab agree.
@@ -181,8 +192,9 @@ Conflicts tab reads the cache — no recompute on page load.
 Concept from the original Full-LLM-Control sketch: once the facts layer
 and detectors are solid, wire a cron to post a "here's what changed
 since yesterday" digest somewhere (HA notification? email? WhatsApp
-back-channel to the host only?). Out of scope until detectors 1/2 land
-and the findings list is trusted in production.
+back-channel to the host only?). Unblocked now that detectors 1/2 are
+live — revisit after a week or two of real traffic to see whether the
+findings list is trustworthy enough to push.
 
 ## Open questions
 

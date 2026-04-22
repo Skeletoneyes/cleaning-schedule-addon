@@ -1977,17 +1977,60 @@ def admin_reprocess_facts():
     })
 
 
+def _fetch_ical_events():
+    """Fetch + parse the Airbnb iCal into [{uid, start, end}] for detector 1.
+
+    Raises on HTTP / parse failure — the /reconcile/run endpoint is meant to
+    surface fetch problems, not hide them. Returns [] when no URL configured.
+    """
+    if not ICAL_URL:
+        raise RuntimeError("No iCal URL configured. Set it in the add-on options.")
+    resp = requests.get(ICAL_URL, timeout=15)
+    resp.raise_for_status()
+    cal = __import__("icalendar").Calendar.from_ical(resp.text)
+    out = []
+    for event in cal.walk("VEVENT"):
+        if str(event.get("SUMMARY", "")) != "Reserved":
+            continue
+        uid = str(event.get("UID", ""))
+        dtstart = event.get("DTSTART").dt
+        dtend = event.get("DTEND").dt
+        start_str = dtstart.strftime("%Y-%m-%d") if hasattr(dtstart, "strftime") else str(dtstart)
+        end_str = dtend.strftime("%Y-%m-%d") if hasattr(dtend, "strftime") else str(dtend)
+        out.append({"uid": uid, "start": start_str, "end": end_str})
+    return out
+
+
 @app.route("/reconcile/run", methods=["POST"])
 def reconcile_run():
     """Run deterministic detectors over current data.json + message_facts.
-    Persists the result to reconciler_last.json so the tab (when wired) can
-    render without recomputing. Returns the full result body."""
+    Also fetches Airbnb iCal and GCal tagged events for detectors 1 and 2;
+    fetch failures propagate as 500s on purpose."""
     _require_local_or_secret()
     with DATA_LOCK:
         data = load_data()
     buckets, unassigned = review_queue(data)
     drift_items = [it for bk in buckets for it in bk["items"]] + unassigned
-    result = reconcile_mod.run(data, drift_items)
+
+    ical_events = _fetch_ical_events()
+    gcal_events = None
+    data_for_detectors = data
+    if GCAL_ENABLED:
+        gcal_events = gcal_mod.fetch_tagged_events(
+            GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID,
+        )
+        # gcal._desired_events reads b["_needs_notify"] for the drift
+        # colour/prefix. Annotate a snapshot so detector 2's diff matches what
+        # sync_to_gcal would produce.
+        data_for_detectors = json.loads(json.dumps(data, default=str))
+        for b in data_for_detectors.get("bookings", {}).values():
+            b["_needs_notify"] = needs_notify(b)
+
+    result = reconcile_mod.run(
+        data_for_detectors, drift_items,
+        ical_events=ical_events,
+        gcal_events=gcal_events,
+    )
     try:
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
     except OSError as e:
@@ -2030,13 +2073,20 @@ def reconcile_dismiss():
 
 
 def _rerun_reconcile_cached():
-    """Recompute and persist reconciler_last.json. Best-effort."""
+    """Re-filter the cached findings against current dismissed_findings.
+
+    Called after dismiss / undismiss. Does NOT re-run detectors or re-fetch
+    iCal / GCal — those only happen on an explicit /reconcile/run. If the
+    cache is missing, no-op.
+    """
     try:
+        if not RECONCILER_LAST_FILE.exists():
+            return
         with DATA_LOCK:
             data = load_data()
-        buckets, unassigned = review_queue(data)
-        drift_items = [it for bk in buckets for it in bk["items"]] + unassigned
-        result = reconcile_mod.run(data, drift_items)
+        cached = json.loads(RECONCILER_LAST_FILE.read_text())
+        dismissed = data.get("dismissed_findings", {}) or {}
+        result = reconcile_mod.filter_and_sort(cached, dismissed)
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
     except Exception as e:
         print(f"[reconcile] re-run failed: {e}")

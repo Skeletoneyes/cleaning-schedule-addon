@@ -237,6 +237,21 @@ def _events_equal(existing, desired):
     return True
 
 
+def fetch_tagged_events(service_account_json, calendar_id):
+    """Return {uid: event_dict} for every event we've tagged source=cleaning-tracker.
+
+    Used by the reconciler — raises on error; no fallback. Callers that don't
+    want to cascade failures should guard the call site, not this helper.
+    """
+    if not _GCAL_AVAILABLE:
+        raise RuntimeError("google-api-python-client not installed")
+    if not (service_account_json and calendar_id):
+        raise RuntimeError("Google Calendar credentials not configured")
+    service = _build_service(service_account_json)
+    events, _dupes = _list_existing(service, calendar_id)
+    return events
+
+
 def sync_to_gcal(data, service_account_json, calendar_id):
     """Run a full diff-and-patch sync. Returns (stats, error).
 

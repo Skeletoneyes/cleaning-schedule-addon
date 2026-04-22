@@ -16,7 +16,7 @@ ingress. No database — data lives in `/data/data.json` (persists across
 rebuilds). Configuration is read from `/data/options.json` (populated by HA
 from `config.yaml` options).
 
-**Current direction (1.15.x):** the add-on is the **brain**, Google Calendar
+**Current direction (1.16.x):** the add-on is the **brain**, Google Calendar
 is the **shared view**. `data.json` is the source of truth; `gcal.py` pushes
 a one-way projection to a GCal calendar shared with Michelle and the
 cleaners. The add-on UI's job is to handle everything GCal can't — the
@@ -28,11 +28,10 @@ The FullCalendar view is gone. `/` now renders three tabs: Notify queue
 (reconciler findings).
 
 The reconciler cross-checks `data.json`, Airbnb iCal, GCal, and the
-WhatsApp archive. Step 1 (versioned facts extraction via `facts.py`) and
-step 2 slices 1 + 2 (detectors 3/4/5/6 in `reconcile.py` + Conflicts tab
-UI with dismiss mechanism) are shipped. Detectors 1 (Airbnb iCal ⇄
-bookings) and 2 (bookings ⇄ GCal) still pending — they need external
-iCal fetches. See `RECONCILER_PLAN.md`.
+WhatsApp archive. Step 1 (versioned facts extraction via `facts.py`)
+and all six Step 2 detectors are shipped. `/reconcile/run` fetches
+the Airbnb iCal and tagged GCal events inline (fail-loudly — no
+fallbacks) and passes them to the detectors. See `RECONCILER_PLAN.md`.
 
 ### Key Files
 
@@ -257,6 +256,13 @@ changed-mind timeline). Findings dedup on stable id so re-runs are
 idempotent.
 
 **Shipped detectors**:
+- `_ical_vs_bookings` — Airbnb iCal ⇄ bookings. `/reconcile/run`
+  fetches the feed inline. Emits `ical_missing_booking`,
+  `booking_not_in_ical`, `ical_date_mismatch`, `ical_resurrected`.
+- `_bookings_vs_gcal` — bookings ⇄ GCal. `/reconcile/run` calls
+  `gcal.fetch_tagged_events` on an annotated snapshot. Emits
+  `gcal_missing_event`, `gcal_stale_event`, `gcal_orphan`. Only
+  runs when `gcal_enabled`.
 - `_drift` — reshapes the notify-queue into findings (new / changed /
   cancelled / unassigned).
 - `_facts_vs_bookings` — confirm/decline facts ⇄ booking state; emits
@@ -267,9 +273,10 @@ idempotent.
 - `_schedule_vs_bookings` — host `schedule_assertion` ⇄ booking cleaner
   (emits `schedule_mismatch` / `schedule_unassigned`).
 
-**Pending**: detector 1 (Airbnb iCal ⇄ bookings) and detector 2
-(bookings ⇄ GCal) — both need external iCal fetches wired into
-`/reconcile/run`.
+The cached result stores `findings_raw` (pre-dismiss) alongside
+`findings` (post-filter). `reconcile.filter_and_sort()` is the pure
+re-filter used by `_rerun_reconcile_cached` after dismiss/undismiss
+— those paths never re-fetch iCal/GCal.
 
 **Routes** (all `_require_local_or_secret`-gated):
 - `POST /reconcile/run` — recompute + persist to `reconciler_last.json`.
@@ -426,14 +433,9 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 
 ## Open questions / deferred
 
-- **Reconciler detectors 1 + 2** — Airbnb iCal ⇄ bookings and bookings
-  ⇄ GCal. Both need external iCal fetches wired into `/reconcile/run`
-  (or into a separate pull step that enriches the input bundle). The
-  reconciler core, facts layer, UI, and detectors 3/4/5/6 all ship as
-  of 1.15.0.
 - **Reconciler step 3 (daily digest)** — cron-triggered "here's what
-  changed since yesterday" notification. Out of scope until detectors
-  1/2 land and the findings list is trusted.
+  changed since yesterday" notification. Unblocked by 1.16.0; revisit
+  once the findings list has a week or two of real traffic behind it.
 - **Facts dedup.** Nothing currently collapses duplicate assertions
   across messages ("Itzel May 19" asserted twice = two facts). The
   reconciler groups by `(cleaner, target_date)` in `_fact_timeline`
