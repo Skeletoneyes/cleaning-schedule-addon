@@ -16,10 +16,11 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template_string, request, redirect, jsonify, abort
+from flask import Flask, render_template_string, request, redirect, jsonify, abort, Response
 
 import facts as facts_mod
 import gcal as gcal_mod
+import reconcile as reconcile_mod
 
 app = Flask(__name__)
 
@@ -41,6 +42,7 @@ ICAL_URL = OPTIONS.get("ical_url", os.environ.get("ICAL_URL", ""))
 ANTHROPIC_API_KEY = OPTIONS.get("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
 CLEANERS = OPTIONS.get("cleaners", [])
 DATA_FILE = DATA_DIR / "data.json"
+RECONCILER_LAST_FILE = DATA_DIR / "reconciler_last.json"
 
 GCAL_ENABLED = bool(OPTIONS.get("gcal_enabled", False))
 GCAL_CALENDAR_ID = OPTIONS.get("gcal_calendar_id", "")
@@ -1860,6 +1862,32 @@ def admin_reprocess_facts():
         "errors": errors,
         "prompt_version": facts_mod.FACTS_PROMPT_VERSION,
     })
+
+
+@app.route("/reconcile/run", methods=["POST"])
+def reconcile_run():
+    """Run deterministic detectors over current data.json + message_facts.
+    Persists the result to reconciler_last.json so the tab (when wired) can
+    render without recomputing. Returns the full result body."""
+    _require_local_or_secret()
+    with DATA_LOCK:
+        data = load_data()
+    buckets, unassigned = review_queue(data)
+    drift_items = [it for bk in buckets for it in bk["items"]] + unassigned
+    result = reconcile_mod.run(data, drift_items)
+    try:
+        RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
+    except OSError as e:
+        print(f"[reconcile] failed to persist: {e}")
+    return jsonify(result)
+
+
+@app.route("/reconcile/last", methods=["GET"])
+def reconcile_last():
+    _require_local_or_secret()
+    if not RECONCILER_LAST_FILE.exists():
+        return jsonify({"error": "no run yet"}), 404
+    return Response(RECONCILER_LAST_FILE.read_text(), mimetype="application/json")
 
 
 @app.route("/admin/remap-group", methods=["POST"])
