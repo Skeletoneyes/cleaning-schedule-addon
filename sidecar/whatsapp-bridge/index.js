@@ -163,7 +163,6 @@ async function start() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
 
       const remoteJid = msg.key.remoteJid || "";
       if (!remoteJid.endsWith("@g.us")) continue;

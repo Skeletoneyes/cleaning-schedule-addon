@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Baileys-based sidecar that forwards WhatsApp group messages to the cleaning-tracker add-on.",
   "main": "index.js",
