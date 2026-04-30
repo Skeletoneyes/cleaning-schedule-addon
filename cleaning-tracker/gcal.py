@@ -142,14 +142,10 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
         if conflict:
             title = "⚠️ " + title
 
-        if clean_time:
-            ev_start = {"dateTime": f"{clean_date.isoformat()}T{clean_time}", "timeZone": LOCAL_TZ}
-            # Default cleaning duration: 3 hours
-            end_dt = datetime.strptime(f"{clean_date.isoformat()} {clean_time}", "%Y-%m-%d %H:%M:%S") + timedelta(hours=3)
-            ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
-        else:
-            ev_start = {"date": clean_date.isoformat()}
-            ev_end = {"date": (clean_date + timedelta(days=1)).isoformat()}
+        start_time = clean_time or "11:00:00"
+        ev_start = {"dateTime": f"{clean_date.isoformat()}T{start_time}", "timeZone": LOCAL_TZ}
+        end_dt = datetime.strptime(f"{clean_date.isoformat()} {start_time}", "%Y-%m-%d %H:%M:%S") + timedelta(hours=2)
+        ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
 
         if conflict or not cleaner:
             color_id = _COLOR_CONFLICT if conflict else _COLOR_UNASSIGNED
