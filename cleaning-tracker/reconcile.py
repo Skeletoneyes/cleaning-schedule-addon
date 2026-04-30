@@ -20,7 +20,7 @@ Findings schema:
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 RECONCILER_VERSION = "reconciler-v1"
 CONFIRM_THRESHOLD = 0.85
@@ -61,6 +61,8 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None):
     }, dismissed)
 
 
+STALE_DAYS = 5  # findings whose date is older than this are auto-suppressed
+
 def filter_and_sort(result, dismissed):
     """Re-apply dismissed filter + sort + count over a cached raw result.
 
@@ -69,14 +71,16 @@ def filter_and_sort(result, dismissed):
     lives in `findings_raw`; `findings` + `counts` are derived each call.
     """
     raw = list(result.get("findings_raw") or result.get("findings") or [])
+    cutoff = (date.today() - timedelta(days=STALE_DAYS)).isoformat()
     dismissed_count = sum(1 for f in raw if f["id"] in dismissed)
-    kept = [f for f in raw if f["id"] not in dismissed]
+    stale_count = sum(1 for f in raw if f["id"] not in dismissed and f.get("date") and f["date"] < cutoff)
+    kept = [f for f in raw if f["id"] not in dismissed and not (f.get("date") and f["date"] < cutoff)]
     kept.sort(key=lambda f: (
         _SEVERITY_RANK.get(f["severity"], 99),
         f.get("date") or "",
         f["id"],
     ))
-    counts = {"total": len(kept), "dismissed": dismissed_count}
+    counts = {"total": len(kept), "dismissed": dismissed_count, "stale": stale_count}
     for f in kept:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
         counts[f["kind"]] = counts.get(f["kind"], 0) + 1
