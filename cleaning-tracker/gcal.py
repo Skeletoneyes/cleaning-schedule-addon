@@ -83,7 +83,37 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
         status = b.get("status", "active")
         btype = b.get("type", "airbnb")
         if status == "cancelled":
-            continue  # delete from GCal
+            commitment = b.get("cleaner_commitment")
+            if not commitment:
+                continue  # already notified → delete from GCal
+            # Cleaner was committed but hasn't been told it's off — keep a red
+            # placeholder visible in GCal until Mark notified clears the commitment.
+            cleaner = commitment.get("cleaner") or b.get("cleaner") or "cleaner"
+            clean_uid = f"clean:{uid}"
+            try:
+                clean_date = date.fromisoformat(b["end"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            committed_time = commitment.get("clean_time") or "11:00:00"
+            ev_start = {"dateTime": f"{clean_date.isoformat()}T{committed_time}", "timeZone": LOCAL_TZ}
+            end_dt = datetime.strptime(f"{clean_date.isoformat()} {committed_time}", "%Y-%m-%d %H:%M:%S") + timedelta(hours=2)
+            ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
+            desired[clean_uid] = {
+                "summary": f"❌ Cleaning Cancelled · Notify {cleaner}",
+                "start": ev_start,
+                "end": ev_end,
+                "colorId": str(_COLOR_CONFLICT),
+                "extendedProperties": {
+                    "private": {
+                        "source": SOURCE_TAG,
+                        "uid": clean_uid,
+                        "booking_uid": uid,
+                        "kind": "cancelled_notify",
+                        "status": "cancelled",
+                    }
+                },
+            }
+            continue
 
         try:
             b_start = date.fromisoformat(b["start"])
