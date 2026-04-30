@@ -212,6 +212,23 @@ def _list_existing(service, calendar_id):
     return out, dupes
 
 
+def _parse_gcal_dt(s, tz_name):
+    """Parse a GCal dateTime string to an aware datetime.
+
+    GCal round-trips timed events with a UTC offset ("…T15:00:00-07:00") while
+    _desired_events writes them without one ("…T15:00:00"). Attaching the named
+    timezone to the naive form makes both sides comparable.
+    """
+    import zoneinfo
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None and tz_name:
+        try:
+            dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return dt
+
+
 def _events_equal(existing, desired):
     """Cheap comparison: if any meaningful field differs, patch."""
     if existing.get("summary") != desired.get("summary"):
@@ -224,8 +241,16 @@ def _events_equal(existing, desired):
     for key in ("start", "end"):
         e = existing.get(key, {})
         d = desired.get(key, {})
-        if e.get("date") != d.get("date") or e.get("dateTime") != d.get("dateTime"):
+        if e.get("date") != d.get("date"):
             return False
+        e_dt = e.get("dateTime")
+        d_dt = d.get("dateTime")
+        if bool(e_dt) != bool(d_dt):
+            return False
+        if e_dt and d_dt:
+            tz_name = d.get("timeZone") or e.get("timeZone")
+            if _parse_gcal_dt(e_dt, tz_name) != _parse_gcal_dt(d_dt, tz_name):
+                return False
         if e.get("timeZone") != d.get("timeZone"):
             return False
     # ExtendedProperties.private — check subset match on desired keys

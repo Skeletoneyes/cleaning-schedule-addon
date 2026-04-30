@@ -213,16 +213,8 @@ Conflicts tab reads the cache — no recompute on page load.
 
 In rough priority order:
 
-1. **Fix `_events_equal` dateTime-offset mismatch** (`cleaning-tracker/gcal.py`).
-   This is the blocker for detector 2. A working comparison should
-   treat `"2026-04-24T15:00:00"` + `timeZone="America/Vancouver"`
-   as equal to `"2026-04-24T15:00:00-07:00"` + same timeZone. Easy
-   options: (a) parse both sides with `datetime.fromisoformat` and
-   compare the resulting aware datetimes, (b) strip a trailing
-   `±HH:MM` before string compare. Option (a) is more robust
-   against DST/off-by-one. Side benefit: `sync_to_gcal` stops doing
-   a pointless update-per-event on every save.
-2. **Re-run `/reconcile/run` after #1** and re-assess detector 2's
+1. ~~**Fix `_events_equal` dateTime-offset mismatch**~~ **Done (1.16.1).** `_parse_gcal_dt` attaches the named timezone to the naive desired-side dateTime before comparing; GCal's offset-bearing round-trip form is then equal. Side effect: `sync_to_gcal` no longer re-patches every timed event on every save.
+2. **Re-run `/reconcile/run` after deploying 1.16.1** and re-assess detector 2's
    signal. A healthy state should show `gcal_stale_event` counts
    near zero during normal operation — non-zero means sync genuinely
    hasn't converged (e.g. credentials rotated, network blip).
