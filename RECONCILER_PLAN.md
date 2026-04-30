@@ -307,5 +307,7 @@ cleaning-tracker/
 - **After a bulk paste**: check `GET /admin/ingest-status` for progress
   and `last_error`. Then `GET /admin/facts` (or `GET /internal/snapshot`
   for the full data bundle) to inspect.
-- **Shared secret lives in** `sidecar/whatsapp-bridge/.env` as
-  `SHARED_SECRET`, mirrored to the add-on option `whatsapp_shared_secret`.
+- **WhatsApp Bridge** is now the `whatsapp-bridge/` HA add-on (not the old
+  PC sidecar). It uses loopback — no shared secret needed. The
+  `whatsapp_shared_secret` add-on option is only needed for non-loopback
+  callers (e.g. off-host scripts).

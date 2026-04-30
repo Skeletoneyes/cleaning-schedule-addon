@@ -1,4 +1,16 @@
-# WhatsApp bridge (test / prod sidecar)
+# WhatsApp bridge (DEPRECATED — PC sidecar)
+
+> **This sidecar is superseded by the `whatsapp-bridge/` HA add-on (shipped
+> 2026-04-30).** The add-on runs on the HA host itself using `host_network:
+> true` (loopback, no secret needed, auth persists in `/data/auth/`). The
+> PC no longer needs to stay awake for message forwarding. The code here is
+> kept for reference only — do not run it alongside the HA add-on.
+>
+> To re-pair on a new bot number: stop the `whatsapp-bridge` add-on, delete
+> `/data/auth/` via the HA SSH add-on, restart and scan the QR from the
+> new phone.
+
+---
 
 Node sidecar that pairs as a WhatsApp **linked device** and forwards inbound
 group messages to the cleaning-tracker add-on's

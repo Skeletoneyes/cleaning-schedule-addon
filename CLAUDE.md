@@ -5,9 +5,8 @@
 Home Assistant add-on that tracks Airbnb cleaning schedules. It syncs bookings
 from an Airbnb iCal feed, lets you assign cleaners to checkout dates, and uses
 Claude Haiku to interpret WhatsApp conversations with cleaners (live traffic
-via a Baileys linked-device sidecar on the user's PC, plus a `/backfill`
-paste page for catching up on historical assignments) to detect confirmations
-and declines.
+via a dedicated WhatsApp Bridge HA add-on, plus a `/backfill` paste page for
+catching up on historical assignments) to detect confirmations and declines.
 
 ## Architecture
 
@@ -45,11 +44,13 @@ cleaning-tracker/
 ├── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
 ├── facts.py                 # Versioned structured-fact extractor (Haiku, FACTS_PROMPT_VERSION)
 └── reconcile.py             # Pure-function reconciler: detectors → ranked findings
-sidecar/whatsapp-bridge/     # Baileys sidecar — EXTERNAL Node process, not in the add-on container
-├── index.js                 # Pairs as a WhatsApp linked device; POSTs group messages to the add-on
+whatsapp-bridge/             # WhatsApp Bridge HA add-on (replaces old PC sidecar)
+├── config.yaml              # Add-on config: slug=whatsapp-bridge, host_network: true
+├── Dockerfile               # node:20-slim + git; uses npm ci + committed package-lock.json
+├── index.js                 # Baileys linked device; forwards all group messages (incl. fromMe) to cleaning-tracker
 ├── package.json
-├── .env.example             # Config template (HA_URL, SHARED_SECRET, GROUP_ALLOWLIST, BACKFILL_*)
-└── README.md                # Setup, test→prod swap, operational notes
+└── package-lock.json        # git+ssh URLs rewritten to git+https so Docker build works without SSH keys
+sidecar/whatsapp-bridge/     # DEPRECATED — superseded by whatsapp-bridge/ HA add-on. Kept for reference.
 scripts/
 ├── reconcile_pull.py        # Off-host puller for the reconcile-cleaning-schedule skill
 └── gcal_auth.py             # Validates a GCal service-account key + prints setup steps
@@ -82,10 +83,11 @@ resulting in an empty base image.
   calendar's "Share with specific people" list with "Make changes to events"
   permission. Use `scripts/gcal_auth.py` to validate a downloaded key and
   print the exact sharing email.
-- `whatsapp_shared_secret` — shared token authenticating the Baileys sidecar's
-  `POST /internal/whatsapp/inbound` calls. Required for any non-loopback
-  caller; loopback (same-host) calls bypass auth. Must match
-  `SHARED_SECRET` in `sidecar/whatsapp-bridge/.env`.
+- `whatsapp_shared_secret` — shared token authenticating
+  `POST /internal/whatsapp/inbound` calls from non-loopback callers. The
+  WhatsApp Bridge add-on uses `host_network: true` so it calls via
+  `127.0.0.1` (loopback) and does not need this secret. Only required if
+  an external caller (e.g. a future off-host bridge) is used.
 
 ## Data model (`/data/data.json`)
 
@@ -278,20 +280,16 @@ The cached result stores `findings_raw` (pre-dismiss) alongside
 re-filter used by `_rerun_reconcile_cached` after dismiss/undismiss
 — those paths never re-fetch iCal/GCal.
 
-**Known issues from first live run (2026-04-22, see `RECONCILER_PLAN.md`
-Next steps):**
-- Detector 2 over-fires `gcal_stale_event` on every projected event.
-  Root cause is in `gcal._events_equal`: `_desired_events` writes
-  `dateTime` without an offset, GCal returns it with `-07:00` after
-  round-trip, string compare always fails. Same bug makes
-  `sync_to_gcal` silently run `events.update()` on every event on
-  every save. Fix by normalising dateTime comparison before trusting
-  detector 2's signal.
+**Known issues (see `RECONCILER_PLAN.md` Next steps):**
+- ~~Detector 2 `_events_equal` dateTime offset mismatch~~ — **Fixed 1.16.1.**
+  `_parse_gcal_dt` now normalises both sides to timezone-aware datetimes
+  before comparing.
 - Detector 6 (`_schedule_vs_bookings`) doesn't collapse stale host
   assertions. A latest-wins pass over `(cleaner, target_date)` keyed
-  by message timestamp would drop the Mar/Apr backfilled-host-message
-  mismatches we're currently seeing.
-- Detector 1 looks healthy — zero findings on first run.
+  by message timestamp would drop Mar/Apr backfilled-host-message
+  mismatches. Until fixed, expect `schedule_mismatch` noise from old
+  host messages.
+- Detector 1 has been healthy — zero findings on first live run.
 
 **Routes** (all `_require_local_or_secret`-gated):
 - `POST /reconcile/run` — recompute + persist to `reconciler_last.json`.
@@ -332,47 +330,48 @@ Auth for all `/admin/*` and `/internal/snapshot` routes goes through
 of `X-Ingress-Path` header the Supervisor proxy stamps), or matching
 `X-Shared-Secret`.
 
-### WhatsApp — Baileys sidecar (Phase 3 Step 3, test mode shipped 1.8.x)
-- **Lives outside the add-on container** at `sidecar/whatsapp-bridge/`,
-  runs as a Node process on the user's Windows PC. This deliberately dodges
-  the `init: false` → `init: true` flip that an in-container sidecar would
-  have forced. Tradeoff: the PC must stay awake (Settings → Power → "Never
-  sleep while plugged in"). Promoting the sidecar to run on the HA host
-  itself is possible later — same code, loopback URL, no secret needed.
-- Pairs as a WhatsApp **linked device** via QR scan. **Test mode** pairs
-  against the user's personal WhatsApp (ban risk eats the personal account;
-  tolerated for a test). **Production path**: delete
-  `sidecar/whatsapp-bridge/auth/`, re-pair against a dedicated bot number
-  (SpeakOut $125/yr plan is the planned number — Step 2 still pending).
-- **Read-only.** `index.js` never calls `sendMessage`. Confirmations and
-  corrections still flow through the Review tab in the add-on UI, not back
-  into the chat.
-- Filters: `key.fromMe` dropped, non-group dropped, group not in
-  `GROUP_ALLOWLIST` dropped, empty text dropped. In-process `seenIds` set
-  layered on top of the add-on's id dedup.
-- **Network path.** Sidecar → `http://<ha-lan-ip>:5000/internal/whatsapp/inbound`
-  with `X-Shared-Secret` header. Requires port 5000 exposed via `ports:` in
-  `config.yaml` AND the Network section in HA's Configuration UI must have
-  the host port set to `5000` (it doesn't bind from `config.yaml` alone).
-  **Windows gotcha**: `homeassistant.local` often resolves to an IPv6
-  link-local (`fe80::...%22`) first, causing `Connection was reset`; use
-  the direct IPv4 in `.env`.
-- **Startup backfill** (`BACKFILL_PER_GROUP`, `BACKFILL_WINDOW_MS`): buffer
-  messages Baileys delivers during a startup window, forward the N most
-  recent per group, then switch to live mode. In practice returns zero on
-  reconnects to an already-synced auth state — WhatsApp's servers don't
-  replay history on linked devices that think they're caught up. For deep
-  history, use `/backfill` (the paste-flow route) instead.
-- `--list-groups` mode prints every group the paired account is in, for
-  populating `GROUP_ALLOWLIST`.
+### WhatsApp — Bridge HA add-on (`whatsapp-bridge/`, shipped 1.0.x)
+- **Runs as a standalone HA add-on** alongside the cleaning tracker. Uses
+  `host_network: true` so it reaches the cleaning tracker via
+  `http://127.0.0.1:5000` (loopback — no shared secret needed). Auth
+  state persists in `/data/auth/` across restarts.
+- Pairs as a WhatsApp **linked device** via QR scan. QR appears in the
+  add-on's Log tab on first start. Subsequent starts reconnect
+  automatically using the saved auth state.
+- **Forwards all group messages including the host's own outbound messages**
+  (`key.fromMe` is NOT filtered). Both cleaner replies and Josh's messages
+  reach the facts layer. The payload includes `from_me: true/false` so the
+  cleaning tracker can role-tag correctly.
+- **Read-only.** `index.js` never calls `sendMessage`.
+- Filters: non-group dropped, group not in `group_allowlist` option dropped,
+  empty text dropped. In-process `seenIds` set layered on top of the
+  add-on's id dedup.
+- **On connect**, logs all visible groups with JIDs — check the Log tab
+  after first pairing to populate the `group_allowlist` option.
+- **Startup backfill** (`backfill_per_group`, `backfill_window_ms` options):
+  buffers messages Baileys delivers during a startup window, forwards the
+  N most recent per group, then switches to live mode. In practice returns
+  zero on reconnects to an already-synced auth state — WhatsApp's servers
+  don't replay history on caught-up linked devices. For deep history, use
+  the transcript ingest route instead.
+- **Production path**: currently paired against personal WhatsApp (tolerated
+  for testing). To move to a dedicated bot number: stop the add-on, delete
+  `/data/auth/`, register WhatsApp Business on the bot phone (SpeakOut
+  $125/yr — pending), restart and scan the new QR.
+- **Docker build note**: `package-lock.json` is committed with `libsignal-node`
+  resolved to `git+https://` (not `git+ssh://`) so `npm ci` works in the
+  build container without SSH keys.
 
 ### Google Calendar projection (primary view, `gcal_enabled`)
 - One-way sync: `data.json` → GCal. Cleaners don't edit the calendar; they
   confirm via WhatsApp.
-- `gcal.py::sync_to_gcal()` diffs desired events (cancelled stays omitted,
-  deleted from GCal) against existing ones tagged with
-  `extendedProperties.private.source="cleaning-tracker"`, then inserts /
-  patches / deletes to converge.
+- `gcal.py::sync_to_gcal()` diffs desired events against existing ones
+  tagged with `extendedProperties.private.source="cleaning-tracker"`, then
+  inserts / patches / deletes to converge. Cancelled bookings are omitted
+  from desired events (deleted from GCal) **unless** the cleaner has an
+  unacknowledged `cleaner_commitment` — in that case a red
+  `❌ Cleaning Cancelled · Notify <cleaner>` timed event is kept until
+  "Mark notified" clears the commitment.
 - Triggered via `save_data()` in a daemon thread (fire-and-forget, errors
   logged and swallowed so GCal outages don't block local writes).
 - **Serialized** with a module-level lock — concurrent calls skip and return
@@ -391,6 +390,10 @@ of `X-Ingress-Path` header the Supervisor proxy stamps), or matching
   not the stay. Resolves on the next sync after "Mark notified".
 - Cleaner colour: md5-hashed onto 9 GCal palette slots (slot 8 reserved for
   cancelled if ever shown, 11 reserved for drift/unassigned).
+- **Cleaning events are always timed** (never all-day). When `clean_time`
+  is set, the event runs from that time for 2 hours. When unset, defaults
+  to 11:00 AM (checkout) → 1:00 PM. Property checkout is 11:00 AM,
+  check-in is 3:00 PM.
 - Timed events are tagged `America/Vancouver` (constant `LOCAL_TZ` in
   `gcal.py`), matching how `clean_time` and Airbnb check-in/out are stored
   in `data.json` as naive local clock times.
@@ -422,16 +425,14 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
   caches add-on configs, and updates for an existing slug only take effect
   on a version bump.
 - `init: false` in `config.yaml` is required — without it, the HA base
-  image's s6-overlay conflicts with a bare `CMD`. The Baileys sidecar was
-  originally scoped as in-container (which would have forced a flip to
-  `init: true` + s6-overlay). The external-sidecar decision in `sidecar/`
-  means this constraint still holds; the flip is not needed.
+  image's s6-overlay conflicts with a bare `CMD`. The WhatsApp Bridge runs
+  as a separate add-on so this constraint is unchanged.
 - **Port 5000 is exposed on the LAN** via the `ports:` mapping in
-  `config.yaml` so the external sidecar can reach `/internal/whatsapp/inbound`.
-  Non-loopback callers must authenticate via `X-Shared-Secret`
-  (`whatsapp_shared_secret`). All other routes on port 5000 are the normal
-  Flask app — same routes ingress serves, minus the `X-Ingress-Path`
-  prefix.
+  `config.yaml`. The WhatsApp Bridge add-on uses loopback and doesn't need
+  this, but the port is kept for the `scripts/reconcile_pull.py` off-host
+  puller and any other tooling that hits `/internal/snapshot` or
+  `/internal/whatsapp/inbound` from outside the host. Non-loopback callers
+  must authenticate via `X-Shared-Secret` (`whatsapp_shared_secret`).
 - **Admin routes are ingress-reachable.** `_require_local_or_secret`
   accepts loopback, HA ingress (via `X-Ingress-Path`), OR matching
   `X-Shared-Secret`. Ingress originates from the Supervisor's docker
@@ -449,10 +450,10 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 ## Open questions / deferred
 
 - **Reconciler step 3 (daily digest)** — cron-triggered "here's what
-  changed since yesterday" notification. Blocked on fixing the
-  `_events_equal` dateTime bug + detector 6 latest-wins collapse (see
-  `RECONCILER_PLAN.md` Next steps 1 + 3); digest is worse than
-  useless while detector 2 floods.
+  changed since yesterday" notification. The `_events_equal` dateTime bug
+  is fixed (1.16.1). Remaining blocker: detector 6 latest-wins collapse
+  (see `RECONCILER_PLAN.md` Next steps #3) — digest is noisy until stale
+  host assertions are filtered.
 - **Facts dedup.** Nothing currently collapses duplicate assertions
   across messages ("Itzel May 19" asserted twice = two facts). The
   reconciler groups by `(cleaner, target_date)` in `_fact_timeline`
@@ -474,7 +475,5 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 - **Rejected / deferred:** resolved-notify audit log, per-line-item notify
   ticking (MVP resolves a whole cleaner at once), GCal guest-invite RSVPs
   (WhatsApp pipeline covers it), split stays-vs-cleanings calendars,
-  retiring `/print` (Michelle still uses it), in-container Baileys
-  sidecar (external process on PC is the chosen path), bot-account swap
-  to SpeakOut number (blocked on user action — see
-  `sidecar/whatsapp-bridge/README.md` for the procedure).
+  retiring `/print` (Michelle still uses it), bot-account swap to SpeakOut
+  number (pending — see `whatsapp-bridge/` for the re-pair procedure).
