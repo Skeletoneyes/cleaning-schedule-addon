@@ -1072,9 +1072,14 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
       {% if conflicts_total is not none %} · {{ conflicts_total }} open{% endif %}
       {% if conflicts_dismissed %} · {{ conflicts_dismissed }} dismissed{% endif %}
     </div>
-    <form action="{{ prefix }}/reconcile/run" method="POST">
+    <form action="{{ prefix }}/reconcile/run" method="POST" style="display:inline;">
       <button type="submit" class="btn btn-sm btn-primary">Re-run</button>
     </form>
+    {% if digest_enabled %}
+    <form action="{{ prefix }}/digest/run" method="POST" style="display:inline;margin-left:6px;">
+      <button type="submit" class="btn btn-sm btn-outline">Run digest</button>
+    </form>
+    {% endif %}
   </div>
 
   {% if conflicts_findings %}
@@ -1617,6 +1622,7 @@ def index():
     return render_template_string(
         FOCUS_TEMPLATE,
         error=request.args.get("error"),
+        digest_enabled=DIGEST_ENABLED,
         **ctx,
         **review,
         **conflicts,
