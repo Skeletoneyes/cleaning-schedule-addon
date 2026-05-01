@@ -52,6 +52,11 @@ WHATSAPP_SHARED_SECRET = OPTIONS.get(
     "whatsapp_shared_secret", os.environ.get("WHATSAPP_SHARED_SECRET", "")
 )
 
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+DIGEST_LAST_FILE = DATA_DIR / "digest_last.json"
+DIGEST_ENABLED = bool(OPTIONS.get("digest_enabled", False))
+DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
+
 
 def _gcal_push(data):
     """Fire-and-forget GCal projection after a write. Errors are swallowed so
@@ -2001,31 +2006,19 @@ def _fetch_ical_events():
     return out
 
 
-@app.route("/reconcile/run", methods=["POST"])
-def reconcile_run():
-    """Run deterministic detectors over current data.json + message_facts.
-    Also fetches Airbnb iCal and GCal tagged events for detectors 1 and 2;
-    fetch failures propagate as 500s on purpose."""
-    _require_local_or_secret()
+def _run_full_reconcile():
     with DATA_LOCK:
         data = load_data()
     buckets, unassigned = review_queue(data)
     drift_items = [it for bk in buckets for it in bk["items"]] + unassigned
-
     ical_events = _fetch_ical_events()
     gcal_events = None
     data_for_detectors = data
     if GCAL_ENABLED:
-        gcal_events = gcal_mod.fetch_tagged_events(
-            GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID,
-        )
-        # gcal._desired_events reads b["_needs_notify"] for the drift
-        # colour/prefix. Annotate a snapshot so detector 2's diff matches what
-        # sync_to_gcal would produce.
+        gcal_events = gcal_mod.fetch_tagged_events(GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID)
         data_for_detectors = json.loads(json.dumps(data, default=str))
         for b in data_for_detectors.get("bookings", {}).values():
             b["_needs_notify"] = needs_notify(b)
-
     result = reconcile_mod.run(
         data_for_detectors, drift_items,
         ical_events=ical_events,
@@ -2035,6 +2028,13 @@ def reconcile_run():
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
     except OSError as e:
         print(f"[reconcile] failed to persist: {e}")
+    return result
+
+
+@app.route("/reconcile/run", methods=["POST"])
+def reconcile_run():
+    _require_local_or_secret()
+    result = _run_full_reconcile()
     if request.form:
         return redirect(ingress_prefix() + "/#conflicts")
     return jsonify(result)
@@ -2106,6 +2106,138 @@ def reconcile_undismiss():
         save_data(data)
     _rerun_reconcile_cached()
     return jsonify({"undismissed": finding_id, "was_dismissed": bool(removed)})
+
+
+def _post_ha_notification(title, message, notification_id="cleaning_digest"):
+    if not SUPERVISOR_TOKEN:
+        print("[digest] no SUPERVISOR_TOKEN — cannot post HA notification")
+        return False
+    try:
+        r = requests.post(
+            "http://supervisor/core/api/services/persistent_notification/create",
+            headers={
+                "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"title": title, "message": message, "notification_id": notification_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[digest] HA notification failed: {e}")
+        return False
+
+
+def _digest_compute_and_notify():
+    """Run reconcile, diff against baseline, post HA notification, save baseline.
+
+    Returns a dict with new/resolved/total/notified/message. Safe to call from
+    both the HTTP route and the background scheduler.
+    """
+    result = _run_full_reconcile()
+
+    baseline = {}
+    if DIGEST_LAST_FILE.exists():
+        try:
+            baseline = json.loads(DIGEST_LAST_FILE.read_text())
+        except Exception:
+            baseline = {}
+
+    current_ids = {f["id"] for f in result["findings"]}
+    baseline_ids = set(baseline.get("finding_ids", []))
+    no_baseline = not baseline_ids and not baseline
+
+    if no_baseline:
+        title = "Cleaning Digest — initial baseline"
+        counts = result["counts"]
+        message = (
+            f"Total: {counts.get('total', 0)} findings "
+            f"({counts.get('needs-attention', 0)} needs-attention, "
+            f"{counts.get('suggest', 0)} suggest, "
+            f"{counts.get('informational', 0)} informational). "
+            "Baseline saved — future runs will show new/resolved diff."
+        )
+        new_findings = []
+        resolved_count = 0
+    else:
+        new_findings = [f for f in result["findings"] if f["id"] in current_ids - baseline_ids]
+        resolved_count = len(baseline_ids - current_ids)
+        title = f"Cleaning Digest — {len(new_findings)} new, {resolved_count} resolved"
+
+        severity_order = ["needs-attention", "suggest", "informational"]
+        grouped = {}
+        for f in new_findings:
+            grouped.setdefault(f["severity"], []).append(f)
+
+        lines = []
+        shown = 0
+        for sev in severity_order:
+            for f in grouped.get(sev, []):
+                if shown >= 10:
+                    break
+                lines.append(f"• [{sev}] {f['why']}")
+                shown += 1
+            if shown >= 10:
+                break
+
+        if len(new_findings) > 10:
+            lines.append(f"…and {len(new_findings) - 10} more")
+
+        if resolved_count:
+            lines.append(f"{resolved_count} previously flagged finding(s) resolved.")
+
+        counts = result["counts"]
+        lines.append(
+            f"Total: {counts.get('total', 0)} findings "
+            f"({counts.get('needs-attention', 0)} needs-attention, "
+            f"{counts.get('suggest', 0)} suggest, "
+            f"{counts.get('informational', 0)} informational)."
+        )
+        message = "\n".join(lines) if lines else "No new findings."
+
+    notified = _post_ha_notification(title, message)
+
+    DIGEST_LAST_FILE.write_text(json.dumps({
+        "run_at": datetime.now().isoformat(timespec="seconds"),
+        "finding_ids": sorted(list(current_ids)),
+        "counts": result["counts"],
+    }, indent=2))
+
+    return {
+        "new": len(new_findings),
+        "resolved": resolved_count,
+        "total": result["counts"].get("total"),
+        "notified": notified,
+        "message": message,
+    }
+
+
+def _digest_scheduler():
+    """Background thread: sleeps until DIGEST_TIME each day, then runs the digest."""
+    try:
+        hour, minute = map(int, DIGEST_TIME.split(":"))
+    except Exception:
+        hour, minute = 8, 0
+    print(f"[digest] scheduler started — daily at {hour:02d}:{minute:02d}")
+    while True:
+        now = datetime.now()
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        time.sleep((next_run - now).total_seconds())
+        try:
+            r = _digest_compute_and_notify()
+            print(f"[digest] ran: new={r['new']} resolved={r['resolved']} notified={r['notified']}")
+        except Exception as e:
+            print(f"[digest] scheduler error: {e}")
+
+
+@app.route("/digest/run", methods=["POST"])
+def digest_run():
+    _require_local_or_secret()
+    r = _digest_compute_and_notify()
+    return jsonify(r)
 
 
 @app.route("/admin/remap-group", methods=["POST"])
@@ -2851,6 +2983,9 @@ if __name__ == "__main__":
 
     ensure_workers_started()
     print("WhatsApp parse workers started (pool=2).")
+
+    if DIGEST_ENABLED:
+        threading.Thread(target=_digest_scheduler, daemon=True, name="digest-scheduler").start()
 
     print("\nStarting server at http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)

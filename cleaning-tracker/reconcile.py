@@ -41,7 +41,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None):
     findings.extend(_drift(drift_items))
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
-    findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str))
+    findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id))
     if ical_events is not None:
         findings.extend(_ical_vs_bookings(bookings, ical_events, today_str))
     if gcal_events is not None:
@@ -267,7 +267,7 @@ def _fact_timeline(facts_records, messages_by_id, today_str):
 # that date should reflect that cleaner. If it's unset or assigned to someone
 # else, surface as a finding — the host asserted a plan the data doesn't match.
 
-def _schedule_vs_bookings(bookings, facts_records, today_str):
+def _schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id=None):
     by_date = {}
     for uid, b in bookings.items():
         if b.get("status") == "cancelled" or b.get("type") == "custom_stay":
@@ -276,8 +276,11 @@ def _schedule_vs_bookings(bookings, facts_records, today_str):
         if d:
             by_date.setdefault(d, []).append((uid, b))
 
-    out = []
+    # Phase 1: collapse to one schedule_assertion per (cleaner, target_date),
+    # keeping the one with the latest source-message timestamp.
+    latest_assertions = {}
     for msg_id, rec in facts_records.items():
+        ts = (messages_by_id or {}).get(msg_id, {}).get("timestamp", "")
         for f in rec.get("facts", []):
             if f.get("kind") != "schedule_assertion":
                 continue
@@ -285,37 +288,45 @@ def _schedule_vs_bookings(bookings, facts_records, today_str):
             cleaner = f.get("cleaner")
             if not tgt or not cleaner or tgt < today_str:
                 continue
-            quote = f.get("evidence") or ""
-            for uid, b in by_date.get(tgt, []):
-                current = b.get("cleaner")
-                if current == cleaner:
-                    continue
-                if current is None:
-                    out.append({
-                        "id": f"schedule_unassigned:{uid}:{cleaner}",
-                        "detector": "schedule_vs_bookings",
-                        "kind": "schedule_unassigned",
-                        "severity": "suggest",
-                        "booking_uid": uid,
-                        "cleaner": cleaner,
-                        "date": tgt,
-                        "why": f"host scheduled {cleaner} for {tgt} but booking is unassigned",
-                        "evidence": [msg_id],
-                        "quote": quote,
-                    })
-                else:
-                    out.append({
-                        "id": f"schedule_mismatch:{uid}:{cleaner}",
-                        "detector": "schedule_vs_bookings",
-                        "kind": "schedule_mismatch",
-                        "severity": "needs-attention",
-                        "booking_uid": uid,
-                        "cleaner": cleaner,
-                        "date": tgt,
-                        "why": f"host scheduled {cleaner} for {tgt} but booking is assigned to {current}",
-                        "evidence": [msg_id],
-                        "quote": quote,
-                    })
+            key = (cleaner, tgt)
+            existing = latest_assertions.get(key)
+            if existing is None or ts > existing[0]:
+                latest_assertions[key] = (ts, msg_id, f)
+
+    # Phase 2: emit findings using only the latest assertion per (cleaner, date).
+    out = []
+    for (cleaner, tgt), (_, msg_id, f) in latest_assertions.items():
+        quote = f.get("evidence") or ""
+        for uid, b in by_date.get(tgt, []):
+            current = b.get("cleaner")
+            if current == cleaner:
+                continue
+            if current is None:
+                out.append({
+                    "id": f"schedule_unassigned:{uid}:{cleaner}",
+                    "detector": "schedule_vs_bookings",
+                    "kind": "schedule_unassigned",
+                    "severity": "suggest",
+                    "booking_uid": uid,
+                    "cleaner": cleaner,
+                    "date": tgt,
+                    "why": f"host scheduled {cleaner} for {tgt} but booking is unassigned",
+                    "evidence": [msg_id],
+                    "quote": quote,
+                })
+            else:
+                out.append({
+                    "id": f"schedule_mismatch:{uid}:{cleaner}",
+                    "detector": "schedule_vs_bookings",
+                    "kind": "schedule_mismatch",
+                    "severity": "needs-attention",
+                    "booking_uid": uid,
+                    "cleaner": cleaner,
+                    "date": tgt,
+                    "why": f"host scheduled {cleaner} for {tgt} but booking is assigned to {current}",
+                    "evidence": [msg_id],
+                    "quote": quote,
+                })
     return out
 
 

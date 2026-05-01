@@ -11,7 +11,13 @@
       "Bash(git merge *)",
       "WebFetch(domain:github.com)",
       "WebSearch",
-      "Bash(git reset *)"
+      "Bash(git reset *)",
+      "Bash(git -C /c/Users/joshu/Documents/cleaning-schedule-addon add CLAUDE.md RECONCILER_PLAN.md cleaning-tracker/app.py cleaning-tracker/config.yaml cleaning-tracker/gcal.py cleaning-tracker/reconcile.py)",
+      "Bash(git -C /c/Users/joshu/Documents/cleaning-schedule-addon commit -m ' *)",
+      "Bash(git *)",
+      "Bash(curl *)",
+      "mcp__home-assistant__GetLiveContext",
+      "Bash(gh api *)"
     ]
   }
 }
