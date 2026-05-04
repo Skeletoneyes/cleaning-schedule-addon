@@ -2004,6 +2004,53 @@ def admin_reprocess_facts():
     })
 
 
+@app.route("/admin/fix-parse-errors", methods=["POST"])
+def admin_fix_parse_errors():
+    """Bulk-fix messages that have parse_error set.
+
+    Messages older than cutoff_days (default 90) are silently ignored.
+    Recent ones are reset so the worker retries them on next enqueue.
+    Idempotent.
+    """
+    _require_local_or_secret()
+    cutoff_days = int(request.json.get("cutoff_days", 90) if request.is_json else 90)
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=cutoff_days)
+
+    ignored = 0
+    reset = 0
+    retry_ids = []
+
+    with DATA_LOCK:
+        data = load_data()
+        for m in data.get("messages", []):
+            if not m.get("parse_error"):
+                continue
+            ts_raw = m.get("timestamp") or ""
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                ts = None
+            old = (ts < cutoff) if ts else (ts_raw < cutoff.strftime("%Y-%m-%d") if ts_raw else True)
+            if old:
+                m["review_state"] = "ignored"
+                ignored += 1
+            else:
+                m["parsed"] = False
+                m["parse_error"] = None
+                retry_ids.append(m["id"])
+                reset += 1
+        save_data(data)
+
+    ensure_workers_started()
+    for mid in retry_ids:
+        enqueue_message(mid)
+
+    return jsonify({"ignored": ignored, "reset_for_retry": reset, "cutoff_days": cutoff_days})
+
+
 def _fetch_ical_events():
     """Fetch + parse the Airbnb iCal into [{uid, start, end}] for detector 1.
 
