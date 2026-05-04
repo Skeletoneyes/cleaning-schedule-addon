@@ -93,6 +93,7 @@ def load_data():
             b["type"] = "manual_cleaning" if uid.startswith("manual-") else "airbnb"
     data.setdefault("messages", [])
     data.setdefault("cleaner_jids", {})
+    data.setdefault("host_jids", [])
     data.setdefault("group_labels", {})
     data.setdefault("message_facts", {})
     return data
@@ -826,6 +827,10 @@ _REVIEW_PANEL = """
       <span style="font-size:0.85rem;color:#666;">or</span>
       <input type="text" name="new_cleaner" placeholder="new cleaner name" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
       <button type="submit" class="btn btn-sm btn-primary">Save mapping</button>
+    </form>
+    <form action="{{ prefix }}/review/ignore-sender" method="POST" style="margin-top:4px;">
+      <input type="hidden" name="jid" value="{{ u.jid }}">
+      <button type="submit" class="btn btn-sm btn-secondary">Not a cleaner (ignore)</button>
     </form>
   </div>
   {% endfor %}
@@ -2565,13 +2570,14 @@ def _build_review_context(data):
     for jids in jid_map.values():
         known_jids.update(jids)
 
+    host_jids = set(data.get("host_jids", []))
     pending = []
     unmapped_senders = {}  # sender_jid -> first msg preview
     for m in data.get("messages", []):
         if m.get("review_state") != "pending":
             continue
         sender = m.get("sender") or ""
-        if sender and sender not in known_jids and sender not in unmapped_senders:
+        if sender and sender not in known_jids and sender not in host_jids and sender not in unmapped_senders:
             grp = m.get("group")
             unmapped_senders[sender] = {
                 "jid": sender,
@@ -2732,6 +2738,21 @@ def review_map_sender():
     ensure_workers_started()
     for mid in requeue:
         enqueue_message(mid)
+    return redirect(ingress_prefix() + "/#review")
+
+
+@app.route("/review/ignore-sender", methods=["POST"])
+def review_ignore_sender():
+    """Mark a JID as a host/non-cleaner so it stops appearing in unmapped senders."""
+    jid = request.form.get("jid", "").strip()
+    if not jid:
+        return redirect(ingress_prefix() + "/#review")
+    with DATA_LOCK:
+        data = load_data()
+        host_jids = data.setdefault("host_jids", [])
+        if jid not in host_jids:
+            host_jids.append(jid)
+        save_data(data)
     return redirect(ingress_prefix() + "/#review")
 
 
