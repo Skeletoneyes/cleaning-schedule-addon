@@ -303,8 +303,8 @@ def upcoming_booking_list(bookings):
 def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleaner, labels):
     """Ask Haiku to interpret a single inbound WhatsApp message in context.
 
-    `history` is the full cross-group message archive (volume is low enough to
-    just pass everything). `labels` is {group_jid: human_label}.
+    `history` is a windowed slice of the cross-group archive (most recent
+    PARSE_HISTORY_WINDOW messages before this one). `labels` is {group_jid: human_label}.
 
     Returns ({booking_uid, cleaner, action, confidence, reason}, None) or
     (None, error_str). `action` is "confirm", "decline", or "none".
@@ -424,6 +424,11 @@ def ensure_workers_started(pool_size=2):
 # same-group messages strictly preceding the target.
 FACTS_HISTORY_WINDOW = 30
 
+# Parse history is cross-group (host-chat context helps resolve ambiguous
+# replies) so a separate, slightly larger window. Still needs a cap —
+# unbounded archive hits the 50k tokens/min org rate limit.
+PARSE_HISTORY_WINDOW = 50
+
 
 def _facts_history(messages, target):
     tgt_group = target.get("group")
@@ -434,6 +439,13 @@ def _facts_history(messages, target):
     ]
     same.sort(key=lambda m: m.get("timestamp") or "")
     return same[-FACTS_HISTORY_WINDOW:]
+
+
+def _parse_history(messages, target):
+    tgt_ts = target.get("timestamp") or ""
+    prior = [m for m in messages if (m.get("timestamp") or "") < tgt_ts]
+    prior.sort(key=lambda m: m.get("timestamp") or "")
+    return prior[-PARSE_HISTORY_WINDOW:]
 
 
 def process_message(msg_id):
@@ -453,8 +465,7 @@ def process_message(msg_id):
         sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
         labels = dict(data.get("group_labels", {}))
 
-    # Parse keeps full history for now (single-message live path, not bulk).
-    result, error = parse_whatsapp_message(msg, all_messages, bookings, known, sender_cleaner, labels)
+    result, error = parse_whatsapp_message(msg, _parse_history(all_messages, msg), bookings, known, sender_cleaner, labels)
     # Facts extraction runs independently of parse routing. An empty facts list
     # is a valid result (chitchat) — only facts_err means retry via reprocess.
     facts_list, facts_err = facts_mod.extract_facts(
