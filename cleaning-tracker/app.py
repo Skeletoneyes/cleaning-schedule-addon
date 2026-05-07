@@ -1097,6 +1097,19 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
     </form>
     {% endif %}
   </div>
+  {% if digest_enabled and digest_run_at is defined %}
+  <div style="font-size:0.8rem;color:#888;margin-bottom:10px;">
+    Digest last ran: {{ digest_run_at }}
+    {% if digest_title %} — {{ digest_title }}{% endif %}
+    {% if digest_notified is defined %}
+      {% if digest_notified %}
+        <span style="color:#2a7;margin-left:4px;">✓ HA notified</span>
+      {% else %}
+        <span style="color:#c33;margin-left:4px;">✗ HA notification failed — check add-on logs</span>
+      {% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
 
   {% if conflicts_findings %}
     {% for f in conflicts_findings %}
@@ -1671,12 +1684,30 @@ def _build_conflicts_context():
         gen = datetime.fromisoformat(gen).strftime("%b %d, %I:%M %p")
     except (ValueError, TypeError):
         pass
+    digest_info = {}
+    if DIGEST_LAST_FILE.exists():
+        try:
+            dl = json.loads(DIGEST_LAST_FILE.read_text())
+            digest_run_at = dl.get("run_at", "")
+            try:
+                digest_run_at = datetime.fromisoformat(digest_run_at).strftime("%b %d, %I:%M %p")
+            except (ValueError, TypeError):
+                pass
+            digest_info = {
+                "digest_run_at": digest_run_at,
+                "digest_title": dl.get("last_title"),
+                "digest_notified": dl.get("last_notified"),
+            }
+        except (OSError, json.JSONDecodeError):
+            pass
+
     return {
         "conflicts_findings": findings,
         "conflicts_total": counts.get("total", len(findings)),
         "conflicts_attn": counts.get("needs-attention", 0),
         "conflicts_dismissed": counts.get("dismissed", 0),
         "conflicts_generated_at": gen,
+        **digest_info,
     }
 
 
@@ -2271,6 +2302,9 @@ def _digest_compute_and_notify():
         "run_at": datetime.now().isoformat(timespec="seconds"),
         "finding_ids": sorted(list(current_ids)),
         "counts": result["counts"],
+        "last_title": title,
+        "last_message": message,
+        "last_notified": notified,
     }, indent=2))
 
     return {
@@ -2306,6 +2340,8 @@ def _digest_scheduler():
 def digest_run():
     _require_local_or_secret()
     r = _digest_compute_and_notify()
+    if request.form:
+        return redirect(ingress_prefix() + "/#conflicts")
     return jsonify(r)
 
 

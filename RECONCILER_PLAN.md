@@ -218,12 +218,11 @@ In rough priority order:
    signal. A healthy state should show `gcal_stale_event` counts
    near zero during normal operation — non-zero means sync genuinely
    hasn't converged (e.g. credentials rotated, network blip).
-3. **Tighten detector 6 with a latest-host-assertion collapse.**
-   Group `schedule_assertion` facts by `(cleaner, target_date)`,
-   keep only the latest by source-message timestamp, then compare
-   against the booking. Mirrors what `_fact_timeline` does for
-   cleaner confirm/decline. Expected drop in `schedule_mismatch`
-   noise; expected surface of the *latest* mismatch only.
+3. ~~**Tighten detector 6 with a latest-host-assertion collapse.**~~
+   **Done (1.17.1).** `_schedule_vs_bookings` now does a two-phase
+   pass: Phase 1 collapses all `schedule_assertion` facts to one
+   per `(cleaner, target_date)` (latest timestamp wins); Phase 2
+   emits findings using only those collapsed assertions.
 4. **Bulk-dismiss-by-kind.** `confirm_no_booking` and historical
    `schedule_mismatch` findings both trend toward "dismiss the
    whole batch and move on." A `POST /reconcile/dismiss-kind`
@@ -232,8 +231,10 @@ In rough priority order:
    new finding kinds (`ical_*`, `gcal_*`) rendering, and the
    already-shipped Assign / Edit / Dismiss buttons against fixture
    data.
-6. **Step 3 daily digest** — only after #1 and #3. The digest is
-   worse than useless if detector 2 still floods it.
+6. ~~**Step 3 daily digest**~~ **Done (1.17.1/1.17.2).** Background
+   scheduler, `/digest/run` route, HA persistent notification,
+   baseline diff (new/resolved), and "Run digest" button in the
+   Conflicts tab UI. Enable via `digest_enabled: true` in options.
 
 ## Step 3 — Daily digest (deferred; discuss before building)
 

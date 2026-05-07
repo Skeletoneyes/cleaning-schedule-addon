@@ -93,11 +93,11 @@ def main() -> int:
         if ignore:
             print("\nSample ignore (first 5):")
             for m in ignore[:5]:
-                print(f"  [{m.get('timestamp','')}] {m.get('sender','')} — {str(m.get('text',''))[:60]}")
+                print(f"  [{m.get('timestamp','')}] {m.get('sender','')} -- {str(m.get('text',''))[:60]}".encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
         if retry:
             print("\nSample retry (first 5):")
             for m in retry[:5]:
-                print(f"  [{m.get('timestamp','')}] {m.get('sender','')} — {str(m.get('text',''))[:60]}")
+                print(f"  [{m.get('timestamp','')}] {m.get('sender','')} -- {str(m.get('text',''))[:60]}".encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
         return 0
 
     for m in ignore:

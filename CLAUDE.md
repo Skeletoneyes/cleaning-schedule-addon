@@ -449,11 +449,12 @@ Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
 
 ## Open questions / deferred
 
-- **Reconciler step 3 (daily digest)** — cron-triggered "here's what
-  changed since yesterday" notification. The `_events_equal` dateTime bug
-  is fixed (1.16.1). Remaining blocker: detector 6 latest-wins collapse
-  (see `RECONCILER_PLAN.md` Next steps #3) — digest is noisy until stale
-  host assertions are filtered.
+- **Reconciler step 3 (daily digest)** — **Shipped in 1.17.1.** Background
+  scheduler runs at `digest_time` (default 08:00), diffs against the
+  previous run's baseline, and posts a HA persistent notification with
+  new/resolved finding counts. Enable via `digest_enabled: true` in add-on
+  options. "Run digest" button in the Conflicts tab triggers on demand.
+  Detector 6 latest-wins collapse also shipped in 1.17.1.
 - **Facts dedup.** Nothing currently collapses duplicate assertions
   across messages ("Itzel May 19" asserted twice = two facts). The
   reconciler groups by `(cleaner, target_date)` in `_fact_timeline`
