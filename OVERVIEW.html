@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cleaning Schedule Add-on — Overview</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 11.5pt;
+    line-height: 1.65;
+    color: #111;
+    background: #fff;
+    padding: 0.6in 0.75in;
+    max-width: 8.5in;
+    margin: 0 auto;
+  }
+
+  h1 { font-size: 22pt; border-bottom: 3px solid #111; padding-bottom: 6px; margin-bottom: 4px; }
+  h2 { font-size: 14pt; margin-top: 30px; margin-bottom: 8px; border-bottom: 1.5px solid #555; padding-bottom: 3px; }
+  h3 { font-size: 11.5pt; margin-top: 16px; margin-bottom: 5px; font-weight: bold; }
+  p  { margin-bottom: 10px; }
+  ul { margin-left: 20px; margin-bottom: 10px; }
+  li { margin-bottom: 5px; }
+
+  .subtitle {
+    color: #555;
+    font-size: 10pt;
+    margin-bottom: 20px;
+  }
+
+  /* ── Big diagram ── */
+  .diagram {
+    font-family: 'Courier New', monospace;
+    font-size: 8.5pt;
+    line-height: 1.55;
+    background: #f8f8f8;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    padding: 16px 20px;
+    margin: 16px 0;
+    white-space: pre;
+  }
+
+  /* ── Notes ── */
+  .notes {
+    margin-top: 16px;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    padding: 8px 10px 4px;
+    background: #fafafa;
+  }
+  .notes-label {
+    font-size: 8pt;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #999;
+    margin-bottom: 4px;
+  }
+  .lines div {
+    border-bottom: 1px solid #ccc;
+    height: 24px;
+  }
+
+  .no-break { page-break-inside: avoid; }
+  .page-break { page-break-before: always; }
+
+  blockquote {
+    border-left: 3px solid #ccc;
+    padding-left: 14px;
+    color: #444;
+    margin: 10px 0 10px 10px;
+    font-style: italic;
+  }
+
+  @media print {
+    body { padding: 0.5in 0.6in; font-size: 10.5pt; }
+    .diagram { font-size: 8pt; }
+    .notes { background: #fff; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Cleaning Schedule Add-on — Plain English Overview</h1>
+<p class="subtitle">2026-05-06 &nbsp;·&nbsp; Version 1.17.x &nbsp;·&nbsp; For reference and planning conversations</p>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 1 — WHAT IS THIS
+     ══════════════════════════════════════════════ -->
+<h2>1. What Is This?</h2>
+
+<p>
+  This is a small web app that runs on your Home Assistant server at home. Its job is to keep track
+  of which cleaner is scheduled for each Airbnb checkout, and to stay in sync with whatever you
+  and the cleaners have discussed over WhatsApp.
+</p>
+
+<p>
+  The app pulls your Airbnb booking calendar automatically, lets you assign cleaners to each checkout,
+  and then watches the WhatsApp group chats to detect when a cleaner has confirmed or declined.
+  It uses Claude (an AI) to read those WhatsApp messages and figure out what was agreed.
+</p>
+
+<p>
+  Everything it knows is saved to one file on the server. Google Calendar is used purely as a
+  display layer — so Michelle and the cleaners can see upcoming jobs without needing to log into
+  anything. The app is the brain; Google Calendar is the whiteboard.
+</p>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     THE BIG PICTURE CHART
+     ══════════════════════════════════════════════ -->
+<h2>2. The Big Picture</h2>
+
+<div class="diagram">
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                         WHERE INFORMATION COMES FROM                        │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  Airbnb Calendar         WhatsApp (live)          WhatsApp (pasted)
+  (iCal URL)              Bridge add-on on HA       chat export or
+  fetched every sync      listens 24/7, forwards    raw transcript
+       │                  every group message             │
+       │                         │                        │
+       └──────────────┬──────────┘                        │
+                      │                                    │
+                      ▼                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                        THE APP  (app.py + helpers)                          │
+  │                                                                             │
+  │   When a booking arrives:          When a WhatsApp message arrives:         │
+  │   ─ add it to the list             ─ Claude reads it (two separate calls)   │
+  │   ─ mark old ones cancelled        ─ "Parse": which booking does this       │
+  │   ─ flag unassigned ones             relate to, and what's the action?      │
+  │     for review                     ─ "Facts": what scheduling claims        │
+  │                                      does this message make at all?         │
+  │                                    ─ High confidence + known cleaner        │
+  │                                      → apply automatically                  │
+  │                                    ─ Anything else → Review queue           │
+  │                                                                             │
+  │                    ┌──────────────────────────┐                             │
+  │                    │      data.json            │                             │
+  │                    │  (the single truth file)  │                             │
+  │                    │  bookings + messages      │                             │
+  │                    │  + facts + cleaner map    │                             │
+  │                    └────────────┬─────────────┘                             │
+  └─────────────────────────────────┼───────────────────────────────────────────┘
+                                    │
+              ┌─────────────────────┼───────────────────────┐
+              │                     │                       │
+              ▼                     ▼                       ▼
+     ┌────────────────┐   ┌─────────────────┐   ┌───────────────────┐
+     │  Notify Tab    │   │  Conflicts Tab  │   │  Google Calendar  │
+     │                │   │                 │   │                   │
+     │  Per-cleaner   │   │  Reconciler     │   │  One-way push.    │
+     │  cards showing │   │  cross-checks   │   │  Cleaners and     │
+     │  what you need │   │  all 4 sources  │   │  Michelle can     │
+     │  to tell each  │   │  and surfaces   │   │  see upcoming     │
+     │  cleaner. Mark │   │  drift, missing │   │  jobs here.       │
+     │  notified when │   │  confirmations, │   │  Red events =     │
+     │  you've messaged   │  and conflicts. │   │  something needs  │
+     │  them.         │   │                 │   │  attention.       │
+     └────────────────┘   └─────────────────┘   └───────────────────┘
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 3 — THE HOME PAGE
+     ══════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>3. The Home Page (Three Tabs)</h2>
+
+<div class="no-break">
+<h3>Notify Tab — the main daily view</h3>
+<p>
+  This is the tab you use most. It shows one cleaner at a time, and lists every job where
+  what you've told that cleaner doesn't match what's currently booked. For example: if you
+  told Maria she was cleaning on the 15th, but the booking got cancelled — she shows up here
+  because you need to tell her.
+</p>
+<p>
+  The possible situations are:
+</p>
+<ul>
+  <li><strong>New</strong> — you've assigned a cleaner but haven't told them yet.</li>
+  <li><strong>Changed</strong> — the date or time has shifted since you last communicated.</li>
+  <li><strong>Cancelled</strong> — the booking was cancelled after you'd already told the cleaner.</li>
+  <li><strong>Unassigned</strong> — there's an upcoming checkout with no cleaner assigned at all.</li>
+</ul>
+<p>
+  When you've sent the message to that cleaner, hit "Mark notified" and the app
+  records what they were told. The card disappears until something changes again.
+  You move through cleaners one at a time using the arrow buttons.
+</p>
+</div>
+
+<div class="no-break">
+<h3>WhatsApp Review Tab</h3>
+<p>
+  Messages that Claude wasn't confident enough to apply automatically end up here.
+  You can read each one, then accept Claude's suggestion, override it with the correct
+  booking and cleaner, or ignore the message entirely. You can also name groups here
+  (so "123456789@g.us" shows as "Maria group") and map unknown phone numbers to cleaners.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Conflicts Tab</h3>
+<p>
+  The reconciler runs in the background and cross-checks all four data sources — Airbnb
+  calendar, your local bookings, Google Calendar, and what cleaners have actually said
+  on WhatsApp. If something doesn't add up, it surfaces here as a finding. Findings are
+  ranked by urgency. You can take action directly (assign a cleaner, open the booking to
+  edit) or dismiss a finding if you know it's resolved some other way.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 4 — HOW BOOKINGS WORK
+     ══════════════════════════════════════════════ -->
+<h2>4. How Bookings Work</h2>
+
+<div class="no-break">
+<h3>Airbnb bookings (automatic)</h3>
+<p>
+  When you press "Sync" on the home page, the app fetches your Airbnb calendar URL
+  and imports any new reservations. If a reservation disappears from Airbnb (cancelled
+  by the guest), it gets marked cancelled in the app too. Everything you've added by hand
+  — custom stays, manual cleanings — is left alone by the sync.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Adding things by hand</h3>
+<p>
+  The Add page lets you create two kinds of entries manually:
+</p>
+<ul>
+  <li><strong>Stay</strong> — a guest stay with a start and end date. You'd use this for non-Airbnb bookings.</li>
+  <li><strong>Cleaning</strong> — a standalone cleaning job on a specific date. Good for deep cleans or
+    jobs not tied to a guest checkout.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>The booking edit page</h3>
+<p>
+  From here you can change the assigned cleaner, set or update the cleaning time, and add notes.
+  For cancelled bookings, there's a Dismiss button to remove it from view. Airbnb bookings that
+  are still active can only have their cleaner and time changed — they can't be deleted
+  (Airbnb decides when they get cancelled).
+</p>
+</div>
+
+<div class="no-break">
+<h3>The print view</h3>
+<p>
+  A clean month-by-month table showing stays as coloured bars and cleaner assignments
+  on checkout days. Designed to look good on paper. Michelle uses this.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 5 — WHATSAPP
+     ══════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>5. How WhatsApp Works</h2>
+
+<div class="no-break">
+<h3>The WhatsApp Bridge (live monitoring)</h3>
+<p>
+  A second add-on running on Home Assistant. It logs into WhatsApp as a linked device
+  (like WhatsApp Web on a phone). Once paired by scanning a QR code once, it stays
+  connected and forwards every message from the specified group chats to the main app.
+  It never sends anything — read-only.
+</p>
+<p>
+  Both your own outbound messages and the cleaners' replies are forwarded. This matters
+  because your messages provide scheduling context for Claude to understand the replies.
+</p>
+</div>
+
+<div class="no-break">
+<h3>What happens when a message arrives</h3>
+<p>
+  Claude reads each message twice, in parallel:
+</p>
+<ul>
+  <li><strong>Parse pass</strong> — "Does this message refer to a specific booking I know about, and if so,
+    is the cleaner confirming, declining, or proposing a time change?" If confidence is high
+    and the cleaner is recognised, the booking gets updated automatically.</li>
+  <li><strong>Facts pass</strong> — "What scheduling claims does this message make, regardless of
+    whether I can match them to a specific booking?" This feeds the reconciler so it can
+    detect things like "a cleaner said yes but the booking still shows unassigned."</li>
+</ul>
+<p>
+  Messages that Claude can't confidently act on go to the Review tab for you to handle manually.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Backfill — catching up on past chats</h3>
+<p>
+  If you've already been running the property for a while before installing this app,
+  you can export a WhatsApp chat (from your phone: open the group → three dots → More → Export chat →
+  Without media) and paste it in. Claude will read through it and suggest which cleaner to
+  assign to each unassigned booking, with a confidence score. You review the suggestions and
+  apply the ones that look right.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Transcript ingest — for historical data</h3>
+<p>
+  Similar to backfill, but instead of matching to unassigned bookings, it parses the transcript
+  into the full message log and runs the facts extraction on each message. This gives the
+  reconciler full historical context. Useful for a one-time catch-up when you first install.
+  Re-running the same transcript is safe — duplicate messages are ignored.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 6 — THE AI LAYER
+     ══════════════════════════════════════════════ -->
+<h2>6. The AI Layer (Claude Haiku)</h2>
+
+<p>
+  The app uses Claude Haiku — a small, fast, cheap AI model — for two distinct jobs.
+  It never makes decisions on its own; it only extracts structured information from
+  unstructured WhatsApp text and hands that back to the app to act on.
+</p>
+
+<div class="no-break">
+<h3>Job 1: Parse (route one message to one booking)</h3>
+<p>
+  Given a message, its recent context, and the list of upcoming bookings,
+  Claude answers: "Which booking does this refer to? Which cleaner? What action?"
+  It returns a confidence score. Below 85% confidence, or if it can't match a
+  known cleaner or booking, the message goes to the Review tab.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Job 2: Facts (extract all scheduling claims)</h3>
+<p>
+  Given the same message and context, Claude also answers a broader question:
+  "List every date, cleaner, and time claim in this message." A single message
+  like a re-posted schedule with 15 dates might produce 15 separate facts.
+  These are stored separately and used by the reconciler to cross-check everything.
+</p>
+<p>
+  The context window for this pass is capped at the last 30 messages from the
+  same group — a practical limit to prevent runaway API costs during bulk imports.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Prompt versioning</h3>
+<p>
+  The facts prompt has a version stamp. If you change the prompt (to improve accuracy
+  or fix a pattern it's getting wrong), you increment the version number and run a
+  reprocess job from the admin panel. This re-reads all stored messages with the new
+  prompt. Old and new records coexist safely until reprocessing is complete.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 7 — THE RECONCILER
+     ══════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>7. The Reconciler (Conflict Detection)</h2>
+
+<p>
+  The reconciler is the app's auditor. It compares all four sources of truth against
+  each other and flags anything that doesn't line up. You run it manually with
+  the "Run digest" button, or it runs automatically when you load the Conflicts tab.
+</p>
+
+<div class="no-break">
+<h3>What it checks</h3>
+<ul>
+  <li><strong>Airbnb calendar vs. your bookings</strong> — is there a reservation in Airbnb that
+    you don't have a booking for? Or a booking in your records that disappeared from Airbnb?</li>
+  <li><strong>Your bookings vs. Google Calendar</strong> — is GCal out of date? Missing events? Events
+    that no longer correspond to a booking?</li>
+  <li><strong>Notify queue drift</strong> — are there bookings where what you've told a cleaner no
+    longer matches reality?</li>
+  <li><strong>WhatsApp facts vs. bookings</strong> — has a cleaner confirmed something that your
+    records don't show? Is someone assigned to a job they declined on WhatsApp?
+    Did two cleaners both confirm the same date?</li>
+  <li><strong>Cleaner change-of-mind</strong> — did a cleaner first confirm and then later decline
+    (or vice versa) for the same date?</li>
+  <li><strong>Host schedule vs. bookings</strong> — did you post a schedule in the chat that
+    names a different cleaner than what's recorded?</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Urgency levels</h3>
+<ul>
+  <li><strong>Needs attention</strong> — something is actively wrong and should be resolved.</li>
+  <li><strong>Suggestion</strong> — something looks like it might be incomplete (e.g. an unrecorded confirmation).</li>
+  <li><strong>Informational</strong> — interesting context but no immediate action required.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Dismissing findings</h3>
+<p>
+  If you know a finding is resolved or not relevant, you can dismiss it from the Conflicts tab.
+  It stays dismissed even if you re-run the reconciler. You can undo a dismissal if needed.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Known noise</h3>
+<p>
+  Old messages where you (as host) posted a schedule in the group chat can generate
+  "schedule mismatch" findings even after those jobs are long done. This is a known
+  limitation — the reconciler doesn't yet filter out stale host messages. Until fixed,
+  expect some noise from older backfilled transcripts.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 8 — GOOGLE CALENDAR
+     ══════════════════════════════════════════════ -->
+<h2>8. Google Calendar</h2>
+
+<p>
+  The app pushes a one-way copy of the schedule to a Google Calendar shared with Michelle
+  and the cleaners. No one edits the Google Calendar — it's purely for viewing.
+  All changes go through the app and get pushed to GCal automatically.
+</p>
+
+<div class="no-break">
+<h3>What the calendar shows</h3>
+<ul>
+  <li>Each cleaning job appears as a timed event (default 11 AM – 1 PM if no time set,
+    or from the clean time for 2 hours).</li>
+  <li>Cleaner's name is in the event title. Colour corresponds to the cleaner
+    (each cleaner gets a consistent colour).</li>
+  <li><strong>Red events (⚠️)</strong> — something needs attention: either the cleaner hasn't been told
+    yet, or what they were told is no longer current.</li>
+  <li>If a booking is cancelled after the cleaner was notified, a red "❌ Cleaning Cancelled — Notify [name]"
+    event stays on the calendar until you mark that cleaner as notified.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Setup</h3>
+<p>
+  Requires a Google Cloud service account — a special set of API credentials that doesn't
+  need a login or refresh tokens. You create it once, share the target calendar with the
+  service account's email address, and paste the credentials into the add-on settings.
+  The <code>gcal_auth.py</code> script validates the credentials and tells you the exact
+  email to share with.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 9 — UNDER THE HOOD
+     ══════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>9. Under the Hood (for context, not operation)</h2>
+
+<div class="no-break">
+<h3>Where data lives</h3>
+<p>
+  One JSON file on the server: <code>/data/data.json</code>. It contains the bookings list,
+  all WhatsApp messages, all extracted facts, the cleaner-to-phone-number mapping,
+  and the group chat labels. There's no database. The file persists across app restarts
+  and updates.
+</p>
+</div>
+
+<div class="no-break">
+<h3>How it runs</h3>
+<p>
+  A Python web app (Flask) running inside a Home Assistant add-on container.
+  The app is a single file (~3,000 lines). The WhatsApp Bridge is a separate
+  Node.js add-on running alongside it. They communicate over the local network.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Auth and access</h3>
+<p>
+  The app is accessible through the Home Assistant sidebar (via HA's ingress proxy,
+  which handles login). It's also reachable directly on port 5000 on your local network
+  for tooling purposes — those external calls need to include a shared secret in the header.
+  The WhatsApp Bridge calls over loopback (same machine) and doesn't need the secret.
+</p>
+</div>
+
+<div class="no-break">
+<h3>Updating the app</h3>
+<p>
+  Push the code change to GitHub, bump the version number in the config file, then
+  refresh the add-on in Home Assistant. HA won't pick up changes unless the version
+  number changes — this is a HA limitation. You can't edit files in place via the
+  Windows file share (SMB caching causes silent failures) — always go through GitHub.
+</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     SECTION 10 — OPEN QUESTIONS
+     ══════════════════════════════════════════════ -->
+<h2>10. Things Not Done Yet</h2>
+
+<div class="no-break">
+<table style="width:100%; border-collapse:collapse; font-size:10.5pt;">
+  <thead>
+    <tr style="background:#eee;">
+      <th style="text-align:left; padding:6px 10px; border:1px solid #ccc; width:45%;">What</th>
+      <th style="text-align:left; padding:6px 10px; border:1px solid #ccc; width:55%;">Why it's not done / what's blocking it</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="padding:6px 10px; border:1px solid #ccc;"><s>Daily digest notification</s> ✓</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;"><strong>Done (v1.17.1).</strong> Runs daily at a configurable time (default 8 AM), compares against the previous day's findings, and posts a Home Assistant notification showing what's new and what's resolved. Enable with <em>digest_enabled: true</em> in add-on options. "Run digest" button in the Conflicts tab for on-demand runs.</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:6px 10px; border:1px solid #ccc;"><s>Stale host message noise</s> ✓</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;"><strong>Done (v1.17.1).</strong> The reconciler now keeps only the most recent host schedule message per cleaner/date, so old WhatsApp schedules no longer generate phantom conflicts.</td>
+    </tr>
+    <tr>
+      <td style="padding:6px 10px; border:1px solid #ccc;">Duplicate fact assertions</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;">If you said "Itzel, May 19" in two different messages, that's currently two separate facts instead of one. Not painful yet, so deferred.</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:6px 10px; border:1px solid #ccc;">Jokey/narrative host messages</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;">Claude sometimes over-reads casual messages from you in the group chat as scheduling assertions. Fix: mark the host's phone number in config so those messages are interpreted differently.</td>
+    </tr>
+    <tr>
+      <td style="padding:6px 10px; border:1px solid #ccc;">First-run notify queue flood</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;">When first installed, every assigned booking looks "new" because there's no record of it having been communicated. Need a one-time "trust what's already here" button.</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:6px 10px; border:1px solid #ccc;">Dedicated bot WhatsApp account</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;">Currently using a personal phone number. Moving to a dedicated SpeakOut number (~$125/yr) would be cleaner. The re-pair procedure is documented but not done yet.</td>
+    </tr>
+    <tr>
+      <td style="padding:6px 10px; border:1px solid #ccc;">Automated UI tests</td>
+      <td style="padding:6px 10px; border:1px solid #ccc;">The notify queue, Conflicts tab, WhatsApp review flow, and backfill pages aren't covered by end-to-end tests yet.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines"><div></div><div></div><div></div><div></div><div></div><div></div></div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CATCH-ALL
+     ══════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>11. General Notes</h2>
+
+<div class="notes">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+    <div></div><div></div><div></div><div></div>
+    <div></div><div></div><div></div><div></div>
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<br>
+<p style="font-size:8pt; color:#aaa; text-align:center; margin-top:20px;">
+  Cleaning Schedule Tracker — Plain English Overview — 2026-05-06
+</p>
+
+</body>
+</html>

@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cleaning Schedule Add-on — Retrospective</title>
+<style>
+  /* ── Base ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 11pt;
+    line-height: 1.55;
+    color: #111;
+    background: #fff;
+    padding: 0.6in 0.75in;
+    max-width: 8.5in;
+    margin: 0 auto;
+  }
+
+  /* ── Typography ── */
+  h1 { font-size: 20pt; border-bottom: 3px solid #111; padding-bottom: 6px; margin-bottom: 4px; }
+  h2 { font-size: 14pt; margin-top: 28px; margin-bottom: 6px; border-bottom: 1.5px solid #555; padding-bottom: 3px; }
+  h3 { font-size: 11pt; margin-top: 14px; margin-bottom: 4px; font-style: italic; }
+  p  { margin-bottom: 8px; }
+  ul { margin-left: 18px; margin-bottom: 8px; }
+  li { margin-bottom: 3px; }
+  code { font-family: 'Courier New', monospace; font-size: 9.5pt; background: #f2f2f2; padding: 1px 3px; border-radius: 2px; }
+  strong { font-weight: bold; }
+
+  /* ── Notes block ── */
+  .notes {
+    margin-top: 14px;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    padding: 8px 10px 4px;
+    background: #fafafa;
+  }
+  .notes-label {
+    font-size: 8pt;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #888;
+    margin-bottom: 4px;
+  }
+  .lines { margin-top: 4px; }
+  .lines div {
+    border-bottom: 1px solid #ccc;
+    height: 22px;
+  }
+
+  /* ── Flow diagram ── */
+  .diagram {
+    font-family: 'Courier New', monospace;
+    font-size: 8.5pt;
+    line-height: 1.5;
+    background: #f8f8f8;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 14px 18px;
+    margin: 14px 0;
+    white-space: pre;
+    overflow-x: auto;
+  }
+
+  /* ── Tag pill ── */
+  .pill {
+    display: inline-block;
+    font-size: 8pt;
+    font-family: monospace;
+    background: #e8e8e8;
+    border: 1px solid #bbb;
+    border-radius: 10px;
+    padding: 0 7px;
+    margin: 1px 2px;
+    white-space: nowrap;
+  }
+
+  /* ── Severity colours ── */
+  .sev-attention { color: #b00; font-weight: bold; }
+  .sev-suggest   { color: #840; }
+  .sev-info      { color: #448; }
+
+  /* ── Section separator ── */
+  .page-break { page-break-before: always; }
+
+  /* ── Print overrides ── */
+  @media print {
+    body { padding: 0.5in 0.6in; font-size: 10.5pt; }
+    .diagram { font-size: 8pt; }
+    .notes { background: #fff; }
+    a { text-decoration: none; color: #111; }
+    h2 { page-break-after: avoid; }
+    h3 { page-break-after: avoid; }
+    .no-break { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Cleaning Schedule Add-on — System Retrospective</h1>
+<p style="color:#555; font-size:9.5pt; margin-bottom:16px;">
+  Generated 2026-05-06 &nbsp;·&nbsp; Version 1.17.x &nbsp;·&nbsp;
+  Working dir: <code>cleaning-schedule-addon/</code>
+</p>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 1 — BIG PICTURE
+     ════════════════════════════════════════════════════════ -->
+<h2>1. Purpose &amp; Philosophy</h2>
+<p>
+  A <strong>Home Assistant add-on</strong> that tracks Airbnb property cleaning schedules.
+  It syncs bookings from an Airbnb iCal feed, assigns cleaners to checkout dates,
+  and uses <strong>Claude Haiku</strong> to interpret WhatsApp conversations with cleaners —
+  detecting confirmations, declines, and time proposals automatically.
+</p>
+<p>
+  <strong>Design principle:</strong> the add-on is the <em>brain</em>;
+  Google Calendar is the <em>shared view</em>.
+  <code>data.json</code> is the single source of truth.
+  GCal is a one-way projection for Michelle and the cleaners to see.
+  The UI handles everything GCal can't: per-cleaner notify queues, WhatsApp review,
+  and conflict detection.
+</p>
+
+<h3>The four data sources the reconciler joins</h3>
+<ul>
+  <li><strong>Airbnb iCal</strong> — the booking calendar (fetched live).</li>
+  <li><strong>data.json bookings</strong> — local state: assignments, cleaner commitments, custom entries.</li>
+  <li><strong>Google Calendar</strong> — the projected shared view (compared for drift).</li>
+  <li><strong>WhatsApp archive</strong> — message facts extracted by Claude Haiku.</li>
+</ul>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     MASTER FLOW DIAGRAM
+     ════════════════════════════════════════════════════════ -->
+<h2>2. System Flow Diagram</h2>
+<div class="diagram">
+EXTERNAL INPUTS
+───────────────────────────────────────────────────────────────────────────
+  Airbnb iCal URL                 WhatsApp Bridge add-on
+  (private token URL)             (Baileys linked device, host_network)
+        │                                    │
+        │  POST /sync                        │  POST /internal/whatsapp/inbound
+        ▼                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          app.py  (Flask)                                 │
+│                                                                          │
+│  sync_ical()                    whatsapp_inbound()                       │
+│  ─ fetch + parse iCal           ─ dedup on msg id                        │
+│  ─ merge into bookings          ─ enqueue to 2-thread worker pool        │
+│  ─ cancelled → status="cancelled"         │                              │
+│          │                                ▼                              │
+│          │                      process_message(msg_id)                  │
+│          │                      ┌─────────────────────────────────┐      │
+│          │                      │  TWO parallel Haiku calls:      │      │
+│          │                      │  1) parse_whatsapp_message()    │      │
+│          │                      │     → routing: one booking      │      │
+│          │                      │  2) facts.extract_facts()       │      │
+│          │                      │     → all scheduling assertions │      │
+│          │                      └─────────┬───────────────────────┘      │
+│          │                                │                              │
+│          │                       confidence ≥ 0.85                       │
+│          │                       + known JID + known booking?            │
+│          │                       Yes ──► auto-apply to booking           │
+│          │                       No  ──► pending Review tab              │
+│          │                                │                              │
+│          ▼                                ▼                              │
+│                     data.json  (single source of truth)                  │
+│        ┌─────────────────────────────────────────────────────┐           │
+│        │  bookings   messages   message_facts   cleaner_jids │           │
+│        │  group_labels   dismissed_findings                  │           │
+│        └──────────────────────────┬──────────────────────────┘           │
+│                                   │                                      │
+│          ┌────────────────────────┼──────────────────────┐               │
+│          │                        │                      │               │
+│          ▼                        ▼                      ▼               │
+│   gcal.py                   reconcile.py           notify queue          │
+│   sync_to_gcal()            run()                  review_queue()        │
+│   ─ diff desired vs         ─ 6 detectors          ─ cleaner_commitment  │
+│     existing GCal events    ─ ranked findings        drift detection     │
+│   ─ insert/patch/delete     ─ cached to             ─ paginated UI card  │
+│   ─ drift signal (⚠️/red)    reconciler_last.json   ─ "Mark notified"    │
+│          │                        │                      │               │
+└──────────┼────────────────────────┼──────────────────────┼───────────────┘
+           │                        │                      │
+           ▼                        ▼                      ▼
+    Google Calendar           Conflicts tab           Notify tab
+    (shared with              (/#conflicts)           (/ home)
+     Michelle + cleaners)
+
+ALTERNATE INGEST PATHS
+───────────────────────────────────────────────────────────────────────────
+  /backfill (GET/POST)                /admin/ingest-transcript (POST)
+  ─ paste WhatsApp export             ─ paste raw transcript text
+  ─ Haiku returns per-booking         ─ parse into messages log
+    proposals (cleaner + time)        ─ run facts extraction
+  ─ review page → apply               ─ idempotent (stable ids)
+  ─ ack_notified(via="backfill")      ─ progress via /admin/ingest-status
+
+ADMIN / MAINTENANCE
+───────────────────────────────────────────────────────────────────────────
+  /admin/reprocess-facts   re-extract stale-prompt messages (batch)
+  /admin/fix-parse-errors  reset 429-errored messages → pending
+  /admin/remap-group       bulk rewrite group JIDs + labels
+  /reconcile/dismiss       human marks finding resolved out-of-band
+  /digest/run              trigger daily digest → HA notification
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 3 — FILES
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>3. File Map</h2>
+
+<div class="no-break">
+<h3>cleaning-tracker/app.py (~3,076 lines) — the whole application</h3>
+<p>Single-file Flask app. Every route, template (inline Jinja2 strings), business logic,
+worker threads, and helper functions live here. Key areas:</p>
+<ul>
+  <li><strong>Bootstrap</strong> (lines 1–200): <code>load_options()</code>, <code>load_data()</code>, <code>save_data()</code>, <code>ingress_prefix()</code></li>
+  <li><strong>iCal sync</strong>: <code>sync_ical()</code></li>
+  <li><strong>Haiku parse</strong>: <code>parse_whatsapp_message()</code></li>
+  <li><strong>Worker pool</strong>: <code>enqueue_message()</code>, <code>_message_worker()</code>, <code>process_message()</code></li>
+  <li><strong>Notify queue</strong>: <code>review_item()</code>, <code>needs_notify()</code>, <code>review_queue()</code>, <code>ack_notified()</code>, <code>build_focus_context()</code></li>
+  <li><strong>Reconciler glue</strong>: <code>_fetch_ical_events()</code>, <code>_run_full_reconcile()</code>, <code>_rerun_reconcile_cached()</code></li>
+  <li><strong>Digest</strong>: <code>_digest_compute_and_notify()</code>, <code>_digest_scheduler()</code></li>
+  <li><strong>Transcript ingest</strong>: <code>_parse_whatsapp_transcript()</code>, <code>_ingest_worker()</code></li>
+  <li><strong>Backfill</strong>: <code>_backfill_haiku()</code>, routes <code>/backfill</code> + <code>/backfill/apply</code></li>
+  <li><strong>Print view</strong>: <code>build_print_data()</code>, <code>/print</code></li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>cleaning-tracker/facts.py (207 lines) — structured fact extraction</h3>
+<p>Separate Haiku call that extracts <em>every</em> scheduling assertion in a message
+(confirm, decline, time_proposal, date_proposal, schedule_assertion, unclear).
+Results stored in <code>data.message_facts</code>, versioned by <code>FACTS_PROMPT_VERSION</code> (currently <code>facts-v2</code>).</p>
+<ul>
+  <li><code>extract_facts()</code> — calls Haiku with role-tagged history (host/cleaner), retries 429/5xx with exponential backoff.</li>
+  <li><code>_facts_history()</code> — caps at last 30 messages from the same group to avoid TPM budget exhaustion.</li>
+  <li><code>build_record()</code> — shapes raw Haiku output into the stored record format.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>cleaning-tracker/gcal.py (361 lines) — Google Calendar projection</h3>
+<p>One-way sync: <code>data.json → GCal</code>. Never reads GCal to make decisions — only to diff for sync.</p>
+<ul>
+  <li><code>sync_to_gcal()</code> — diffs desired events against tagged existing events; insert/patch/delete. Module-level lock prevents race-condition duplicates.</li>
+  <li><code>_desired_events()</code> — builds the target event list. Drift bookings get <code>colorId=11</code> (red) + ⚠️ prefix.</li>
+  <li><code>fetch_tagged_events()</code> — used by reconciler to snapshot GCal state.</li>
+  <li>All events tagged with <code>extendedProperties.private.source="cleaning-tracker"</code>.</li>
+  <li>Auth: service account JSON (no OAuth, no refresh tokens).</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>cleaning-tracker/reconcile.py (494 lines) — pure-function detectors</h3>
+<p>Takes <code>data.json</code> + iCal events + GCal events → returns ranked findings list.
+No side effects; all writes happen in <code>app.py</code>.</p>
+<ul>
+  <li><code>run()</code> — calls all 6 detectors, deduplicates by stable id, sorts by severity.</li>
+  <li><code>filter_and_sort()</code> — strips dismissed findings (used after dismiss/undismiss without re-fetching).</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 4 — DATA MODEL
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>4. Data Model (<code>/data/data.json</code>)</h2>
+<p>No database. Everything lives in one JSON file. Lazily backfilled on read — all fields are additive.</p>
+
+<div class="no-break">
+<h3>bookings (keyed by UID)</h3>
+<ul>
+  <li><code>type</code>: <code>"airbnb"</code> | <code>"custom_stay"</code> | <code>"manual_cleaning"</code></li>
+  <li><code>start</code>, <code>end</code>: ISO dates. <code>end</code> is exclusive (Airbnb convention).</li>
+  <li><code>status</code>: <code>"active"</code> | <code>"cancelled"</code> | <code>"complete"</code></li>
+  <li><code>cleaner</code>: assigned cleaner name or null.</li>
+  <li><code>clean_time</code>: <code>"HH:MM:SS"</code> or null. Shown in calendar titles.</li>
+  <li><code>cleaner_commitment</code>: snapshot of what the cleaner was told:
+    <code>{cleaner, date, clean_time, communicated_at, communicated_via}</code>.
+    Absent on legacy/freshly-assigned bookings → appears in notify queue as "new".
+    Drift between this and current truth drives the notify queue and GCal ⚠️ signal.</li>
+  <li><code>notes</code>: free-text (legacy <code>"Time: HH:MM AM"</code> prefix auto-backfilled into <code>clean_time</code>).</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>messages (inbound WhatsApp log)</h3>
+<p>Each entry: <code>{id, timestamp, sender, group, text, parsed, applied_uid, review_state, haiku_result?, source?, sender_name_raw?}</code></p>
+<ul>
+  <li><code>review_state</code>: <code>"auto"</code> (applied automatically) | <code>"pending"</code> (needs human review) | <code>"ignored"</code></li>
+  <li><code>source: "backfill"</code> + <code>haiku_result.backfill_ingest=true</code> = facts-only ingest, never shown in Review tab.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>message_facts (keyed by message id)</h3>
+<p><code>{facts: [...], reported_by_jid, model_version, prompt_version, extracted_at}</code></p>
+<p>Each fact: <code>{kind, target_date, target_time, cleaner, confidence, tentative, evidence}</code></p>
+<p>Kinds: <span class="pill">confirm</span> <span class="pill">decline</span> <span class="pill">time_proposal</span> <span class="pill">date_proposal</span> <span class="pill">schedule_assertion</span> <span class="pill">unclear</span></p>
+<p>Reconciler reads only records matching <code>FACTS_PROMPT_VERSION</code> — half-reprocessed state is safe.</p>
+</div>
+
+<div class="no-break">
+<h3>Other top-level keys</h3>
+<ul>
+  <li><code>cleaner_jids</code>: <code>{jid: cleaner_name}</code> — built from Review-tab mappings.</li>
+  <li><code>group_labels</code>: <code>{group_jid: label}</code> — human-readable group names for the UI.</li>
+  <li><code>dismissed_findings</code>: <code>{finding_id: {dismissed_at, reason}}</code> — reconciler findings a human marked resolved.</li>
+</ul>
+<p><strong>Separate file:</strong> <code>/data/reconciler_last.json</code> — cached reconciler output (not in <code>data.json</code>).
+Stores <code>findings_raw</code> (pre-dismiss) and <code>findings</code> (post-filter).</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 5 — UI ROUTES
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>5. UI Routes &amp; Pages</h2>
+
+<div class="no-break">
+<h3>/ (home — three tabs)</h3>
+<ul>
+  <li><strong>Notify tab</strong> (default): One cleaner at a time. Cards show bookings whose <code>cleaner_commitment</code> diverges from truth. Kinds: <em>new</em> (no commitment), <em>changed</em> (drifted), <em>cancelled</em> (post-commitment cancellation). Unassigned bucket shown separately. <code>?i=N</code> paginates cleaner buckets. "Mark notified" writes commitment for the whole cleaner-batch.</li>
+  <li><strong>WhatsApp Review tab</strong> (<code>#review</code>): Pending messages. Accept / override / ignore. Map unknown senders to cleaners. Label groups.</li>
+  <li><strong>Conflicts tab</strong> (<code>#conflicts</code>): Cached reconciler findings grouped by severity. One-click: Assign, Edit booking, Dismiss. Badge = needs-attention count.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Booking management</h3>
+<ul>
+  <li><code>/add</code> — radio: Cleaning vs Stay. Stays need start+end; cleanings take one date + optional cleaner + time.</li>
+  <li><code>/edit/&lt;uid&gt;</code> — edit cleaner, notes, clean_time. Cancelled → Dismiss button. Custom/manual → Delete.</li>
+  <li><code>/assign/&lt;uid&gt;</code> — write cleaner + clean_time (clears if blank).</li>
+  <li><code>/delete/&lt;uid&gt;</code> — soft delete (marks cancelled or removes from data).</li>
+  <li><code>/sync</code> (POST) — trigger iCal sync manually.</li>
+  <li><code>/gcal/sync</code> (POST) — trigger GCal sync manually.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Backfill &amp; ingest</h3>
+<ul>
+  <li><code>/backfill</code> — paste a WhatsApp chat export. Haiku returns per-booking proposals. Review + apply page.</li>
+  <li><code>/admin/ingest</code> — paste raw transcript. Parses into messages log, runs facts extraction. Progress via <code>/admin/ingest-status</code>.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Print &amp; utility</h3>
+<ul>
+  <li><code>/print?month=YYYY-MM</code> — hand-rolled HTML table, print-optimized CSS. Shows stays (colour bars) + cleaner+time on checkout cells.</li>
+  <li><code>/internal/snapshot</code> — returns full <code>data.json</code> + reconciler cache (used by off-host reconcile script).</li>
+  <li><code>/digest/run</code> — trigger daily digest manually. Posts HA notification.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Reconcile routes</h3>
+<ul>
+  <li><code>POST /reconcile/run</code> — recompute + persist. Accepts form post (redirects) or JSON.</li>
+  <li><code>GET /reconcile/last</code> — serve cached JSON.</li>
+  <li><code>POST /reconcile/dismiss</code> + <code>/reconcile/undismiss</code> — toggle dismissed state, re-filter cache.</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 6 — WHATSAPP PIPELINE
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>6. WhatsApp Pipeline</h2>
+
+<div class="no-break">
+<h3>6a. WhatsApp Bridge add-on (<code>whatsapp-bridge/</code>)</h3>
+<p>A separate HA add-on running <strong>Baileys</strong> (Node.js). Pairs as a WhatsApp linked device via QR scan.</p>
+<ul>
+  <li>Uses <code>host_network: true</code> → reaches cleaning tracker at <code>http://127.0.0.1:5000</code> (loopback, no shared secret needed).</li>
+  <li>Forwards <strong>all group messages</strong> including host's own outbound (<code>fromMe: true</code> is NOT filtered — both sides reach the facts layer).</li>
+  <li>Read-only: never calls <code>sendMessage</code>.</li>
+  <li>Filters: non-group dropped, group not in <code>group_allowlist</code> dropped, empty text dropped.</li>
+  <li>Auth state persists in <code>/data/auth/</code> across restarts. Subsequent starts reconnect automatically.</li>
+  <li>On first connect: logs all visible groups with JIDs → use Log tab to populate <code>group_allowlist</code>.</li>
+  <li>Startup backfill option (<code>backfill_per_group</code>): returns zero in practice on reconnects — WhatsApp doesn't replay history for caught-up devices. Use transcript ingest for deep history.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>6b. Live inbound pipeline</h3>
+<div class="diagram" style="white-space:pre-wrap;">POST /internal/whatsapp/inbound
+  │
+  ├─ dedup: id already in messages? → 200 early-return
+  ├─ auth: loopback? ✓  non-loopback needs X-Shared-Secret header
+  │
+  └─ enqueue_message(msg_id) → 2-thread worker pool
+       │
+       └─ process_message(msg_id)
+            ├─ _parse_history() → last N messages (full history, same group)
+            ├─ _facts_history() → last 30 messages (same group)
+            │
+            ├─ [Thread A] parse_whatsapp_message()  ← routing Haiku call
+            │    Input: message + history + bookings + cleaners + labels
+            │    Output: {uid, cleaner, action, confidence, evidence}
+            │
+            └─ [Thread B] facts.extract_facts()     ← facts Haiku call
+                 Input: message + 30-msg history + cleaners + labels
+                 Output: [{kind, target_date, cleaner, confidence, …}]
+                 Stored → data.message_facts[msg_id]
+
+After both calls:
+  confidence ≥ 0.85 AND known cleaner JID AND known booking?
+    YES → _apply_booking_change() → auto review_state="auto"
+    NO  → review_state="pending" → appears in Review tab
+</div>
+</div>
+
+<div class="no-break">
+<h3>6c. Backfill flow (<code>/backfill</code>)</h3>
+<ul>
+  <li>User pastes WhatsApp export. Haiku receives transcript + all active unassigned bookings + known cleaners + optional group hint.</li>
+  <li>Returns per-booking proposals: <code>{uid, cleaner, clean_time, confidence, evidence}</code>.</li>
+  <li>Review page: confidence-coloured borders (green ≥ 0.85 / yellow 0.6–0.85 / red &lt; 0.6), editable fields, checkbox pre-ticked at ≥ 0.85.</li>
+  <li>On apply: writes assignments, calls <code>ack_notified(via="backfill")</code> → skips notify queue.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>6d. Transcript ingest (<code>/admin/ingest-transcript</code>)</h3>
+<ul>
+  <li>Parses three timestamp formats: <code>[YYYY-MM-DD, HH:MM:SS AM/PM]</code>, <code>[H:MM AM/PM, M/D/YYYY]</code>, Android <code>YYYY-MM-DD, H:MM a.m./p.m. - Sender: text</code>.</li>
+  <li>Stable ids (<code>backfill-sha1(ts|sender|text)[:16]</code>) — re-runs are idempotent and dedup against live messages.</li>
+  <li>Runs facts extraction (or full <code>process_message</code> if <code>apply=true</code>) in a background thread.</li>
+  <li>Progress polled via <code>/admin/ingest-status</code>.</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 7 — FACTS LAYER
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>7. Facts Layer (<code>facts.py</code>)</h2>
+
+<p>
+  The facts layer answers a different question than the parse layer.
+  <strong>Parse</strong> asks: "route this single message to one booking?"
+  <strong>Facts</strong> asks: "list every date/cleaner/time assertion in this message."
+</p>
+
+<div class="no-break">
+<h3>Fact kinds</h3>
+<ul>
+  <li><span class="pill">confirm</span> — cleaner confirms a date (cleaner-only)</li>
+  <li><span class="pill">decline</span> — cleaner declines a date (cleaner-only)</li>
+  <li><span class="pill">time_proposal</span> — cleaner proposes a time (cleaner-only)</li>
+  <li><span class="pill">date_proposal</span> — cleaner proposes an alternative date (cleaner-only)</li>
+  <li><span class="pill">schedule_assertion</span> — host states who cleans what date (host-only)</li>
+  <li><span class="pill">unclear</span> — ambiguous</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Key design decisions</h3>
+<ul>
+  <li><strong>Role-tagged history:</strong> each history line labelled <code>&lt;host&gt;</code> or <code>&lt;cleaner:Name&gt;</code>. Haiku uses role to determine allowed fact kinds (e.g. host can't produce a <code>confirm</code>).</li>
+  <li><strong>Re-posted-list recognition:</strong> when a cleaner re-posts a full schedule list, it's treated as re-confirmation of all listed dates. This is the dominant real-chat pattern.</li>
+  <li><strong>History window (30 messages):</strong> only last 30 messages from the same group are sent. Prevents TPM budget exhaustion on bulk reprocess (a previous stalled ingest hit 284/952 over 5 hours before the cap was added).</li>
+  <li><strong>Versioning:</strong> <code>FACTS_PROMPT_VERSION = "facts-v2"</code> stamps every record. Reconciler reads only current-version records — safe to bump and reprocess incrementally.</li>
+  <li><strong>Rate-limit handling:</strong> exponential backoff honouring <code>retry-after</code>. Bulk ingest paced at 0.8s/call.</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 8 — RECONCILER
+     ════════════════════════════════════════════════════════ -->
+<h2>8. Reconciler (<code>reconcile.py</code>)</h2>
+
+<p>Pure-function. Takes data as arguments, returns findings. No side effects. All 6 detectors are shipped.</p>
+
+<div class="no-break">
+<h3>Severity tiers</h3>
+<ul>
+  <li class="sev-attention">needs-attention — drift, decline-still-assigned, contested cleaner, schedule mismatch</li>
+  <li class="sev-suggest">suggest — unrecorded confirmation, schedule vs unassigned booking</li>
+  <li class="sev-info">informational — confirm with no booking, changed-mind timeline</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Detectors</h3>
+<ul>
+  <li><strong>_ical_vs_bookings</strong>: Airbnb iCal ↔ bookings. Emits: <code>ical_missing_booking</code>, <code>booking_not_in_ical</code>, <code>ical_date_mismatch</code>, <code>ical_resurrected</code>.</li>
+  <li><strong>_bookings_vs_gcal</strong>: bookings ↔ GCal. Emits: <code>gcal_missing_event</code>, <code>gcal_stale_event</code>, <code>gcal_orphan</code>. Only runs when <code>gcal_enabled</code>.</li>
+  <li><strong>_drift</strong>: reshapes notify queue into findings (new / changed / cancelled / unassigned).</li>
+  <li><strong>_facts_vs_bookings</strong>: confirm/decline facts ↔ booking state. Emits: <code>unrecorded_confirmation</code>, <code>contested_cleaner</code>, <code>decline_still_assigned</code>, <code>confirm_no_booking</code>.</li>
+  <li><strong>_fact_timeline</strong>: <code>changed_mind</code> when a cleaner said both confirm and decline on the same date (latest wins).</li>
+  <li><strong>_schedule_vs_bookings</strong>: host <code>schedule_assertion</code> ↔ booking cleaner. Emits: <code>schedule_mismatch</code>, <code>schedule_unassigned</code>.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Known issues / noise</h3>
+<ul>
+  <li>Detector 6 (<code>_schedule_vs_bookings</code>) doesn't collapse stale host assertions. Old host messages generate <code>schedule_mismatch</code> noise. A latest-wins pass over <code>(cleaner, target_date)</code> by message timestamp would fix it.</li>
+  <li>Facts dedup: nothing collapses duplicate assertions across messages. Reconciler groups by <code>(cleaner, target_date)</code> in <code>_fact_timeline</code> + <code>_schedule_vs_bookings</code> but not across detectors.</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 9 — GCAL PROJECTION
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>9. Google Calendar Projection (<code>gcal.py</code>)</h2>
+
+<div class="no-break">
+<h3>Philosophy</h3>
+<p>GCal is a <strong>read-only view for humans</strong>. The add-on never reads GCal to make decisions — only to diff for sync. Cleaners confirm via WhatsApp, not by editing the calendar.</p>
+</div>
+
+<div class="no-break">
+<h3>How sync works</h3>
+<ul>
+  <li><code>sync_to_gcal()</code> builds the desired event list, lists existing events tagged with <code>source="cleaning-tracker"</code>, then insert/patch/deletes to converge.</li>
+  <li><strong>Serialized</strong> with a module-level lock — concurrent calls skip and return <code>{"skipped": 1}</code>. Prevents race-condition duplicates when <code>save_data()</code> fires many times in a row during iCal sync.</li>
+  <li><strong>Dedupes on the fly</strong>: <code>_list_existing</code> deletes any duplicate events (same UID tag, multiple events) at the start of each sync.</li>
+  <li>Triggered via <code>save_data()</code> in a daemon thread (fire-and-forget; GCal outages don't block local writes).</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Event rules</h3>
+<ul>
+  <li><strong>Cleaning events always timed</strong> (never all-day). Default 11:00 AM–1:00 PM when <code>clean_time</code> unset. Otherwise from <code>clean_time</code> for 2 hours.</li>
+  <li><strong>Timezone:</strong> <code>America/Vancouver</code> (constant <code>LOCAL_TZ</code> in gcal.py).</li>
+  <li><strong>Drift signal:</strong> cleaning events with unresolved drift get <code>colorId=11</code> (red) + ⚠️ prefix. Resolves on next sync after "Mark notified".</li>
+  <li><strong>Cleaner colour:</strong> md5-hashed onto 9 palette slots (slot 8 reserved for cancelled, 11 for drift/unassigned).</li>
+  <li><strong>Cancelled bookings:</strong> omitted from desired events (deleted from GCal) <em>unless</em> the cleaner has an unacknowledged commitment — then a red ❌ Cancelled event is kept until commitment cleared.</li>
+  <li><strong>Auth:</strong> service account JSON. No OAuth, no refresh-token expiry. Share calendar with service account email at "Make changes to events".</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 10 — NOTIFY QUEUE LOGIC
+     ════════════════════════════════════════════════════════ -->
+<h2>10. Notify Queue Logic</h2>
+
+<div class="no-break">
+<h3>What drives the queue</h3>
+<p>A booking enters the queue when its <code>cleaner_commitment</code> diverges from current truth. The "truth tuple" is <code>(cleaner, checkout_date, clean_time)</code>. The "commit tuple" is the same fields from <code>cleaner_commitment</code>.</p>
+<ul>
+  <li><strong>new</strong>: cleaner assigned, no commitment exists.</li>
+  <li><strong>changed</strong>: commitment exists but one of the three fields differs.</li>
+  <li><strong>cancelled</strong>: booking cancelled after commitment was written.</li>
+  <li><strong>unassigned</strong>: active Airbnb booking with no cleaner at all → separate bucket at top of page.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Resolution</h3>
+<p>"Mark notified" (<code>POST /review/notify/&lt;slug&gt;</code>) calls <code>ack_notified(booking, via="manual")</code> for every booking in the cleaner's bucket. This writes a fresh <code>cleaner_commitment</code> matching current truth, removing the drift. Unit of work is <strong>one cleaner = one WhatsApp message</strong>. No per-line ticking.</p>
+<p>WhatsApp auto-apply writes <code>communicated_via="whatsapp"</code>; backfill apply writes <code>communicated_via="backfill"</code>. Both have the same effect as "Mark notified".</p>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 11 — AUTH & DEPLOYMENT
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>11. Auth &amp; Deployment</h2>
+
+<div class="no-break">
+<h3>Auth model (<code>_require_local_or_secret()</code>)</h3>
+<p>Used for all <code>/admin/*</code>, <code>/internal/*</code>, and <code>/reconcile/*</code> routes. Accepts any of:</p>
+<ul>
+  <li><strong>Loopback</strong> — <code>127.0.0.1</code> (WhatsApp Bridge calls, local scripts).</li>
+  <li><strong>HA ingress</strong> — presence of <code>X-Ingress-Path</code> header (Supervisor proxy stamps it; the browser uses this path).</li>
+  <li><strong>Shared secret</strong> — <code>X-Shared-Secret</code> matching <code>whatsapp_shared_secret</code> option (off-host callers).</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Deployment</h3>
+<ul>
+  <li>Installed via HA custom repository URL. Add-on Store → Repositories → paste URL → Install.</li>
+  <li>Updates: bump <code>version</code> in <code>config.yaml</code>, push to GitHub, refresh in HA. <strong>Always bump on every push</strong> — Supervisor caches configs.</li>
+  <li><code>init: false</code> in <code>config.yaml</code> required (s6-overlay conflict with bare <code>CMD</code>).</li>
+  <li>Port 5000 exposed on LAN for off-host tooling (<code>reconcile_pull.py</code>, etc.).</li>
+  <li>Dockerfile: <code>python:3.12-slim</code> hardcoded (HA's <code>BUILD_FROM</code> arg pattern didn't work — Supervisor wasn't passing it through).</li>
+  <li>Do NOT use Samba for development on HAOS from Windows — SMB write caching makes files stale.</li>
+</ul>
+</div>
+
+<div class="no-break">
+<h3>Add-on options</h3>
+<ul>
+  <li><code>ical_url</code> — Airbnb iCal URL (private token — never commit)</li>
+  <li><code>anthropic_api_key</code> — Claude Haiku key (password type)</li>
+  <li><code>cleaners</code> — list of cleaner names (used for dropdowns + JID mapping)</li>
+  <li><code>gcal_enabled</code>, <code>gcal_calendar_id</code>, <code>gcal_service_account_json</code></li>
+  <li><code>whatsapp_shared_secret</code> — only needed for non-loopback callers</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 12 — OPEN QUESTIONS / DEFERRED
+     ════════════════════════════════════════════════════════ -->
+<h2>12. Open Questions &amp; Deferred Work</h2>
+
+<div class="no-break">
+<table style="width:100%; border-collapse:collapse; font-size:10pt;">
+  <thead>
+    <tr style="background:#eee;">
+      <th style="text-align:left; padding:5px 8px; border:1px solid #ccc;">Item</th>
+      <th style="text-align:left; padding:5px 8px; border:1px solid #ccc;">Status</th>
+      <th style="text-align:left; padding:5px 8px; border:1px solid #ccc;">Blocker</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Reconciler daily digest (Step 3)</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Deferred</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Detector 6 noise (stale host assertions)</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:5px 8px; border:1px solid #ccc;">Detector 6 latest-wins collapse</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Not started</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">—</td>
+    </tr>
+    <tr>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Facts dedup across messages</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Deferred</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Not painful enough yet</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:5px 8px; border:1px solid #ccc;">Josh-as-host signal (jokey messages)</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Deferred</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Allowlist host in config</td>
+    </tr>
+    <tr>
+      <td style="padding:5px 8px; border:1px solid #ccc;">First-run notify-queue noise (legacy data)</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Deferred</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">One-shot "trust current state" admin action</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:5px 8px; border:1px solid #ccc;">Playwright coverage (notify queue, Conflicts tab)</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Not started</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">—</td>
+    </tr>
+    <tr>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Bot account swap to SpeakOut number</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Pending</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">$125/yr registration + re-pair procedure</td>
+    </tr>
+    <tr style="background:#fafafa;">
+      <td style="padding:5px 8px; border:1px solid #ccc;">Resolved-notify audit log</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Rejected (MVP)</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">—</td>
+    </tr>
+    <tr>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Retire /print route</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Rejected</td>
+      <td style="padding:5px 8px; border:1px solid #ccc;">Michelle still uses it</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 13 — SCRIPTS
+     ════════════════════════════════════════════════════════ -->
+<div class="page-break"></div>
+<h2>13. Scripts (not shipped in add-on image)</h2>
+
+<div class="no-break">
+<ul>
+  <li><code>scripts/reconcile_pull.py</code> — off-host puller. Hits <code>/internal/snapshot</code> on port 5000, downloads full data, runs reconciler locally. Used by the <code>reconcile-cleaning-schedule</code> Claude skill.</li>
+  <li><code>scripts/gcal_auth.py</code> — validates a GCal service-account key, prints the email to share with, and runs a test event insert/delete.</li>
+  <li><code>scripts/fix_parse_errors.py</code> — resets messages stuck in a 429-error parse state back to pending. Superseded by <code>/admin/fix-parse-errors</code> route but kept as a standalone fallback.</li>
+</ul>
+</div>
+
+<div class="notes no-break">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SECTION 14 — GENERAL NOTES
+     ════════════════════════════════════════════════════════ -->
+<h2>14. General / Catch-all Notes</h2>
+
+<div class="notes">
+  <div class="notes-label">Notes</div>
+  <div class="lines">
+    <div></div><div></div><div></div><div></div>
+    <div></div><div></div><div></div><div></div>
+    <div></div><div></div><div></div><div></div>
+  </div>
+</div>
+
+<br>
+<p style="font-size:8pt; color:#aaa; text-align:center; margin-top:20px;">
+  Cleaning Schedule Tracker — System Retrospective — 2026-05-06
+</p>
+
+</body>
+</html>
