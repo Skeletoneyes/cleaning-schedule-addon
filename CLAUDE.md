@@ -330,6 +330,19 @@ Auth for all `/admin/*` and `/internal/snapshot` routes goes through
 of `X-Ingress-Path` header the Supervisor proxy stamps), or matching
 `X-Shared-Secret`.
 
+### Disaster recovery — `POST /internal/restore` (1.18.0)
+Inverse of `/internal/snapshot`: repopulates `/data/data.json` after a host
+wipe or fresh install. The add-on's `/data` is a private volume with no `map:`,
+so it can't be written from outside (e.g. an SSH session) — this endpoint is
+the only way to inject a full snapshot back in. Same auth as `/internal/snapshot`
+(loopback open; remote callers present `X-Shared-Secret`). Body is the bare
+`data` object **or** a `{"data": {...}}` wrapper, so a `/internal/snapshot`
+response replays verbatim. It moves the existing file to `data.json.bak`, writes
+via `save_data()` (so GCal re-syncs), and returns post-restore counts. After
+restoring, hit `POST /sync` to merge any feed reservations newer than the
+snapshot (assignments are preserved by UID). Snapshot backups live in the repo
+at `.secrets/pulls/<ts>/ha_snapshot.json`.
+
 ### WhatsApp — Bridge HA add-on (`whatsapp-bridge/`, shipped 1.0.x)
 - **Runs as a standalone HA add-on** alongside the cleaning tracker. Uses
   `host_network: true` so it reaches the cleaning tracker via
@@ -411,13 +424,28 @@ passed to every template as `{{ prefix }}`.
 
 ## Deployment
 
-Installed via HA custom repository:
-1. Add-ons > Add-on Store > Repositories > paste GitHub URL.
-2. Install "Cleaning Schedule Tracker".
-3. Configure options (iCal URL, API key, cleaners).
-4. Start — appears in sidebar as "Cleaning Schedule".
+Installed via HA custom repository. **Preferred: SSH CLI** (scriptable; the
+external long-lived token gets 401 on store/install endpoints, so the UI or the
+CLI are the only options):
+```bash
+SSH="ssh -p 22 -i ~/.ssh/id_ed25519_ha root@homeassistant.local"
+$SSH "ha store add-repository https://github.com/Skeletoneyes/cleaning-schedule-addon"
+$SSH "ha addons install 27cbea7f_cleaning-tracker && ha addons install 27cbea7f_whatsapp-bridge"
+# set options via the Supervisor API (full access from inside the session):
+$SSH 'curl -s -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" -H "Content-Type: application/json" \
+  --data @/tmp/opts.json http://supervisor/addons/27cbea7f_cleaning-tracker/options'
+$SSH "ha addons start 27cbea7f_cleaning-tracker"
+```
+Repo slug is `27cbea7f`; add-on slugs are `27cbea7f_cleaning-tracker` and
+`27cbea7f_whatsapp-bridge`. Or via the UI: Add-ons > Add-on Store >
+Repositories > paste the GitHub URL > install > configure options > start.
 
-Updates: bump `version` in `config.yaml`, push to GitHub, refresh in HA.
+Restore data after a wipe with `POST /internal/restore` (see Disaster recovery
+above) — the data volume is private, so you cannot just drop a file in `/data`
+over SSH.
+
+Updates: bump `version` in `config.yaml`, push to GitHub, then
+`ha store reload && ha addons update 27cbea7f_cleaning-tracker`.
 
 ## Important notes
 
