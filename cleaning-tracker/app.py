@@ -1907,6 +1907,52 @@ def internal_snapshot():
     })
 
 
+@app.route("/internal/restore", methods=["POST"])
+def internal_restore():
+    """Overwrite data.json with a posted full snapshot (disaster recovery).
+
+    Inverse of /internal/snapshot: used to repopulate /data after a host wipe
+    or fresh install, since the add-on's /data volume is private and cannot be
+    written from outside. Same auth model — loopback is open, remote callers
+    must present X-Shared-Secret.
+
+    Body is either the bare data object (a dict with a "bookings" map) or a
+    {"data": {...}} wrapper (so a /internal/snapshot response can be replayed
+    verbatim). The existing data.json is moved to data.json.bak first. Writes
+    go through save_data(), so the GCal projection re-syncs as usual.
+    """
+    remote = request.remote_addr or ""
+    if remote not in ("127.0.0.1", "::1"):
+        provided = request.headers.get("X-Shared-Secret", "")
+        if not WHATSAPP_SHARED_SECRET or provided != WHATSAPP_SHARED_SECRET:
+            abort(403)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    data = payload["data"] if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data.get("bookings"), dict):
+        return jsonify({"error": "missing bookings object"}), 400
+
+    with DATA_LOCK:
+        if DATA_FILE.exists():
+            try:
+                DATA_FILE.replace(DATA_FILE.with_name(DATA_FILE.name + ".bak"))
+            except OSError:
+                pass
+        save_data(data)
+        restored = load_data()
+
+    b = restored.get("bookings", {})
+    return jsonify({
+        "ok": True,
+        "bookings": len(b),
+        "assigned": sum(1 for v in b.values() if v.get("cleaner")),
+        "messages": len(restored.get("messages", [])),
+        "message_facts": len(restored.get("message_facts", {})),
+    })
+
+
 @app.route("/internal/whatsapp/inbound", methods=["POST"])
 def whatsapp_inbound():
     """Accept a single WhatsApp message from the Baileys sidecar.
