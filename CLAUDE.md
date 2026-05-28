@@ -85,9 +85,12 @@ resulting in an empty base image.
   print the exact sharing email.
 - `whatsapp_shared_secret` — shared token authenticating
   `POST /internal/whatsapp/inbound` calls from non-loopback callers. The
-  WhatsApp Bridge add-on uses `host_network: true` so it calls via
-  `127.0.0.1` (loopback) and does not need this secret. Only required if
-  an external caller (e.g. a future off-host bridge) is used.
+  WhatsApp Bridge add-on uses `host_network: true` and dials
+  `127.0.0.1:5000`, but the tracker is **not** on host network — Docker
+  NATs the source IP to the bridge gateway (`172.30.32.1`), so the
+  tracker does **not** see the bridge as loopback. The bridge therefore
+  needs this secret too: set the same string in both add-ons'
+  `shared_secret` / `whatsapp_shared_secret` options (1.0.4+).
 
 ## Data model (`/data/data.json`)
 
@@ -346,8 +349,12 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
 ### WhatsApp — Bridge HA add-on (`whatsapp-bridge/`, shipped 1.0.x)
 - **Runs as a standalone HA add-on** alongside the cleaning tracker. Uses
   `host_network: true` so it reaches the cleaning tracker via
-  `http://127.0.0.1:5000` (loopback — no shared secret needed). Auth
-  state persists in `/data/auth/` across restarts.
+  `http://127.0.0.1:5000`. Despite host_network, the tracker is on the
+  docker bridge with port 5000 mapped — Docker NATs the source to
+  `172.30.32.1`, so the tracker doesn't see this as loopback. The bridge
+  must therefore present `X-Shared-Secret` matching the tracker's
+  `whatsapp_shared_secret` (the bridge's own `shared_secret` option,
+  added in 1.0.4). Auth state persists in `/data/auth/` across restarts.
 - Pairs as a WhatsApp **linked device** via QR scan. QR appears in the
   add-on's Log tab on first start. Subsequent starts reconnect
   automatically using the saved auth state.

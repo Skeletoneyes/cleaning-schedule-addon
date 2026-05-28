@@ -29,11 +29,17 @@ const {
 const P = require("pino");
 const qrcode = require("qrcode-terminal");
 
-// In HA, always loopback — cleaning tracker accepts 127.0.0.1 without a secret.
+// Bridge runs with host_network: true, so it reaches the tracker via
+// 127.0.0.1:5000 — but the tracker is on the docker bridge with port 5000
+// mapped, so Docker NATs the source IP to the bridge gateway (172.30.32.1).
+// That means the tracker does NOT see us as loopback, so we must present the
+// shared secret in HA mode too.
 const HA_URL = IN_HA
   ? "http://127.0.0.1:5000"
   : (process.env.HA_URL || "").replace(/\/$/, "");
-const SHARED_SECRET = IN_HA ? "" : (process.env.SHARED_SECRET || "");
+const SHARED_SECRET = IN_HA
+  ? (opts.shared_secret || "")
+  : (process.env.SHARED_SECRET || "");
 
 const GROUP_ALLOWLIST = new Set([
   ...(opts.group_allowlist || []),

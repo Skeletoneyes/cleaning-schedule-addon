@@ -1,5 +1,5 @@
 name: WhatsApp Bridge
-version: "1.0.3"
+version: "1.0.4"
 slug: whatsapp-bridge
 description: Baileys WhatsApp linked-device bridge that forwards group messages to the Cleaning Schedule Tracker.
 init: false
@@ -14,8 +14,10 @@ options:
   group_allowlist: []
   backfill_per_group: 10
   backfill_window_ms: 15000
+  shared_secret: ""
 schema:
   group_allowlist:
     - str
   backfill_per_group: int
   backfill_window_ms: int
+  shared_secret: password?
