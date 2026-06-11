@@ -2616,6 +2616,10 @@ INGEST_LOCK = threading.Lock()
 INGEST_STATUS = {"running": False, "total": 0, "done": 0, "errors": 0, "apply": False}
 
 
+def _truthy(v):
+    return str(v or "").lower() in ("1", "true", "yes", "on")
+
+
 def _parse_whatsapp_transcript(text):
     """Parse a WhatsApp export into [{timestamp, sender, text}, ...].
 
@@ -2737,7 +2741,8 @@ def admin_ingest_transcript():
     payload = request.get_json(silent=True) or request.form
     transcript = (payload.get("transcript") or "").strip()
     group_jid = (payload.get("group_jid") or "backfill-group").strip()
-    apply_flag = str(payload.get("apply") or "").lower() in ("1", "true", "yes", "on")
+    apply_flag = _truthy(payload.get("apply"))
+    confirm_apply = _truthy(payload.get("confirm_apply"))
 
     if not transcript:
         return jsonify({"error": "missing transcript"}), 400
@@ -2747,6 +2752,40 @@ def admin_ingest_transcript():
     entries = _parse_whatsapp_transcript(transcript)
     if not entries:
         return jsonify({"error": "no messages parsed from transcript"}), 400
+
+    # Cost gate (ISC-9): apply=true runs full process_message — 2 Haiku calls
+    # per NEW message (parse + facts) AND routes lines into the live review/
+    # auto-apply queue. Historical backfill should be facts-only (apply off =
+    # 1 call/msg, no routing). On 2026-06-10 a ticked box silently double-spent.
+    # Require explicit confirmation that states the real cost. Count new
+    # messages WITHOUT inserting, so an unconfirmed apply is a true no-op.
+    if apply_flag and not confirm_apply:
+        with DATA_LOCK:
+            data = load_data()
+            new_count = sum(
+                1 for e in entries
+                if not _find_message(
+                    data, _ingest_msg_id(e["timestamp"], e["sender"], e["text"]))
+            )
+        warn = {
+            "needs_confirmation": True,
+            "apply": True,
+            "parsed_entries": len(entries),
+            "new_messages": new_count,
+            "haiku_calls": new_count * 2,
+            "why": ("apply=true runs full parse + facts (2 Haiku calls per new "
+                    "message) and routes them into the live review/auto-apply "
+                    "queue. For historical backfill, uncheck Apply: facts-only "
+                    "is 1 call/message and never touches a booking."),
+        }
+        if request.is_json:
+            return jsonify(warn), 409
+        return render_template_string(
+            _INGEST_CONFIRM_TEMPLATE, prefix=ingress_prefix(),
+            shared_styles=_SHARED_STYLES, transcript=transcript,
+            group_jid=group_jid, new_messages=new_count,
+            haiku_calls=new_count * 2, parsed_entries=len(entries),
+        ), 409
 
     inserted_ids = []
     skipped = 0
@@ -2820,6 +2859,40 @@ in the log. Facts are extracted for every inserted message.</p>
 </form>
 <p>After submitting, poll <a href=\"{{ prefix }}/admin/ingest-status\">/admin/ingest-status</a> to watch progress.
 Inspect extracted facts at <a href=\"{{ prefix }}/admin/facts\">/admin/facts</a>.</p>
+</div>
+</body></html>
+"""
+
+
+# Cost-gate interstitial (ISC-9). Shown when Apply is ticked but unconfirmed.
+# Re-posts the same transcript with confirm_apply=1 so the cost is acknowledged.
+_INGEST_CONFIRM_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><title>Confirm Apply ingest</title>
+<style>{{ shared_styles|safe }}
+.warn { background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:14px; margin:14px 0; }
+.big { font-size:1.4rem; font-weight:600; }
+.muted { color:#666; font-size:0.9rem; }
+</style></head><body>
+<div class=\"container\">
+<h1>⚠️ Confirm full-Apply ingest</h1>
+<div class=\"warn\">
+  <p class=\"big\">{{ new_messages }} new message(s) → {{ haiku_calls }} Haiku calls</p>
+  <p>You ticked <strong>Apply</strong>. That runs the full parse + facts pipeline
+  (<strong>2 Haiku calls per new message</strong>) and routes these lines into the
+  live review / auto-apply queue — where a high-confidence parse can reassign a
+  booking.</p>
+  <p class=\"muted\">For a historical backfill this is almost always wrong. Going
+  back and unchecking Apply makes it facts-only: 1 call/message, no queue routing,
+  no booking changes. ({{ parsed_entries }} lines parsed; already-seen lines are skipped.)</p>
+</div>
+<form method=\"POST\" action=\"{{ prefix }}/admin/ingest-transcript\">
+  <input type=\"hidden\" name=\"transcript\" value=\"{{ transcript }}\" />
+  <input type=\"hidden\" name=\"group_jid\" value=\"{{ group_jid }}\" />
+  <input type=\"hidden\" name=\"apply\" value=\"1\" />
+  <input type=\"hidden\" name=\"confirm_apply\" value=\"1\" />
+  <button type=\"submit\" style=\"background:#dc3545;\">Yes, run full Apply ({{ haiku_calls }} calls)</button>
+</form>
+<p style=\"margin-top:12px;\"><a href=\"{{ prefix }}/admin/ingest\">← Back (uncheck Apply for facts-only backfill)</a></p>
 </div>
 </body></html>
 """
