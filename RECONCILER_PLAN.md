@@ -8,27 +8,21 @@
 > over. Dismiss / undismiss re-uses the cached `findings_raw` list so
 > those actions never re-fetch.
 >
-> **Known issues from first live run (2026-04-22):**
-> 1. **Detector 2 over-fires `gcal_stale_event` on every projected
->    event** (59/59 in the live run). `_events_equal` in `gcal.py`
->    compares `dateTime` by string, but `_desired_events` writes
->    `"2026-04-24T15:00:00"` (no offset) while GCal returns
->    `"2026-04-24T15:00:00-07:00"` after round-trip — so every timed
->    event looks different. Same bug silently makes `sync_to_gcal`
->    run `events.update()` on every tagged event on every save; it
->    succeeds, so it's been invisible. Fix: normalise both sides
->    (parse dateTime + timeZone semantically, or strip the offset
->    before comparing) in `_events_equal`. Detector 2 shouldn't be
->    trusted until this lands.
-> 2. **Detector 6 doesn't collapse host `schedule_assertion` history.**
->    Live run surfaced 9 `schedule_mismatch` findings, all "host said
->    Itzel, booking is Daria" from Mar/Apr host messages. If the host
->    reassigned later, detector 6 still re-asserts the earlier name
->    because it doesn't do latest-wins the way detector 5 does for
->    cleaner facts. Consider a parallel collapse on
->    `(cleaner, target_date)` keyed by host-message timestamp.
-> 3. **Detector 1 reported zero findings** on first run — Airbnb
->    iCal aligned perfectly with local bookings. Looks healthy.
+> **Update (2026-06-11, add-on 1.20.0):** the 2026-04-22 known issues are
+> resolved and the system is live:
+> 1. ~~Detector 2 over-fires `gcal_stale_event`~~ — **Fixed 1.16.1**
+>    (`_parse_gcal_dt` normalises both sides to tz-aware datetimes).
+> 2. ~~Detector 6 doesn't collapse host history~~ — **Fixed 1.17.1**
+>    (latest-wins over `(cleaner, target_date)` by message timestamp).
+> 3. Detector 1 still healthy.
+> **Step 3 (daily digest) shipped 1.17.1 and is now ENABLED** in the live
+> deployment (`digest_enabled: true`) — runs a full reconcile daily at 08:00.
+> Adjacent reliability work this session: credit-exhaustion circuit breaker
+> (1.19.0) and ingest cost-gate (1.20.0). Live ideal-state tracking moved to
+> `ISA.md`; this file is retained as the original design narrative.
+>
+> _Historical known-issues from the 2026-04-22 first live run are preserved
+> in git history (pre-1.16.1) if needed._
 
 ## Goal
 
