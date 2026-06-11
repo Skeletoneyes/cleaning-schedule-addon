@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E3
 phase: execute
-updated: 2026-06-11T09:07:32-07:00
-progress: 8/12
+updated: 2026-06-11T09:30:00-07:00
+progress: 9/12
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -88,7 +88,7 @@ host never silently loses a same-day schedule change again.
 - [x] ISC-7: Deferred messages auto-reprocess once credits return, with a "restored" notification — no manual reprocess needed. *(shipped 1.19.0 recovery probe.)*
 - [ ] ISC-7.1: Anti: the credit-recovery probe must not hot-loop or bill tokens while exhausted (max_tokens=1 probe, ≥10-min interval, 400s are pre-billing). *(code review only; not yet observed firing live.)*
 - [x] ISC-8: Reprocessing stuck messages uses the **facts-only** path (`/admin/reprocess-facts`), never live `process_message`, so it cannot auto-reassign a booking. *(verified this session: 4 reprocessed, Daria booking untouched.)*
-- [ ] ISC-9: Anti: a transcript backfill must not silently run at double Haiku cost — `apply` defaults OFF in the form and route. *(form already defaults OFF; the trap is a manual tick — needs a guard or confirm step.)*
+- [x] ISC-9: Anti: a transcript backfill must not silently run at double Haiku cost — `apply=true` requires explicit confirmation stating the cost; unconfirmed apply is a no-op. *(verified 2026-06-11: 1.20.0 cost gate — apply without confirm → 409, inserts nothing, no tokens.)*
 - [x] ISC-10: Live snapshot is pullable off-host via `/internal/snapshot` + `X-Shared-Secret` for diagnosis without disturbing the running add-on. *(verified: 913KB HTTP 200.)*
 - [ ] ISC-11: A credit/health outage is visible on the home page (banner), not only as a transient notification. *(deferred — notification-only in 1.19.0.)*
 
@@ -125,6 +125,7 @@ host never silently loses a same-day schedule change again.
 - 2026-06-11 09:06: Chose **facts-only** reprocess (`/admin/reprocess-facts`) over `/admin/fix-parse-errors` for the 4 stuck messages, because the latter runs live `process_message` and the Itzel JID is mapped → a ≥0.85 parse could have auto-reassigned Daria's booking. Facts-only surfaces the conflict for human review without mutating bookings.
 - 2026-06-11 09:06: ❌ DEAD END: Supervisor options POST is NOT safe with a partial body assumption — sending only `{digest_enabled:true}` risks wiping the api key / iCal / GCal config. Always fetch full `.data.options`, merge, and POST the complete set.
 - 2026-06-11 09:06: ❌ DEAD END: Windows `python` can't see git-bash `/tmp` paths; `curl -o /tmp/x` (git-bash) then `python open('/tmp/x')` fails. Use awk/jq in the same shell, or a Windows-visible path.
+- 2026-06-11 09:30: Built ISC-9 (1.20.0): chose a server-side **cost-gate interstitial** over a better default or client-side JS confirm. The route counts new messages without inserting and returns 409 `needs_confirmation` (JSON) / a red HTML confirm page (form) stating exact Haiku-call cost; processing needs `confirm_apply=1`. A default-off checkbox couldn't stop a deliberate-but-mistaken tick — the cost has to be shown at the moment of the click.
 
 ## Changelog
 
@@ -157,4 +158,5 @@ host never silently loses a same-day schedule change again.
 - ISC-6: unit — `_is_low_balance_error` matched the real 400 string and rejected 429 / parse-fail / network / none (ALL PASS); module imported on server with no traceback.
 - ISC-7: code — `_credit_recovery_loop` requeues deferred ids and posts "credits restored" (reuses proven `_post_ha_notification` / `enqueue_message`). Not yet observed firing live.
 - ISC-8: safety — `/admin/reprocess-facts` → `{"stale":4,"extracted":4,"errors":0}`; June 12 booking cleaner still `Daria` post-reprocess.
+- ISC-9: behavior — live POST `apply=1` without `confirm_apply` → `HTTP 409` `{"needs_confirmation":true,"new_messages":1,"haiku_calls":2,...}`; message count `1053→1053` (inserted nothing, no tokens). Confirmed path gated behind `confirm_apply=1`.
 - ISC-10: reachability — `GET /internal/snapshot` + `X-Shared-Secret` → HTTP 200, 913KB.
