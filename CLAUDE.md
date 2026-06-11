@@ -15,7 +15,7 @@ ingress. No database — data lives in `/data/data.json` (persists across
 rebuilds). Configuration is read from `/data/options.json` (populated by HA
 from `config.yaml` options).
 
-**Current direction (1.16.x):** the add-on is the **brain**, Google Calendar
+**Current direction (1.20.x):** the add-on is the **brain**, Google Calendar
 is the **shared view**. `data.json` is the source of truth; `gcal.py` pushes
 a one-way projection to a GCal calendar shared with Michelle and the
 cleaners. The add-on UI's job is to handle everything GCal can't — the
@@ -225,6 +225,14 @@ line numbers; the file grows.
 - Review tab UI: pending-message queue with accept/override/ignore; group
   label editor; unmapped-sender flow (map to existing cleaner OR create new,
   then re-queue that sender's pending messages).
+- **Credit-exhaustion circuit breaker (1.19.0).** When a call returns the
+  Anthropic `400 "credit balance is too low"`, `process_message` does NOT bury
+  it as a silent `pending` parse_error. Instead `_flag_credit_exhausted` posts
+  one HA persistent notification (6h cooldown, id `cleaning_credit`), defers the
+  message id, and spins `_credit_recovery_loop` — a `max_tokens=1` probe every
+  10 min that, once credits return, requeues all deferred messages and posts a
+  "credits restored" notification. 400s are rejected pre-billing, so the
+  breaker costs no tokens while exhausted. Detect via `_is_low_balance_error`.
 
 ### Facts layer (`facts.py`, `data.message_facts`)
 - Separate from parse. Parse answers "route this message to one booking?";
@@ -287,12 +295,14 @@ re-filter used by `_rerun_reconcile_cached` after dismiss/undismiss
 - ~~Detector 2 `_events_equal` dateTime offset mismatch~~ — **Fixed 1.16.1.**
   `_parse_gcal_dt` now normalises both sides to timezone-aware datetimes
   before comparing.
-- Detector 6 (`_schedule_vs_bookings`) doesn't collapse stale host
-  assertions. A latest-wins pass over `(cleaner, target_date)` keyed
-  by message timestamp would drop Mar/Apr backfilled-host-message
-  mismatches. Until fixed, expect `schedule_mismatch` noise from old
-  host messages.
+- ~~Detector 6 (`_schedule_vs_bookings`) doesn't collapse stale host
+  assertions~~ — **Fixed 1.17.1.** Latest-wins pass over `(cleaner,
+  target_date)` keyed by message timestamp now drops old backfilled-host
+  mismatches.
 - Detector 1 has been healthy — zero findings on first live run.
+- Residual: 2 `gcal_stale_event`s for a far-future unassigned booking
+  (Dec 2026 → Jan 2027) where sync hasn't converged. Tracked as ISC-3 in
+  `ISA.md`. Low priority.
 
 **Routes** (all `_require_local_or_secret`-gated):
 - `POST /reconcile/run` — recompute + persist to `reconciler_last.json`.
@@ -314,11 +324,17 @@ severity with one-click actions — `Assign <cleaner>` for
 - `POST /admin/ingest-transcript` — paste a WhatsApp chat export, parse
   each line into the messages log, run facts extraction (or full
   `process_message` if `apply=true`) in a background thread. Body:
-  `{transcript, group_jid, apply}`. Parser handles three formats:
+  `{transcript, group_jid, apply, confirm_apply}`. Parser handles three formats:
   `[YYYY-MM-DD, HH:MM:SS AM/PM]`, `[H:MM AM/PM, M/D/YYYY]`, and Android
   `YYYY-MM-DD, H:MM a.m./p.m. - Sender: text`. Stable ids
   (`backfill-<sha1(ts|sender|text)[:16]>`) make re-runs idempotent and
   dedup against live messages.
+  - **Cost gate (1.20.0).** `apply=true` is 2 Haiku calls/new-message AND
+    routes to the live auto-apply queue. When `apply` is set without
+    `confirm_apply=1`, the route counts new messages **without inserting** and
+    returns `409 needs_confirmation` (JSON) / a red confirm interstitial (form)
+    stating the exact call cost. Unconfirmed apply is a true no-op — facts-only
+    backfill (`apply` off = 1 call/msg, no booking writes) is the default path.
 - `GET /admin/ingest-status` — progress + `last_error`.
 - `GET /admin/ingest` — HTML paste form, linked from the home page's
   Unassigned card ("Ingest transcript").
@@ -484,12 +500,13 @@ Updates: bump `version` in `config.yaml`, push to GitHub, then
 
 ## Open questions / deferred
 
-- **Reconciler step 3 (daily digest)** — **Shipped in 1.17.1.** Background
-  scheduler runs at `digest_time` (default 08:00), diffs against the
-  previous run's baseline, and posts a HA persistent notification with
-  new/resolved finding counts. Enable via `digest_enabled: true` in add-on
-  options. "Run digest" button in the Conflicts tab triggers on demand.
-  Detector 6 latest-wins collapse also shipped in 1.17.1.
+- **Reconciler step 3 (daily digest)** — **Shipped 1.17.1; ENABLED in this
+  deployment 2026-06-11.** `digest_enabled: true` is set, so the scheduler
+  runs daily at `digest_time` (08:00), runs a full fresh reconcile, diffs
+  against the previous baseline, and posts a HA persistent notification with
+  new/resolved finding counts. (Was default-off — being off is why the
+  reconciler sat stale 2026-05-23 → 2026-06-11.) "Run digest" button in the
+  Conflicts tab triggers on demand.
 - **Facts dedup.** Nothing currently collapses duplicate assertions
   across messages ("Itzel May 19" asserted twice = two facts). The
   reconciler groups by `(cleaner, target_date)` in `_fact_timeline`
