@@ -417,6 +417,125 @@ def ensure_workers_started(pool_size=2):
         _WORKERS_STARTED = True
 
 
+# ── Credit-exhaustion circuit breaker ───────────────────────────────────────
+# Anthropic returns HTTP 400 "credit balance is too low" when the prepaid
+# balance hits zero. Unhandled, inbound messages fail silently and sit pending
+# (this happened 2026-06-10 and hid a same-day scheduling change for ~17h).
+# Behaviour: detect the signature → post ONE HA notification (6h cooldown) →
+# defer the message id → spin a probe thread that requeues everything and
+# notifies once credits return. 400s are rejected pre-billing, so this costs
+# no tokens while exhausted; the recovery probe is a single max_tokens=1 ping.
+
+_CREDIT_LOCK = threading.Lock()
+_CREDIT_STATE = {
+    "exhausted": False,
+    "since": None,
+    "last_notified": None,
+    "deferred": set(),
+    "recovery_running": False,
+}
+_CREDIT_NOTIFY_COOLDOWN = timedelta(hours=6)
+_CREDIT_PROBE_INTERVAL = 600  # seconds between recovery probes
+
+
+def _is_low_balance_error(err):
+    """True if an extract/parse error string is the Anthropic out-of-credit 400."""
+    if not err:
+        return False
+    e = str(err).lower()
+    return "credit balance is too low" in e or ("400" in e and "billing" in e)
+
+
+def _credit_probe_ok():
+    """One tiny Haiku ping to test whether credits are back. True only on 200."""
+    if not ANTHROPIC_API_KEY:
+        return False
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ok"}],
+            },
+            timeout=20,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _credit_recovery_loop():
+    """Spun up on first credit-exhausted failure. Probes every
+    _CREDIT_PROBE_INTERVAL; on recovery, resets + requeues deferred messages
+    and notifies. Exits once recovered."""
+    while True:
+        time.sleep(_CREDIT_PROBE_INTERVAL)
+        if not _credit_probe_ok():
+            continue
+        with _CREDIT_LOCK:
+            deferred = list(_CREDIT_STATE["deferred"])
+            _CREDIT_STATE.update(
+                exhausted=False, since=None, deferred=set(), recovery_running=False,
+            )
+        ensure_workers_started()
+        with DATA_LOCK:
+            data = load_data()
+            for mid in deferred:
+                m = _find_message(data, mid)
+                if m:
+                    m["parsed"] = False
+                    m["parse_error"] = None
+            save_data(data)
+        for mid in deferred:
+            enqueue_message(mid)
+        _post_ha_notification(
+            "Cleaning tracker: Anthropic credits restored",
+            f"Live WhatsApp parsing resumed. Re-queued {len(deferred)} message(s) "
+            "that failed while the balance was empty.",
+            notification_id="cleaning_credit",
+        )
+        return
+
+
+def _flag_credit_exhausted(msg_id):
+    """Record an out-of-credit failure: defer the message, notify once per
+    cooldown, and ensure the recovery probe is running."""
+    notify = False
+    start_recovery = False
+    now = datetime.now()
+    with _CREDIT_LOCK:
+        _CREDIT_STATE["deferred"].add(msg_id)
+        if not _CREDIT_STATE["exhausted"]:
+            _CREDIT_STATE["exhausted"] = True
+            _CREDIT_STATE["since"] = now.isoformat(timespec="seconds")
+        last = _CREDIT_STATE["last_notified"]
+        if last is None or (now - datetime.fromisoformat(last)) > _CREDIT_NOTIFY_COOLDOWN:
+            _CREDIT_STATE["last_notified"] = now.isoformat(timespec="seconds")
+            notify = True
+        if not _CREDIT_STATE["recovery_running"]:
+            _CREDIT_STATE["recovery_running"] = True
+            start_recovery = True
+    if notify:
+        _post_ha_notification(
+            "Cleaning tracker: Anthropic credits exhausted",
+            "Live WhatsApp parsing is PAUSED — the API returned 'credit balance "
+            "is too low'. Top up at console.anthropic.com (Plans & Billing). "
+            "Queued messages auto-reprocess once credits return; no action needed "
+            "in the add-on.",
+            notification_id="cleaning_credit",
+        )
+    if start_recovery:
+        threading.Thread(
+            target=_credit_recovery_loop, daemon=True, name="credit-recovery",
+        ).start()
+
+
 # Facts extraction prompts carry recent context so the model can resolve
 # "yes", "that date", and spot re-posted lists. Unbounded history was fine
 # at the 33-message test corpus but blows up in bulk backfill (quadratic
@@ -471,6 +590,21 @@ def process_message(msg_id):
     facts_list, facts_err = facts_mod.extract_facts(
         ANTHROPIC_API_KEY, msg, _facts_history(all_messages, msg), known, labels,
     )
+
+    # Out-of-credit (HTTP 400 "balance too low") is not a per-message failure —
+    # it's an account-wide outage. Don't bury it as a pending parse_error;
+    # alert + defer so it auto-reprocesses when credits return.
+    if _is_low_balance_error(error) or _is_low_balance_error(facts_err):
+        _flag_credit_exhausted(msg_id)
+        with DATA_LOCK:
+            data = load_data()
+            m = _find_message(data, msg_id)
+            if m:
+                m["parsed"] = False  # eligible for recovery requeue
+                m["parse_error"] = error or facts_err
+                m["review_state"] = "pending"
+                save_data(data)
+        return
 
     with DATA_LOCK:
         data = load_data()
