@@ -99,6 +99,11 @@ async function start() {
     printQRInTerminal: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    // Skip Baileys' init queries (fetchProps etc.). They 408 ("init queries
+    // Timed Out") on this linked device every connect, and we don't use the
+    // server props / feature-flag data — only live message forwarding. This
+    // suppresses the recurring timeout without affecting forwarding.
+    fireInitQueries: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
