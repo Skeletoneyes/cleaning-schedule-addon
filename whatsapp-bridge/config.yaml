@@ -1,5 +1,5 @@
 name: WhatsApp Bridge
-version: "1.0.4"
+version: "1.0.5"
 slug: whatsapp-bridge
 description: Baileys WhatsApp linked-device bridge that forwards group messages to the Cleaning Schedule Tracker.
 init: false

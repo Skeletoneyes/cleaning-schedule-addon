@@ -9,7 +9,7 @@
     "list-groups": "node index.js --list-groups"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.0",
+    "@whiskeysockets/baileys": "^6.7.23",
     "dotenv": "^16.4.5",
     "pino": "^9.0.0",
     "qrcode-terminal": "^0.12.0"
