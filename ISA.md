@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E3
 phase: execute
-updated: 2026-06-11T09:30:00-07:00
-progress: 9/12
+updated: 2026-06-21T16:40:00-07:00
+progress: 11/15
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -91,6 +91,9 @@ host never silently loses a same-day schedule change again.
 - [x] ISC-9: Anti: a transcript backfill must not silently run at double Haiku cost — `apply=true` requires explicit confirmation stating the cost; unconfirmed apply is a no-op. *(verified 2026-06-11: 1.20.0 cost gate — apply without confirm → 409, inserts nothing, no tokens.)*
 - [x] ISC-10: Live snapshot is pullable off-host via `/internal/snapshot` + `X-Shared-Secret` for diagnosis without disturbing the running add-on. *(verified: 913KB HTTP 200.)*
 - [ ] ISC-11: A credit/health outage is visible on the home page (banner), not only as a transient notification. *(deferred — notification-only in 1.19.0.)*
+- [x] ISC-12: The WhatsApp Bridge live-forwards group messages despite the benign Baileys `init queries` 408 — `fireInitQueries: false` skips the failing `fetchProps` init query the read-only bridge never needed. *(verified 2026-06-21: bridge 1.0.6 — `init queries` count 0 at 95s past connect, well beyond the 60s query-timeout window; clean `backfill complete → live mode`.)*
+- [ ] ISC-13: Both cleaning groups — Itzel (`120363285451054712@g.us`) and Daria (`120363410469116316@g.us`) — are in the bridge `group_allowlist` and live-forward to the tracker. *(allowlist verified 2026-06-21; Itzel live-forward proven; Daria forward not yet live-tested — follow-up: send a Daria-group test message.)*
+- [x] ISC-14: The daily digest posts an HA persistent notification — the cleaning-tracker add-on is granted `homeassistant_api: true`. *(verified 2026-06-21: 1.20.1, `/digest/run` → `"notified":true`; was `notified:false` because the Supervisor rejected Core-API calls without the grant — which also silently broke the ISC-6/7 notification leg.)*
 
 ## Test Strategy
 
@@ -126,6 +129,13 @@ host never silently loses a same-day schedule change again.
 - 2026-06-11 09:06: ❌ DEAD END: Supervisor options POST is NOT safe with a partial body assumption — sending only `{digest_enabled:true}` risks wiping the api key / iCal / GCal config. Always fetch full `.data.options`, merge, and POST the complete set.
 - 2026-06-11 09:06: ❌ DEAD END: Windows `python` can't see git-bash `/tmp` paths; `curl -o /tmp/x` (git-bash) then `python open('/tmp/x')` fails. Use awk/jq in the same shell, or a Windows-visible path.
 - 2026-06-11 09:30: Built ISC-9 (1.20.0): chose a server-side **cost-gate interstitial** over a better default or client-side JS confirm. The route counts new messages without inserting and returns 409 `needs_confirmation` (JSON) / a red HTML confirm page (form) stating exact Haiku-call cost; processing needs `confirm_apply=1`. A default-off checkbox couldn't stop a deliberate-but-mistaken tick — the cost has to be shown at the moment of the click.
+- 2026-06-21 14:00: WhatsApp Bridge looked "dead" (no inbound since 06-20 14:45, WhatsApp "last active yesterday"). It was NOT dead — live forwarding is push-based and fine; the Itzel group was just quiet. Proven by a live test message forwarding in ~1 min. Lesson: zero inbound ≠ zero health; verify liveness with a live test, not by inferring from log gaps or the lagging "last active" field.
+- 2026-06-21 14:30: The Daria group was invisible to the bridge — its participating-groups enumeration is stale on cached-auth reconnects. Fix = fresh QR re-pair (forces full app-state resync), which surfaced Daria (`120363410469116316@g.us`); added it to `group_allowlist`. Re-pair needed wiping `/data/auth`, which the sandboxed SSH add-on can't reach → did it via add-on **uninstall + reinstall** (wipes `/data`), then restored options + shared_secret.
+- 2026-06-21 15:00: Bumped bridge Baileys 6.7.21 → 6.7.23 (latest stable 6.x = `legacy` dist-tag). Did NOT take 7.0.0-rc13 (the `latest` tag) — a pre-release pulling native `whatsapp-rust-bridge`/`libsignal` that risks the aarch64 Docker build.
+- 2026-06-21 15:10: ❌ DEAD END: regenerating the bridge `package-lock.json` re-introduces `git+ssh://` for `libsignal-node`, breaking `npm ci` in Docker (no SSH keys). Must rewrite the resolved URL to `git+https://` (keep the commit hash) after any lockfile regen.
+- 2026-06-21 16:00: ❌ DEAD END / GOTCHA: don't declare the `init queries` 408 fixed from an early log read — it fires ~46s after connect (Baileys `defaultQueryTimeoutMs` = 60s). A +60s check once read 0 and was wrong; wait past the 60s window before claiming it's gone.
+- 2026-06-21 16:30: Cleared the 607-message review queue: 598 were one-time transcript-**backfill** chatter (not live), 9 were stale live items from before the LID senders were mapped. Bulk-set to `ignored` via the `/internal/snapshot` → edit → `/internal/restore` round-trip (the only bulk-write path since `/data` is private; restore backs up to `data.json.bak`). LID→cleaner/host mappings were already correct (192…→Itzel, 162…/697…→host).
+- 2026-06-21 16:45: GOTCHA: `host_jids` only suppresses the "unmapped sender" prompt — it does NOT remove a host sender's messages from the pending list (`_build_review_context` includes all `pending` regardless). Host chatter keeps queuing; a real fix would skip/auto-ignore `host_jids` senders in the inbound path.
 
 ## Changelog
 
@@ -149,6 +159,21 @@ host never silently loses a same-day schedule change again.
   learned: `apply=true` is for future bulk adds, not historical backfill; it doubles cost and pollutes review. The form already defaults OFF — the failure mode is a manual tick, so a default fix alone is insufficient.
   criterion now: ISC-9 (anti: backfill must not silently double-spend) added; needs a confirm/guard, not just a default.
 
+- 2026-06-21 | conjectured: the WhatsApp Bridge's recurring `init queries Timed Out` (408 in `fetchProps`) was Baileys version drift, fixable by updating the package.
+  refuted by: bumping 6.7.21 → 6.7.23 (latest stable 6.x) — the 408 still fired ~46s after every connect with an identical stack.
+  learned: it's a non-essential init query (server props/feature-flags) the read-only bridge never uses, and it's benign for live forwarding (push-based). `fireInitQueries: false` skips it entirely; on-demand API history backfill is the only thing the query path would have helped, and that's unreliable on linked devices anyway.
+  criterion now: ISC-12 added (bridge live-forwards with the 408 suppressed via `fireInitQueries:false`) — verified on bridge 1.0.6.
+
+- 2026-06-21 | conjectured: the credit-breaker (ISC-6/7) and digest HA notifications work — the code calls `_post_ha_notification` and the logic is unit-tested.
+  refuted by: the digest Conflicts tab showed "✗ HA notification failed"; a live `/digest/run` returned `notified:false`; the add-on `config.yaml` never granted `homeassistant_api`, so the Supervisor rejected every `POST /core/api/...`.
+  learned: ISC-6/7's notification *leg* was structurally broken all along — the unit tests verified error *detection*, never delivery. No add-on can reach the Core API without `homeassistant_api: true`.
+  criterion now: ISC-14 added (digest posts an HA persistent notification; `homeassistant_api` granted) — verified on 1.20.1 (`notified:true`); retroactively un-breaks the ISC-6/7 notification path.
+
+- 2026-06-21 | conjectured: a larger backfill window would let the bridge pull missed history (e.g. a cancellation) through the API.
+  refuted by: a 7-day window hung backfill entirely (history fetch uses the same query path the 408 breaks), and Baileys docs/issues confirm WhatsApp silently drops on-demand `fetchMessageHistory` for companion/linked devices.
+  learned: API history backfill is unreliable on linked devices by design; the transcript-ingest paste route is the dependable backfill path (which is why the add-on already ships it).
+  criterion now: no new ISC — reaffirms the existing transcript-ingest design; bridge backfill window reverted to the known-good 15s.
+
 ## Verification
 
 - ISC-1: invariant — `curl <gcal ical>` → `BEGIN:VEVENT` count 92; distinct (dtstart+summary) 92. No duplicates.
@@ -160,3 +185,5 @@ host never silently loses a same-day schedule change again.
 - ISC-8: safety — `/admin/reprocess-facts` → `{"stale":4,"extracted":4,"errors":0}`; June 12 booking cleaner still `Daria` post-reprocess.
 - ISC-9: behavior — live POST `apply=1` without `confirm_apply` → `HTTP 409` `{"needs_confirmation":true,"new_messages":1,"haiku_calls":2,...}`; message count `1053→1053` (inserted nothing, no tokens). Confirmed path gated behind `confirm_apply=1`.
 - ISC-10: reachability — `GET /internal/snapshot` + `X-Shared-Secret` → HTTP 200, 913KB.
+- ISC-12: boot-log — bridge 1.0.6, 95s past connect: `grep -c "init queries"` = 0; only logged event `backfill complete — switching to live mode`. (On 1.0.5 the same window always produced the 408 at ~46s.)
+- ISC-14: behavior — cleaning-tracker 1.20.1: `ha addons info` shows `homeassistant_api: true`; `POST /digest/run` → `{"notified":true,...}` (was `notified:false` pre-grant).
