@@ -394,6 +394,33 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
   for testing). To move to a dedicated bot number: stop the add-on, delete
   `/data/auth/`, register WhatsApp Business on the bot phone (SpeakOut
   $125/yr — pending), restart and scan the new QR.
+- **Health alarms (1.1.0)** — the bridge posts HA persistent notifications
+  (6h cooldown per kind, `homeassistant_api: true`) on: ≥5 decrypt failures
+  in 10 min, ≥4 disconnects in 30 min, ≥5 tracker-forward failures in
+  10 min, and immediately on logged-out. Verify the path end-to-end by
+  setting the `test_alarm` option to true and restarting (fires one test
+  notification on connect; turn it back off after). Decrypt failures are
+  detected by intercepting the Baileys pino logger (`hooks.logMethod`) —
+  Baileys exposes no public event for them.
+- **⚠️ Session-corruption failure mode (bit hard 2026-07-21):** libsignal
+  `MessageCounterError: Key used already or never filled` on decrypt →
+  Baileys stream crashes (code 500) → reconnect → WhatsApp redelivers the
+  same message → crash again. The connection flaps every 30–60 min and
+  messages arriving in the gaps are silently lost; per-sender sender-key
+  breakage can also mute one participant entirely (Daria had ZERO live
+  messages for 3 months while Josh/Michelle's forwarded fine — "quiet
+  group" in the archive is NOT evidence of a quiet group). **Fix: re-pair
+  fresh.** The SSH add-on cannot touch the bridge's private `/data`, so:
+  capture options via Supervisor API → `ha addons uninstall` + `install`
+  (wipes `/data/auth`) → restore options → start → scan QR from the Log
+  tab (QR rotates ~60s; get the phone camera ready first). `ha addons
+  update` preserves `/data`, so code updates do NOT need a re-pair. The
+  pairing history-sync recovers only the recent tail; deeper gaps need
+  phone chat export → `/admin/ingest-transcript`.
+- **Log visibility gotcha:** `ha addons logs` returns only ~100 lines and
+  the on-connect group listing floods it. Use
+  `ha host logs --identifier addon_27cbea7f_whatsapp-bridge --lines 2000`
+  for real history (journald).
 - **Docker build note**: `package-lock.json` is committed with `libsignal-node`
   resolved to `git+https://` (not `git+ssh://`) so `npm ci` works in the
   build container without SSH keys.
