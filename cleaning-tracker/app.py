@@ -365,7 +365,11 @@ Return ONLY valid JSON, no other text:
         )
         resp.raise_for_status()
         result = resp.json()
-        text = result["content"][0]["text"].strip()
+        # claude-sonnet-5 may emit a thinking block before the text block —
+        # select the text block instead of assuming content[0].
+        text = next(
+            b["text"] for b in result["content"] if b.get("type") == "text"
+        ).strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1]
             text = text.rsplit("```", 1)[0]

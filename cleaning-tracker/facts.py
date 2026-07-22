@@ -149,7 +149,11 @@ def extract_facts(api_key, msg, history, known_cleaners, labels):
                 delay = min(delay * 2, _RETRY_MAX_DELAY)
                 continue
             resp.raise_for_status()
-            text = resp.json()["content"][0]["text"].strip()
+            # claude-sonnet-5 may emit a thinking block before the text block —
+            # select the text block instead of assuming content[0].
+            text = next(
+                b["text"] for b in resp.json()["content"] if b.get("type") == "text"
+            ).strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0]
             parsed = json.loads(text)
