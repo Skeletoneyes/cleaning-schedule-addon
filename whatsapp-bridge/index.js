@@ -50,8 +50,105 @@ const BACKFILL_PER_GROUP = opts.backfill_per_group ?? parseInt(process.env.BACKF
 const BACKFILL_WINDOW_MS = opts.backfill_window_ms ?? parseInt(process.env.BACKFILL_WINDOW_MS || "15000", 10);
 const LIST_GROUPS = process.argv.includes("--list-groups");
 const STARTED_AT_SEC = Math.floor(Date.now() / 1000);
+const TEST_ALARM = !!opts.test_alarm;
 
 const log = P({ level: "info" });
+
+// ---------------------------------------------------------------------------
+// Health alarms → HA persistent notifications.
+//
+// This bridge failed silently for 3 months (libsignal MessageCounterError
+// poison loop: decrypt failure → stream crash → reconnect → redeliver → …)
+// and nothing surfaced it. These alarms make that class of failure loud.
+// Requires homeassistant_api: true in config.yaml (SUPERVISOR_TOKEN env).
+// ---------------------------------------------------------------------------
+const SUPERVISOR_TOKEN = process.env.SUPERVISOR_TOKEN || "";
+const ALARM_COOLDOWN_MS = 6 * 60 * 60 * 1000; // one HA notification per kind per 6h
+const _alarmLastSent = {};
+
+async function postAlarm(kind, title, message) {
+  const now = Date.now();
+  if (_alarmLastSent[kind] && now - _alarmLastSent[kind] < ALARM_COOLDOWN_MS) return;
+  _alarmLastSent[kind] = now;
+  log.error({ kind, message }, "HEALTH ALARM");
+  if (!SUPERVISOR_TOKEN) {
+    log.warn("no SUPERVISOR_TOKEN — cannot post HA notification");
+    return;
+  }
+  try {
+    const res = await fetch("http://supervisor/core/api/services/persistent_notification/create", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SUPERVISOR_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        notification_id: `whatsapp_bridge_${kind}`,
+        title: `WhatsApp Bridge: ${title}`,
+        message,
+      }),
+    });
+    log.info({ kind, status: res.status }, "health alarm posted to HA");
+  } catch (err) {
+    log.error({ err: err.message, kind }, "health alarm post failed");
+  }
+}
+
+// Sliding-window event counters: alarm when `threshold` events land within `windowMs`.
+function makeWindowCounter(kind, threshold, windowMs, title, messageFn) {
+  const events = [];
+  return () => {
+    const now = Date.now();
+    events.push(now);
+    while (events.length && events[0] < now - windowMs) events.shift();
+    if (events.length >= threshold) postAlarm(kind, title, messageFn(events.length));
+  };
+}
+
+const countDecryptFailure = makeWindowCounter(
+  "decrypt", 5, 10 * 60 * 1000,
+  "message decryption failing",
+  (n) => `${n} messages failed to decrypt in the last 10 minutes (libsignal session ` +
+    `corruption — the exact failure mode that silently dropped 3 months of Daria's ` +
+    `messages). Fix: stop the add-on, reinstall it to wipe /data/auth, restart, and ` +
+    `re-scan the QR from the Log tab. Messages sent meanwhile are recoverable via ` +
+    `chat export → transcript ingest.`
+);
+
+const countDisconnect = makeWindowCounter(
+  "flapping", 4, 30 * 60 * 1000,
+  "connection flapping",
+  (n) => `${n} disconnects in the last 30 minutes. Messages arriving during the gaps ` +
+    `may be lost. If this persists, check the bridge Log tab for decrypt errors ` +
+    `(session corruption → re-pair) or network issues.`
+);
+
+const countForwardFailure = makeWindowCounter(
+  "forward", 5, 10 * 60 * 1000,
+  "cannot reach cleaning tracker",
+  (n) => `${n} forwards to the cleaning-tracker add-on failed in the last 10 minutes. ` +
+    `Incoming WhatsApp messages are NOT being recorded. Check that the Cleaning ` +
+    `Schedule Tracker add-on is running and whatsapp_shared_secret matches.`
+);
+
+// Baileys logs decrypt failures through the logger we hand it — intercept them
+// there, since it exposes no public event for this.
+const DECRYPT_ERR_RE = /failed to decrypt|MessageCounterError|Bad MAC|No matching sessions|No SenderKeyRecord|SessionError/i;
+const baileysLogger = P({
+  level: "warn",
+  hooks: {
+    logMethod(args, method) {
+      try {
+        const flat = args.map((a) => {
+          if (typeof a === "string") return a;
+          try { return JSON.stringify(a); } catch { return String(a); }
+        }).join(" ");
+        if (DECRYPT_ERR_RE.test(flat)) countDecryptFailure();
+      } catch {}
+      return method.apply(this, args);
+    },
+  },
+});
 
 function extractText(msg) {
   const m = msg.message;
@@ -80,11 +177,13 @@ async function forward(payload) {
     });
     if (!res.ok) {
       log.error({ status: res.status, id: payload.id }, "forward failed");
+      countForwardFailure();
     } else {
       log.info({ id: payload.id, group: payload.group_jid, from_me: payload.from_me }, "forwarded");
     }
   } catch (err) {
     log.error({ err: err.message, id: payload.id }, "forward threw");
+    countForwardFailure();
   }
 }
 
@@ -95,7 +194,7 @@ async function start() {
   const sock = makeWASocket({
     version,
     auth: state,
-    logger: P({ level: "warn" }),
+    logger: baileysLogger,
     printQRInTerminal: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
@@ -116,6 +215,9 @@ async function start() {
     }
     if (connection === "open") {
       log.info("connected");
+      if (TEST_ALARM) {
+        postAlarm("test", "test alarm", "Bridge health-alarm path works. Turn the test_alarm option back off.");
+      }
       // Always log visible groups so you can populate group_allowlist on first install.
       try {
         const groups = await sock.groupFetchAllParticipating();
@@ -132,9 +234,17 @@ async function start() {
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       log.warn({ code, shouldReconnect }, "disconnected");
       if (shouldReconnect) {
+        countDisconnect();
         start();
       } else {
         log.error("logged out — delete /data/auth and restart to re-pair");
+        await postAlarm(
+          "logged_out",
+          "LOGGED OUT — re-pair required",
+          "WhatsApp unlinked this device. NO messages are being captured. Reinstall " +
+          "the WhatsApp Bridge add-on (wipes /data/auth), restart, and scan the QR " +
+          "from the Log tab."
+        );
         process.exit(1);
       }
     }
