@@ -20,7 +20,7 @@ from datetime import datetime
 
 import requests
 
-FACTS_MODEL = "claude-haiku-4-5-20251001"
+FACTS_MODEL = "claude-sonnet-5"
 FACTS_PROMPT_VERSION = "facts-v2"
 
 # Anthropic free/standard tiers rate-limit by tokens-per-minute and

@@ -4,9 +4,10 @@
 
 Home Assistant add-on that tracks Airbnb cleaning schedules. It syncs bookings
 from an Airbnb iCal feed, lets you assign cleaners to checkout dates, and uses
-Claude Haiku to interpret WhatsApp conversations with cleaners (live traffic
-via a dedicated WhatsApp Bridge HA add-on, plus a `/backfill` paste page for
-catching up on historical assignments) to detect confirmations and declines.
+Claude Sonnet (`claude-sonnet-5`, upgraded from Haiku 1.21.0) to interpret
+WhatsApp conversations with cleaners (live traffic via a dedicated WhatsApp
+Bridge HA add-on, plus `/admin/ingest` for historical transcript backfill)
+to detect confirmations and declines.
 
 ## Architecture
 
@@ -42,7 +43,7 @@ cleaning-tracker/
 ├── requirements.txt         # flask, requests, icalendar, anthropic, google-api-*
 ├── app.py                   # Flask routes, templates, logic — ~2800 lines
 ├── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
-├── facts.py                 # Versioned structured-fact extractor (Haiku, FACTS_PROMPT_VERSION)
+├── facts.py                 # Versioned structured-fact extractor (Sonnet, FACTS_PROMPT_VERSION)
 └── reconcile.py             # Pure-function reconciler: detectors → ranked findings
 whatsapp-bridge/             # WhatsApp Bridge HA add-on (replaces old PC sidecar)
 ├── config.yaml              # Add-on config: slug=whatsapp-bridge, host_network: true
@@ -71,7 +72,7 @@ resulting in an empty base image.
 
 - `ical_url` — Airbnb iCal calendar URL (contains private token, never commit
   it)
-- `anthropic_api_key` — API key for Claude Haiku (WhatsApp parsing, both
+- `anthropic_api_key` — API key for Claude (WhatsApp parsing, both
   paste-flow and Phase 3 inbound). Stored as password type.
 - `cleaners` — List of cleaner names (used for assignment dropdowns and as
   the canonical name set for JID mapping)
@@ -194,29 +195,17 @@ line numbers; the file grows.
   print-optimized CSS. Black borders, colour bars for stays, cleaner + time
   on checkout cells.
 
-### WhatsApp — backfill page (`/backfill`, added 1.9.0)
-- User pastes a WhatsApp chat export (phone: group → Export chat → Without
-  media). Haiku receives the transcript + the **full list of active unassigned
-  bookings** (no date window) + known cleaners + an optional group-hint
-  string.
-- Returns per-booking proposals: `{uid, cleaner, clean_time, confidence,
-  evidence}`. The review page renders each with confidence-coloured border
-  (green ≥ 0.85, yellow 0.6–0.85, red < 0.6), editable cleaner dropdown,
-  time input, and a checkbox pre-ticked at ≥ 0.85.
-- `POST /backfill/apply` writes approved assignments and calls
-  `ack_notified(booking, via="backfill")` so they skip the notify queue.
-- Purpose: one-shot catch-up after install, or for reviving historical
-  assignments that predate the linked-device sync window. Live traffic
-  goes through the inbound pipeline instead.
-- Entry point: "Backfill from chat" link in the Unassigned bookings card
-  on `/`. Supersedes the older paste flow described in earlier docs — that
-  older flow's routes no longer exist in the code.
+### WhatsApp — backfill page — REMOVED (1.21.0)
+The `/backfill` proposal flow (paste export → per-booking assignment
+proposals) was removed 2026-07-21 at Josh's request — superseded by
+`/admin/ingest-transcript` (facts-only archive backfill). `ack_notified(via=
+"backfill")` values persist in old commitment records; the enum is retained.
 
 ### WhatsApp — inbound pipeline (live traffic)
 - `POST /internal/whatsapp/inbound`: dedups on message id, enqueues to a
   2-thread worker pool. Loopback calls bypass auth; non-loopback callers
   must present `X-Shared-Secret` matching `whatsapp_shared_secret`.
-- `process_message` runs TWO independent Haiku calls per message: the
+- `process_message` runs TWO independent claude-sonnet-5 calls per message: the
   classic `parse_whatsapp_message` (routing decision for one booking) AND
   `facts_mod.extract_facts` (every scheduling assertion in the message,
   for the reconciler). Facts are stored regardless of parse outcome.
@@ -329,7 +318,7 @@ severity with one-click actions — `Assign <cleaner>` for
   `YYYY-MM-DD, H:MM a.m./p.m. - Sender: text`. Stable ids
   (`backfill-<sha1(ts|sender|text)[:16]>`) make re-runs idempotent and
   dedup against live messages.
-  - **Cost gate (1.20.0).** `apply=true` is 2 Haiku calls/new-message AND
+  - **Cost gate (1.20.0).** `apply=true` is 2 Sonnet calls/new-message AND
     routes to the live auto-apply queue. When `apply` is set without
     `confirm_apply=1`, the route counts new messages **without inserting** and
     returns `409 needs_confirmation` (JSON) / a red confirm interstitial (form)
