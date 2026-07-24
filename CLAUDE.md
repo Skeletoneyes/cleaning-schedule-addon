@@ -89,6 +89,10 @@ resulting in an empty base image.
 - `dead_channel_min_msgs` — minimum historical message count before a group
   counts as an "active channel" worth watching for silence (default: 10;
   keeps one-off groups from false-alarming).
+- `vps_status_enabled` — toggle the footer VPS status widget (default: off).
+- `vps_status_url` — URL/host of the box to probe (e.g. a hub URL). **Never
+  committed** — set in the HA UI. Empty = widget hidden.
+- `vps_status_label` — short label shown in the widget (default: `VPS`).
 - `gcal_service_account_json` — full JSON blob for a Google Cloud service
   account key. The service account's email must be added to the target
   calendar's "Share with specific people" list with "Make changes to events"
@@ -481,6 +485,22 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
   `gcal_service_account_json` option. No OAuth flow, no consent screen,
   no refresh-token expiry. `scripts/gcal_auth.py` validates a downloaded
   key and prints the email to share with.
+
+### Footer VPS status widget (`/vps/status`, 1.23.0)
+An ambient health dot in the home-page footer for a separate always-on box
+(Josh's VPS). Off by default; enabled via options. Signals are **only what a
+container can collect via "ping"** — raw ICMP isn't available in the add-on
+container, so `_vps_ping()` does a **TCP connect** to the URL's host:port
+(proves the box + port is up, times the handshake) plus a best-effort HTTP
+HEAD for a status code (any response, incl. 401/403 from a Basic-Auth hub,
+means the web server is up). It reports reachable / latency_ms / http_status,
+**never the configured host/URL**. Cached `VPS_STATUS_TTL` (45s); the footer
+JS polls `/vps/status` every 60s and shows a green/red dot. `/vps/status` is
+ungated (matches the LAN-reachable, ungated `index()` — it returns strictly
+less). **Scope limit:** this pings the box's web surface only; a crashed
+Telegram bot on an otherwise-up box won't show red (the bot has no ping
+surface). **The VPS host is a config option, never hardcoded** — this repo is
+on GitHub; `vps_status_url` lives in `/data/options.json` like `ical_url`.
 
 ### Ingress
 All URLs are prefixed with the `X-Ingress-Path` request header so forms and

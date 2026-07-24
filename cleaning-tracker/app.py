@@ -10,10 +10,12 @@ import json
 import os
 import queue
 import re
+import socket
 import threading
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, render_template_string, request, redirect, jsonify, abort, Response
@@ -64,6 +66,14 @@ DEAD_CHANNEL_ENABLED = bool(OPTIONS.get("dead_channel_enabled", True))
 DEAD_CHANNEL_DAYS = int(OPTIONS.get("dead_channel_days", 14))
 BRIDGE_SILENT_DAYS = int(OPTIONS.get("bridge_silent_days", 7))
 DEAD_CHANNEL_MIN_MSGS = int(OPTIONS.get("dead_channel_min_msgs", 10))
+
+# Footer VPS status widget. Host/URL is NEVER hardcoded (this add-on's code is
+# on GitHub) — it's a config option, empty by default, same as ical_url.
+VPS_STATUS_ENABLED = bool(OPTIONS.get("vps_status_enabled", False))
+VPS_STATUS_URL = (OPTIONS.get("vps_status_url", "") or "").strip()
+VPS_STATUS_LABEL = OPTIONS.get("vps_status_label", "VPS") or "VPS"
+VPS_STATUS_TTL = 45  # seconds — cache probe result; footer polls every 60s
+_VPS_STATUS_CACHE = {"result": None, "at": 0.0}
 
 
 def _gcal_push(data):
@@ -1311,6 +1321,60 @@ if (location.hash === '#review') {
   });
 }
 </script>
+
+<style>
+  .app-footer { margin: 28px auto 12px; text-align: center; }
+  .vps-widget { display: inline-flex; align-items: center; gap: 7px;
+    font-size: 0.8rem; color: #666; padding: 5px 12px; border: 1px solid #e3e3e3;
+    border-radius: 14px; background: #fafafa; }
+  .vps-dot { width: 9px; height: 9px; border-radius: 50%; background: #bbb;
+    flex: 0 0 auto; }
+  .vps-dot.up { background: #28a745; }
+  .vps-dot.down { background: #dc3545; }
+  .vps-dot.checking { background: #f0ad4e; }
+</style>
+<footer class="app-footer">
+  <span id="vps-widget" class="vps-widget" style="display:none;">
+    <span id="vps-dot" class="vps-dot checking"></span>
+    <span id="vps-text">checking…</span>
+  </span>
+</footer>
+<script>
+(function() {
+  var prefix = "{{ prefix }}";
+  function render(d) {
+    var w = document.getElementById('vps-widget');
+    var dot = document.getElementById('vps-dot');
+    var txt = document.getElementById('vps-text');
+    if (!d || !d.enabled) { w.style.display = 'none'; return; }
+    w.style.display = 'inline-flex';
+    var label = d.label || 'VPS';
+    if (d.reachable) {
+      dot.className = 'vps-dot up';
+      var lat = (d.latency_ms != null) ? (' · ' + d.latency_ms + 'ms') : '';
+      var code = d.http_status ? (' · HTTP ' + d.http_status) : '';
+      txt.textContent = label + ' online' + lat + code;
+    } else {
+      dot.className = 'vps-dot down';
+      txt.textContent = label + ' unreachable' + (d.error ? ' (' + d.error + ')' : '');
+    }
+    if (d.checked_at) txt.title = 'last checked ' + d.checked_at;
+  }
+  function poll() {
+    fetch(prefix + '/vps/status')
+      .then(function(r) { return r.json(); })
+      .then(render)
+      .catch(function() {
+        var dot = document.getElementById('vps-dot');
+        var txt = document.getElementById('vps-text');
+        if (dot) dot.className = 'vps-dot down';
+        if (txt) txt.textContent = 'VPS check failed';
+      });
+  }
+  poll();
+  setInterval(poll, 60000);
+})();
+</script>
 </body>
 </html>
 """
@@ -2390,6 +2454,67 @@ def _run_full_reconcile():
     except OSError as e:
         print(f"[reconcile] failed to persist: {e}")
     return result
+
+
+def _vps_ping(url):
+    """Container-safe reachability probe for the footer widget. Raw ICMP isn't
+    available in the add-on container, so 'ping' = a TCP connect to the URL's
+    host:port (proves the box + port is up, times the handshake) plus a short
+    HTTP HEAD for a status code. Any HTTP response — including 401/403 (the hub
+    is Basic-Auth protected) — means the web server is up. Returns a dict; never
+    raises."""
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    parsed = urlparse(url if "://" in url else "https://" + url)
+    host = parsed.hostname
+    scheme = parsed.scheme or "https"
+    port = parsed.port or (443 if scheme == "https" else 80)
+    out = {"reachable": False, "latency_ms": None, "http_status": None,
+           "error": None, "checked_at": now_iso}
+    if not host:
+        out["error"] = "no host configured"
+        return out
+    t = time.time()
+    try:
+        socket.create_connection((host, port), timeout=4).close()
+    except Exception as e:
+        out["error"] = type(e).__name__
+        return out
+    out["reachable"] = True
+    out["latency_ms"] = round((time.time() - t) * 1000)
+    # Best-effort status code — reachability is already proven above.
+    full = url if "://" in url else "https://" + url
+    try:
+        out["http_status"] = requests.head(full, timeout=4, allow_redirects=True).status_code
+    except Exception:
+        try:
+            r = requests.get(full, timeout=4, stream=True)
+            out["http_status"] = r.status_code
+            r.close()
+        except Exception:
+            pass  # TCP up but HTTP unreadable — still 'reachable'
+    return out
+
+
+def _vps_status_cached():
+    now = time.time()
+    if _VPS_STATUS_CACHE["result"] is None or now - _VPS_STATUS_CACHE["at"] > VPS_STATUS_TTL:
+        _VPS_STATUS_CACHE["at"] = now  # set first to blunt concurrent stampede
+        _VPS_STATUS_CACHE["result"] = _vps_ping(VPS_STATUS_URL)
+    return _VPS_STATUS_CACHE["result"]
+
+
+@app.route("/vps/status")
+def vps_status():
+    # Ungated to match the home page (index() is LAN-reachable without auth);
+    # this returns strictly less than that page — VPS reachability + latency,
+    # never the configured host/URL. Cached (VPS_STATUS_TTL) so it can't be used
+    # to hammer the target.
+    if not VPS_STATUS_ENABLED or not VPS_STATUS_URL:
+        return jsonify({"enabled": False})
+    res = dict(_vps_status_cached())
+    res["enabled"] = True
+    res["label"] = VPS_STATUS_LABEL
+    return jsonify(res)
 
 
 @app.route("/reconcile/run", methods=["POST"])
