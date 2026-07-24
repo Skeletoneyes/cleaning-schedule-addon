@@ -57,6 +57,14 @@ DIGEST_LAST_FILE = DATA_DIR / "digest_last.json"
 DIGEST_ENABLED = bool(OPTIONS.get("digest_enabled", False))
 DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 
+# Channel-silence ("WhatsApp going dark") detection. Complements the bridge's
+# error-burst health alarms, which cannot see a quiet per-group mute (the Daria
+# failure: 3 months of silently-dropped messages, no error to count).
+DEAD_CHANNEL_ENABLED = bool(OPTIONS.get("dead_channel_enabled", True))
+DEAD_CHANNEL_DAYS = int(OPTIONS.get("dead_channel_days", 14))
+BRIDGE_SILENT_DAYS = int(OPTIONS.get("bridge_silent_days", 7))
+DEAD_CHANNEL_MIN_MSGS = int(OPTIONS.get("dead_channel_min_msgs", 10))
+
 
 def _gcal_push(data):
     """Fire-and-forget GCal projection after a write. Errors are swallowed so
@@ -2290,6 +2298,74 @@ def _fetch_ical_events():
     return out
 
 
+_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?")
+
+def _parse_msg_ts(s):
+    """Parse a message timestamp to a naive datetime for day-granularity age
+    math. Messages are a mix of bridge UTC-with-Z (`...Z`) and naive-local
+    fallback (`datetime.now().isoformat()`); at a 7–14 day threshold the ~8h
+    tz skew is irrelevant, so we take the leading YYYY-MM-DD[THH:MM:SS] and
+    ignore any offset / fractional seconds. Returns None on unparseable input."""
+    if not s:
+        return None
+    m = _TS_RE.match(str(s).strip())
+    if not m:
+        return None
+    y, mo, d = m.group(1).split("-")
+    hh = m.group(2) or "0"
+    mm = m.group(3) or "0"
+    ss = m.group(4) or "0"
+    try:
+        return datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss))
+    except ValueError:
+        return None
+
+
+def _compute_silence_input(data):
+    """Pre-compute the channel-silence detector's input from the message log so
+    reconcile._channel_silence stays a pure function. Per-group last-seen age +
+    historical count, plus the newest message from any group (whole-bridge
+    liveness)."""
+    labels = data.get("group_labels", {}) or {}
+    now = datetime.now()
+    groups = {}          # jid -> {"last_dt": datetime, "count": int}
+    last_any = None
+    for msg in data.get("messages", []):
+        ts = _parse_msg_ts(msg.get("timestamp"))
+        if ts is None:
+            continue
+        if last_any is None or ts > last_any:
+            last_any = ts
+        gjid = msg.get("group")
+        if not gjid:
+            continue
+        rec = groups.setdefault(gjid, {"last_dt": None, "count": 0})
+        rec["count"] += 1
+        if rec["last_dt"] is None or ts > rec["last_dt"]:
+            rec["last_dt"] = ts
+
+    def _age_days(dt):
+        return (now - dt).total_seconds() / 86400 if dt else None
+
+    group_out = {
+        gjid: {
+            "label": labels.get(gjid) or gjid,
+            "age_days": _age_days(rec["last_dt"]),
+            "count": rec["count"],
+            "last_ts": rec["last_dt"].isoformat(timespec="seconds") if rec["last_dt"] else None,
+        }
+        for gjid, rec in groups.items()
+    }
+    return {
+        "enabled": DEAD_CHANNEL_ENABLED,
+        "bridge_days": BRIDGE_SILENT_DAYS,
+        "dead_days": DEAD_CHANNEL_DAYS,
+        "min_group_msgs": DEAD_CHANNEL_MIN_MSGS,
+        "last_any_age_days": _age_days(last_any),
+        "groups": group_out,
+    }
+
+
 def _run_full_reconcile():
     with DATA_LOCK:
         data = load_data()
@@ -2307,6 +2383,7 @@ def _run_full_reconcile():
         data_for_detectors, drift_items,
         ical_events=ical_events,
         gcal_events=gcal_events,
+        silence=_compute_silence_input(data),
     )
     try:
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))

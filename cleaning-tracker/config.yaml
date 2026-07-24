@@ -1,5 +1,5 @@
 name: Cleaning Schedule Tracker
-version: "1.21.1"
+version: "1.22.0"
 slug: cleaning-tracker
 description: Airbnb cleaning schedule tracker with iCal sync and AI-powered WhatsApp parsing
 init: false
@@ -27,6 +27,10 @@ options:
   whatsapp_shared_secret: ""
   digest_enabled: false
   digest_time: "08:00"
+  dead_channel_enabled: true
+  dead_channel_days: 14
+  bridge_silent_days: 7
+  dead_channel_min_msgs: 10
 schema:
   ical_url: url
   anthropic_api_key: password
@@ -38,3 +42,7 @@ schema:
   whatsapp_shared_secret: password?
   digest_enabled: bool
   digest_time: str?
+  dead_channel_enabled: bool
+  dead_channel_days: int(1,)
+  bridge_silent_days: int(1,)
+  dead_channel_min_msgs: int(0,)

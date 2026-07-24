@@ -79,6 +79,16 @@ resulting in an empty base image.
 - `gcal_enabled` — toggle Google Calendar projection (default: off)
 - `gcal_calendar_id` — target GCal calendar id (e.g.
   `abc@group.calendar.google.com`)
+- `dead_channel_enabled` — toggle WhatsApp "going dark" detection (default:
+  on). When on, the reconciler/digest surfaces silent channels (see
+  `_channel_silence`).
+- `dead_channel_days` — a group with history that goes silent this many days is
+  flagged `channel_silent` (default: 14).
+- `bridge_silent_days` — no message from ANY group for this many days flags
+  `bridge_silent` — likely the whole bridge is down/logged-out (default: 7).
+- `dead_channel_min_msgs` — minimum historical message count before a group
+  counts as an "active channel" worth watching for silence (default: 10;
+  keeps one-off groups from false-alarming).
 - `gcal_service_account_json` — full JSON blob for a Google Cloud service
   account key. The service account's email must be added to the target
   calendar's "Share with specific people" list with "Make changes to events"
@@ -274,6 +284,22 @@ idempotent.
   decline on the same date (latest wins).
 - `_schedule_vs_bookings` — host `schedule_assertion` ⇄ booking cleaner
   (emits `schedule_mismatch` / `schedule_unassigned`).
+- `_channel_silence` — WhatsApp "going dark" detection (1.22.0). Catches
+  **absence of signal**, which the bridge's error-burst health alarms
+  structurally cannot: a quiet per-group mute (the Daria failure — 3 months
+  silently dropped, no error to count). Input pre-computed by
+  `_compute_silence_input()` in `app.py` (per-group last-seen age + historical
+  count + newest-from-any-group), so the detector stays pure. Emits
+  `bridge_silent` (needs-attention, singleton — nothing from ANY group in
+  `bridge_silent_days`, returns early so a dead bridge doesn't also spam
+  per-group) and `channel_silent:<group_jid>` (needs-attention — a group with
+  ≥`dead_channel_min_msgs` history silent past `dead_channel_days`). Findings
+  are **dated today** (not the last-message date) so `filter_and_sort`'s
+  `STALE_DAYS` suppression can't drop the very signal they exist to raise, and
+  ids are stable so a dark channel alarms **once** via the digest diff, not
+  every morning. Lives in the always-running tracker (not the bridge, which
+  can't reliably alarm on its own death) and rides the existing daily-digest
+  HA notification automatically.
 
 The cached result stores `findings_raw` (pre-dismiss) alongside
 `findings` (post-filter). `reconcile.filter_and_sort()` is the pure

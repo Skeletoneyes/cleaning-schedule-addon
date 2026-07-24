@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E3
 phase: execute
-updated: 2026-06-21T16:40:00-07:00
-progress: 11/15
+updated: 2026-07-23T00:00:00-07:00
+progress: 11/16
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -93,7 +93,7 @@ host never silently loses a same-day schedule change again.
 - [ ] ISC-11: A credit/health outage is visible on the home page (banner), not only as a transient notification. *(deferred — notification-only in 1.19.0.)*
 - [x] ISC-12: The WhatsApp Bridge live-forwards group messages despite the benign Baileys `init queries` 408 — `fireInitQueries: false` skips the failing `fetchProps` init query the read-only bridge never needed. *(verified 2026-06-21: bridge 1.0.6 — `init queries` count 0 at 95s past connect, well beyond the 60s query-timeout window; clean `backfill complete → live mode`.)*
 - [ ] ISC-13: Both cleaning groups — Itzel (`120363285451054712@g.us`) and Daria (`120363410469116316@g.us`) — are in the bridge `group_allowlist` and live-forward to the tracker. *(allowlist verified 2026-06-21; Itzel live-forward proven; Daria forward not yet live-tested — follow-up: send a Daria-group test message.)*
-- [x] ISC-14: The daily digest posts an HA persistent notification — the cleaning-tracker add-on is granted `homeassistant_api: true`. *(verified 2026-06-21: 1.20.1, `/digest/run` → `"notified":true`; was `notified:false` because the Supervisor rejected Core-API calls without the grant — which also silently broke the ISC-6/7 notification leg.)*
+- [ ] ISC-15: WhatsApp "going dark" is caught by **absence** detection, not just error-burst alarms. A group with history that stops forwarding for `dead_channel_days` surfaces a `channel_silent` needs-attention finding; zero messages from ANY group for `bridge_silent_days` surfaces a singleton `bridge_silent`. Both are dated today (survive the STALE_DAYS filter), stable-ided (alarm once via the digest diff, not daily), and ride the existing daily-digest HA notification. *(shipped 1.22.0; detector + parse/aggregation logic unit-verified — 8 detector cases + 7 timestamp-format cases pass; **pending live confirmation**: a real digest run showing the finding, and recovery clearing it. This is the gap the 1.1.0 error-burst alarms structurally could not cover — the exact Daria 3-month-mute failure mode.)* — the cleaning-tracker add-on is granted `homeassistant_api: true`. *(verified 2026-06-21: 1.20.1, `/digest/run` → `"notified":true`; was `notified:false` because the Supervisor rejected Core-API calls without the grant — which also silently broke the ISC-6/7 notification leg.)*
 
 ## Test Strategy
 
@@ -138,6 +138,12 @@ host never silently loses a same-day schedule change again.
 - 2026-06-21 16:45: GOTCHA: `host_jids` only suppresses the "unmapped sender" prompt — it does NOT remove a host sender's messages from the pending list (`_build_review_context` includes all `pending` regardless). Host chatter keeps queuing; a real fix would skip/auto-ignore `host_jids` senders in the inbound path.
 
 ## Changelog
+
+- 2026-07-23 | conjectured: the 1.1.0 bridge health alarms (decrypt/disconnect/forward counters) closed the WhatsApp "going dark" hole.
+  refuted by: all three alarms are **presence-of-error, volume-thresholded** (≥5 decrypt fails / 10 min, etc.). The failure that actually muted Daria for 3 months was **absence of signal** — one group's messages stopped arriving with either a slow trickle of decrypt errors (never 5-in-10-min) or none at all (pure absence). An error counter cannot detect silence, and the bridge cannot reliably alarm on its own death.
+  learned: the missing detector is a positive-liveness check, and it belongs in the **always-running tracker** (which has the message log + runs the daily digest independent of the bridge), not in the bridge. Adding it as a reconciler *finding* means it rides the existing digest→HA-notification path for free. Two traps avoided: (1) a silence finding dated at the last-message date is auto-suppressed by the STALE_DAYS filter — it must be dated today; (2) a per-run-changing id would re-alarm every morning — the id must be stable so the digest diff fires once.
+  criterion now: ISC-15 (channel-silence via `_channel_silence`, `bridge_silent` + `channel_silent`) added; shipped 1.22.0, logic unit-verified, pending live digest confirmation.
+
 
 - 2026-06-11 | conjectured: the cleaning app burned "a ton of Haiku tokens today."
   refuted by: live data shows only ~18 messages processed today (7 ingest + 11 live); the genuinely heavy days were Apr 21 (737 facts) and May 4 (285); today's 4 evening messages 400'd with "credit balance is too low."

@@ -28,7 +28,7 @@ CONFIRM_THRESHOLD = 0.85
 _SEVERITY_RANK = {"needs-attention": 0, "suggest": 1, "informational": 2}
 
 
-def run(data, drift_items, ical_events=None, gcal_events=None, today=None):
+def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silence=None):
     today = today or date.today()
     today_str = today.isoformat()
     bookings = data.get("bookings", {})
@@ -39,6 +39,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None):
 
     findings = []
     findings.extend(_drift(drift_items))
+    findings.extend(_channel_silence(silence, today_str))
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
     findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id))
@@ -119,6 +120,92 @@ def _drift(items):
             "cleaner": cleaner,
             "date": it.get("date"),
             "why": lead + why_map.get(k, k),
+            "evidence": [],
+        })
+    return out
+
+
+# ── Detector 7: channel silence (WhatsApp "going dark") ─────────────────────
+# The 1.1.0 bridge health alarms catch *error bursts* (≥5 decrypt failures /
+# 10 min, disconnect flapping, forward failures). They structurally cannot
+# catch the failure that dropped 3 months of Daria's messages: a quiet
+# per-sender/per-group mute where messages simply stop arriving with no error
+# to count. This detector catches absence-of-signal instead of presence-of-
+# error, keyed off the always-running tracker (not the bridge, which can't
+# reliably alarm on its own death).
+#
+# `silence` is pre-computed in app.py (which owns message iteration + the
+# clock) so this stays a pure function:
+#   {
+#     "enabled": bool,
+#     "bridge_days": int, "dead_days": int, "min_group_msgs": int,
+#     "last_any_age_days": float | None,   # age of newest message from ANY group
+#     "groups": { group_jid: {"label": str, "age_days": float|None, "count": int,
+#                             "last_ts": iso|None} },
+#   }
+# Findings are dated `today_str` (NOT the last-message date) so filter_and_sort's
+# STALE_DAYS suppression can't drop the very signal this exists to surface, and
+# ids are stable so a genuinely-dark channel alarms once (via the digest diff),
+# not every morning.
+
+def _channel_silence(silence, today_str):
+    if not silence or not silence.get("enabled", True):
+        return []
+
+    bridge_days = silence.get("bridge_days", 7)
+    dead_days = silence.get("dead_days", 14)
+    min_msgs = silence.get("min_group_msgs", 10)
+    last_any = silence.get("last_any_age_days")
+
+    # 1. Whole-bridge silence — nothing from ANY group in bridge_days. Almost
+    #    always the bridge is down / logged out. Emit ONE finding and stop; a
+    #    dead bridge shouldn't also spam a per-group finding for every channel.
+    if last_any is None or last_any >= bridge_days:
+        span = "ever" if last_any is None else f"{int(last_any)} days"
+        return [{
+            "id": "bridge_silent",
+            "detector": "channel_silence",
+            "kind": "bridge_silent",
+            "severity": "needs-attention",
+            "booking_uid": None,
+            "cleaner": None,
+            "date": today_str,
+            "why": (
+                f"No WhatsApp messages received from ANY group in {span} — the "
+                f"bridge is likely down or logged out. Check the WhatsApp Bridge "
+                f"add-on Log tab; re-pair (uninstall→install→scan QR) if needed."
+            ),
+            "evidence": [],
+        }]
+
+    # 2. Per-group silence — a channel that was demonstrably active
+    #    (≥ min_group_msgs historical messages) has gone quiet past dead_days.
+    #    This is the Daria failure mode: one group muted while others forward
+    #    fine, so the bridge and everyone else look healthy.
+    out = []
+    for gjid, g in (silence.get("groups") or {}).items():
+        if g.get("count", 0) < min_msgs:
+            continue
+        age = g.get("age_days")
+        if age is None or age < dead_days:
+            continue
+        label = g.get("label") or gjid
+        last_ts = (g.get("last_ts") or "")[:10] or "unknown"
+        out.append({
+            "id": f"channel_silent:{gjid}",
+            "detector": "channel_silence",
+            "kind": "channel_silent",
+            "severity": "needs-attention",
+            "booking_uid": None,
+            "cleaner": None,
+            "date": today_str,
+            "why": (
+                f"No messages from the '{label}' WhatsApp group in {int(age)} days "
+                f"(last: {last_ts}). This channel may have gone dark — the "
+                f"per-sender mute that silently dropped 3 months of Daria's "
+                f"messages. Send a test message in the group and confirm it "
+                f"appears in Review; re-pair the bridge if it doesn't."
+            ),
             "evidence": [],
         })
     return out
