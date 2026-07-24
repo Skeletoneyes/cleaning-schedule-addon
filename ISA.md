@@ -5,7 +5,7 @@ type: project
 effort: E3
 phase: execute
 updated: 2026-07-23T00:00:00-07:00
-progress: 11/17
+progress: 12/17
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -95,7 +95,7 @@ host never silently loses a same-day schedule change again.
 - [ ] ISC-13: Both cleaning groups — Itzel (`120363285451054712@g.us`) and Daria (`120363410469116316@g.us`) — are in the bridge `group_allowlist` and live-forward to the tracker. *(allowlist verified 2026-06-21; Itzel live-forward proven; Daria forward not yet live-tested — follow-up: send a Daria-group test message.)*
 - [ ] ISC-15: WhatsApp "going dark" is caught by **absence** detection, not just error-burst alarms. A group with history that stops forwarding for `dead_channel_days` surfaces a `channel_silent` needs-attention finding; zero messages from ANY group for `bridge_silent_days` surfaces a singleton `bridge_silent`. Both are dated today (survive the STALE_DAYS filter), stable-ided (alarm once via the digest diff, not daily), and ride the existing daily-digest HA notification. *(shipped 1.22.0; detector + parse/aggregation logic unit-verified — 8 detector cases + 7 timestamp-format cases pass; **pending live confirmation**: a real digest run showing the finding, and recovery clearing it. This is the gap the 1.1.0 error-burst alarms structurally could not cover — the exact Daria 3-month-mute failure mode.)* — the cleaning-tracker add-on is granted `homeassistant_api: true`. *(verified 2026-06-21: 1.20.1, `/digest/run` → `"notified":true`; was `notified:false` because the Supervisor rejected Core-API calls without the grant — which also silently broke the ISC-6/7 notification leg.)*
 
-- [ ] ISC-16: The home-page footer shows an ambient VPS health dot fed only by container-collectable "ping" signals (TCP-connect reachability + latency + HTTP status), the target host is a config option (never hardcoded — public repo), and the widget is hidden when unconfigured. *(shipped 1.23.0; `_vps_ping` logic verified against real/down/edge hosts; pending in-browser render confirmation on the deployed add-on. Scope limit recorded: pings the box's web surface only — a crashed bot on an up box won't show red.)*
+- [x] ISC-16: The home-page footer shows an ambient VPS health dot fed only by container-collectable "ping" signals (TCP-connect reachability + latency + HTTP status), the target host is a config option (never hardcoded — public repo), and the widget is hidden when unconfigured. *(shipped 1.23.0 + deployed + configured; `_vps_ping` verified against real/down/edge hosts; **in-browser confirmed 2026-07-24** — Chromium on the live add-on rendered a green dot reading "VPS online · 75ms · HTTP 401", zero console errors. Scope limit recorded: pings the box's web surface only — a crashed bot on an up box won't show red.)*
 
 ## Test Strategy
 
