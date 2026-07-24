@@ -4,15 +4,16 @@ slug: cleaning-schedule-addon
 type: project
 effort: E3
 phase: execute
-updated: 2026-07-23T00:00:00-07:00
+updated: 2026-07-24T00:00:00-07:00
 progress: 12/17
 ---
 
 # Cleaning Schedule Tracker — Project ISA
 
 Long-lived system of record for the HA add-on that tracks Airbnb cleaning
-schedules, projects them to a shared Google Calendar, and uses Claude Haiku to
-interpret WhatsApp coordination with cleaners. Operational detail lives in
+schedules, projects them to a shared Google Calendar, and uses Claude Sonnet
+(`claude-sonnet-5`, upgraded from Haiku in 1.21.0) to interpret WhatsApp
+coordination with cleaners. Operational detail lives in
 `CLAUDE.md`; this file holds the ideal state, the criteria for "working," and
 the error-correction trail.
 
@@ -93,7 +94,8 @@ host never silently loses a same-day schedule change again.
 - [ ] ISC-11: A credit/health outage is visible on the home page (banner), not only as a transient notification. *(deferred — notification-only in 1.19.0.)*
 - [x] ISC-12: The WhatsApp Bridge live-forwards group messages despite the benign Baileys `init queries` 408 — `fireInitQueries: false` skips the failing `fetchProps` init query the read-only bridge never needed. *(verified 2026-06-21: bridge 1.0.6 — `init queries` count 0 at 95s past connect, well beyond the 60s query-timeout window; clean `backfill complete → live mode`.)*
 - [ ] ISC-13: Both cleaning groups — Itzel (`120363285451054712@g.us`) and Daria (`120363410469116316@g.us`) — are in the bridge `group_allowlist` and live-forward to the tracker. *(allowlist verified 2026-06-21; Itzel live-forward proven; Daria forward not yet live-tested — follow-up: send a Daria-group test message.)*
-- [ ] ISC-15: WhatsApp "going dark" is caught by **absence** detection, not just error-burst alarms. A group with history that stops forwarding for `dead_channel_days` surfaces a `channel_silent` needs-attention finding; zero messages from ANY group for `bridge_silent_days` surfaces a singleton `bridge_silent`. Both are dated today (survive the STALE_DAYS filter), stable-ided (alarm once via the digest diff, not daily), and ride the existing daily-digest HA notification. *(shipped 1.22.0; detector + parse/aggregation logic unit-verified — 8 detector cases + 7 timestamp-format cases pass; **pending live confirmation**: a real digest run showing the finding, and recovery clearing it. This is the gap the 1.1.0 error-burst alarms structurally could not cover — the exact Daria 3-month-mute failure mode.)* — the cleaning-tracker add-on is granted `homeassistant_api: true`. *(verified 2026-06-21: 1.20.1, `/digest/run` → `"notified":true`; was `notified:false` because the Supervisor rejected Core-API calls without the grant — which also silently broke the ISC-6/7 notification leg.)*
+- [x] ISC-14: The daily digest posts an HA persistent notification — the cleaning-tracker add-on is granted `homeassistant_api: true`. *(verified 2026-06-21: 1.20.1, `/digest/run` → `"notified":true`; was `notified:false` because the Supervisor rejected Core-API calls without the grant — which also silently broke the ISC-6/7 notification leg.)*
+- [ ] ISC-15: WhatsApp "going dark" is caught by **absence** detection, not just error-burst alarms. A group with history that stops forwarding for `dead_channel_days` surfaces a `channel_silent` needs-attention finding; zero messages from ANY group for `bridge_silent_days` surfaces a singleton `bridge_silent`. Both are dated today (survive the STALE_DAYS filter), stable-ided (alarm once via the digest diff, not daily), and ride the existing daily-digest HA notification. *(shipped 1.22.0; detector + parse/aggregation logic unit-verified — 8 detector cases + 7 timestamp-format cases pass; **pending live confirmation**: a real digest run showing the finding, and recovery clearing it. This is the gap the 1.1.0 error-burst alarms structurally could not cover — the exact Daria 3-month-mute failure mode.)*
 
 - [x] ISC-16: The home-page footer shows an ambient VPS health dot fed only by container-collectable "ping" signals (TCP-connect reachability + latency + HTTP status), the target host is a config option (never hardcoded — public repo), and the widget is hidden when unconfigured. *(shipped 1.23.0 + deployed + configured; `_vps_ping` verified against real/down/edge hosts; **in-browser confirmed 2026-07-24** — Chromium on the live add-on rendered a green dot reading "VPS online · 75ms · HTTP 401", zero console errors. Scope limit recorded: pings the box's web surface only — a crashed bot on an up box won't show red.)*
 
@@ -110,6 +112,8 @@ host never silently loses a same-day schedule change again.
 | ISC-8 | safety | reprocess 4 stuck msgs; assert booking cleaner unchanged | unchanged | snapshot diff |
 | ISC-9 | default | GET /admin/ingest; assert apply checkbox unchecked | unchecked | curl + grep |
 | ISC-10 | reachability | GET /internal/snapshot with secret | HTTP 200 | curl |
+| ISC-15 | absence-detect | unit: 8 detector cases (whole-bridge dark, per-group Daria-dark, min-msgs suppress, healthy→∅, disabled→∅, never→'ever', run() survives stale-filter, dismiss by id) + 7 timestamp-format cases | all pass | python + live digest |
+| ISC-16 | render | load home page in Chromium; assert `#vps-widget` visible + dot class `up` + latency text | green dot shown | playwright + curl /vps/status |
 
 ## Features
 
@@ -121,6 +125,8 @@ host never silently loses a same-day schedule change again.
 | safe-reprocess | facts-only reprocess path for stuck/errored messages | ISC-8 | — | true |
 | ingest-cost-guard | keep backfill facts-only by default; guard apply=true | ISC-9 | — | true |
 | ops-access | off-host snapshot pull + Supervisor lifecycle via SSH | ISC-10 | — | true |
+| channel-silence | absence-of-signal WhatsApp dark-channel detection (`_channel_silence` → bridge_silent + channel_silent) | ISC-15 | — | true |
+| vps-status-widget | footer VPS health dot from ping-only signals (TCP-connect + HTTP HEAD, host configurable) | ISC-16 | — | true |
 
 ## Decisions
 
@@ -200,3 +206,5 @@ host never silently loses a same-day schedule change again.
 - ISC-10: reachability — `GET /internal/snapshot` + `X-Shared-Secret` → HTTP 200, 913KB.
 - ISC-12: boot-log — bridge 1.0.6, 95s past connect: `grep -c "init queries"` = 0; only logged event `backfill complete — switching to live mode`. (On 1.0.5 the same window always produced the 408 at ~46s.)
 - ISC-14: behavior — cleaning-tracker 1.20.1: `ha addons info` shows `homeassistant_api: true`; `POST /digest/run` → `{"notified":true,...}` (was `notified:false` pre-grant).
+- ISC-15: unit (2026-07-23) — `reconcile._channel_silence` 8/8 cases pass (whole-bridge dark → single `bridge_silent` dated today; per-group Daria-dark → `channel_silent` w/ "42 days"+label; min-msgs suppression; healthy→∅; disabled→∅; never-any→`bridge_silent` "ever"; `run()` keeps finding through `filter_and_sort`; dismiss by stable id `channel_silent:gD`). `_parse_msg_ts`+aggregation 7/7 formats (UTC-Z, naive, offset, date-only, space, garbage→None). Live: 1.22.0 deployed, clean boot, `POST /reconcile/run` HTTP 200 executed the detector — 0 silence findings (healthy; absence of `bridge_silent` proves it saw recent real messages). **Pending:** a real digest firing the notification when a channel actually goes dark.
+- ISC-16: in-browser (2026-07-24) — Chromium on live add-on 1.23.0: `#vps-widget` visible, `#vps-dot` class `vps-dot up`, text "VPS online · 75ms · HTTP 401", **0 console errors** (screenshot). `GET /vps/status` → `{"enabled":true,"reachable":true,"latency_ms":75,"http_status":401,"label":"VPS"}`. Options merge preserved all 16 keys (no secret wiped). `_vps_ping` verified against real/down/edge hosts.
