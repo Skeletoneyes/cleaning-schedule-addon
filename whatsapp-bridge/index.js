@@ -108,11 +108,14 @@ function makeWindowCounter(kind, threshold, windowMs, title, messageFn) {
 const countDecryptFailure = makeWindowCounter(
   "decrypt", 5, 10 * 60 * 1000,
   "message decryption failing",
-  (n) => `${n} messages failed to decrypt in the last 10 minutes (libsignal session ` +
-    `corruption — the exact failure mode that silently dropped 3 months of Daria's ` +
-    `messages). Fix: stop the add-on, reinstall it to wipe /data/auth, restart, and ` +
-    `re-scan the QR from the Log tab. Messages sent meanwhile are recoverable via ` +
-    `chat export → transcript ingest.`
+  (n) => `${n} messages failed to decrypt in a cleaning group in the last 10 minutes ` +
+    `(libsignal session corruption — the failure mode that silently dropped 3 months ` +
+    `of Daria's messages). First CHECK, don't re-pair: open the Log tab and confirm ` +
+    `the failures are still arriving and are in an allowlisted group. Only if it ` +
+    `persists, re-pair — uninstall + reinstall the add-on to wipe /data/auth, restore ` +
+    `options, restart, scan the QR. Re-pairing costs the auth state, so it is the ` +
+    `last step, not the first. Messages missed meanwhile are recoverable via chat ` +
+    `export → transcript ingest.`
 );
 
 const countDisconnect = makeWindowCounter(
@@ -134,6 +137,28 @@ const countForwardFailure = makeWindowCounter(
 // Baileys logs decrypt failures through the logger we hand it — intercept them
 // there, since it exposes no public event for this.
 const DECRYPT_ERR_RE = /failed to decrypt|MessageCounterError|Bad MAC|No matching sessions|No SenderKeyRecord|SessionError/i;
+const REMOTE_JID_RE = /"remoteJid"\s*:\s*"([^"]+)"/;
+
+// Only ALARM on failures in groups this bridge actually forwards (same filter
+// as the messages.upsert loop below). The account is in ~60 personal groups;
+// a stale sender-key in "Property Bros" costs the cleaning schedule nothing,
+// but it used to trip a 5-in-10-min alarm whose text says "the exact failure
+// mode that dropped 3 months of Daria's messages" — a false alarm that teaches
+// you to ignore the real one. Out-of-scope failures are still logged (visible
+// in the Log tab), just not escalated to a persistent notification.
+// Unattributable failures (no parseable remoteJid) still count: the detector
+// exists because silent loss went unnoticed for 3 months, so anything we
+// cannot rule out stays loud.
+function noteDecryptFailure(flat) {
+  const jid = (flat.match(REMOTE_JID_RE) || [])[1] || "";
+  const inScope = !jid || GROUP_ALLOWLIST.size === 0 || GROUP_ALLOWLIST.has(jid);
+  if (!inScope) {
+    log.warn({ jid }, "decrypt failure in non-allowlisted group — not alarming");
+    return;
+  }
+  countDecryptFailure();
+}
+
 const baileysLogger = P({
   level: "warn",
   hooks: {
@@ -143,7 +168,7 @@ const baileysLogger = P({
           if (typeof a === "string") return a;
           try { return JSON.stringify(a); } catch { return String(a); }
         }).join(" ");
-        if (DECRYPT_ERR_RE.test(flat)) countDecryptFailure();
+        if (DECRYPT_ERR_RE.test(flat)) noteDecryptFailure(flat);
       } catch {}
       return method.apply(this, args);
     },

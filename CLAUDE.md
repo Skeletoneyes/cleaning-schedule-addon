@@ -421,6 +421,17 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
   notification on connect; turn it back off after). Decrypt failures are
   detected by intercepting the Baileys pino logger (`hooks.logMethod`) —
   Baileys exposes no public event for them.
+- **Decrypt alarm is allowlist-scoped (1.2.0).** The decrypt counter used to
+  count failures in **every** group the account belongs to (~60 personal
+  chats), not just the forwarded ones — so a stale sender-key in an unrelated
+  group fired an alarm whose text blamed the cleaning channel and advised a
+  re-pair. `noteDecryptFailure()` now parses `remoteJid` out of the intercepted
+  log line and only alarms when it's in `group_allowlist` (same filter as the
+  `messages.upsert` loop). Out-of-scope failures are logged at `warn` and
+  visible in the Log tab, just not escalated. **Failures with no parseable
+  `remoteJid` still alarm** — deliberate fail-loud, since silent loss is the
+  bug this whole alarm exists to catch. The alarm text now says check the Log
+  tab first and treat re-pairing as the last step, not the first.
 - **⚠️ Session-corruption failure mode (bit hard 2026-07-21):** libsignal
   `MessageCounterError: Key used already or never filled` on decrypt →
   Baileys stream crashes (code 500) → reconnect → WhatsApp redelivers the
