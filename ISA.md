@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E3
 phase: execute
-updated: 2026-07-24T00:00:00-07:00
-progress: 12/17
+updated: 2026-07-24T12:00:00-07:00
+progress: 13/18
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -99,6 +99,8 @@ host never silently loses a same-day schedule change again.
 
 - [x] ISC-16: The home-page footer shows an ambient VPS health dot fed only by container-collectable "ping" signals (TCP-connect reachability + latency + HTTP status), the target host is a config option (never hardcoded — public repo), and the widget is hidden when unconfigured. *(shipped 1.23.0 + deployed + configured; `_vps_ping` verified against real/down/edge hosts; **in-browser confirmed 2026-07-24** — Chromium on the live add-on rendered a green dot reading "VPS online · 75ms · HTTP 401", zero console errors. Scope limit recorded: pings the box's web surface only — a crashed bot on an up box won't show red.)*
 
+- [x] ISC-17: A health alarm fires only for groups the bridge actually forwards. Decrypt failures in non-allowlisted groups are logged (Log tab) but never escalated to an HA persistent notification; failures with no parseable `remoteJid` still alarm (fail-loud on the unattributable case). Alarm text names checking before re-pairing, so a notification can never be the sole trigger for a destructive action. *(shipped 1.2.0; 5 predicate cases pass against the real log line + live allowlist; **live-proven in production 2026-07-24** — within seconds of deploy, two real `MessageCounterError` events in a non-allowlisted chat logged `decrypt failure in non-allowlisted group — not alarming` and raised nothing.)*
+
 ## Test Strategy
 
 | isc | type | check | threshold | tool |
@@ -114,6 +116,7 @@ host never silently loses a same-day schedule change again.
 | ISC-10 | reachability | GET /internal/snapshot with secret | HTTP 200 | curl |
 | ISC-15 | absence-detect | unit: 8 detector cases (whole-bridge dark, per-group Daria-dark, min-msgs suppress, healthy→∅, disabled→∅, never→'ever', run() survives stale-filter, dismiss by id) + 7 timestamp-format cases | all pass | python + live digest |
 | ISC-16 | render | load home page in Chromium; assert `#vps-widget` visible + dot class `up` + latency text | green dot shown | playwright + curl /vps/status |
+| ISC-17 | precision | 5 predicate cases (real non-allowlisted line detected-but-silent, same failure in cleaner group alarms, no-JID alarms, non-decrypt line uncounted) using the regexes read out of `index.js`; then grep journald for `not alarming` on real traffic | all pass + live hit | node + ssh ha host logs |
 
 ## Features
 
@@ -126,6 +129,7 @@ host never silently loses a same-day schedule change again.
 | ingest-cost-guard | keep backfill facts-only by default; guard apply=true | ISC-9 | — | true |
 | ops-access | off-host snapshot pull + Supervisor lifecycle via SSH | ISC-10 | — | true |
 | channel-silence | absence-of-signal WhatsApp dark-channel detection (`_channel_silence` → bridge_silent + channel_silent) | ISC-15 | — | true |
+| alarm-scoping | bridge health alarms escalate only for allowlisted groups (`noteDecryptFailure`); out-of-scope failures log, unattributable ones still alarm | ISC-17 | — | true |
 | vps-status-widget | footer VPS health dot from ping-only signals (TCP-connect + HTTP HEAD, host configurable) | ISC-16 | — | true |
 
 ## Decisions
@@ -143,9 +147,15 @@ host never silently loses a same-day schedule change again.
 - 2026-06-21 15:10: ❌ DEAD END: regenerating the bridge `package-lock.json` re-introduces `git+ssh://` for `libsignal-node`, breaking `npm ci` in Docker (no SSH keys). Must rewrite the resolved URL to `git+https://` (keep the commit hash) after any lockfile regen.
 - 2026-06-21 16:00: ❌ DEAD END / GOTCHA: don't declare the `init queries` 408 fixed from an early log read — it fires ~46s after connect (Baileys `defaultQueryTimeoutMs` = 60s). A +60s check once read 0 and was wrong; wait past the 60s window before claiming it's gone.
 - 2026-06-21 16:30: Cleared the 607-message review queue: 598 were one-time transcript-**backfill** chatter (not live), 9 were stale live items from before the LID senders were mapped. Bulk-set to `ignored` via the `/internal/snapshot` → edit → `/internal/restore` round-trip (the only bulk-write path since `/data` is private; restore backs up to `data.json.bak`). LID→cleaner/host mappings were already correct (192…→Itzel, 162…/697…→host).
+- 2026-07-24 12:00: GOTCHA: the documented session-corruption fix ("re-pair fresh": uninstall + reinstall to wipe `/data/auth`) is correct but had no **precondition**. Applied on the strength of an alarm alone it costs the auth state to fix nothing — today's alarm was raised by an unrelated personal group. Before re-pairing, confirm the failures are (a) still arriving and (b) in an allowlisted group; `ha addons logs` truncates to ~100 lines and the on-connect group listing floods it, so read journald (`ha host logs --identifier addon_27cbea7f_whatsapp-bridge --lines 400`). Note the observed failures are all `fromMe: true` linked-device echoes scattered across personal groups — benign for cleaning data, now correctly silent, but an ongoing pattern rather than a one-off.
 - 2026-06-21 16:45: GOTCHA: `host_jids` only suppresses the "unmapped sender" prompt — it does NOT remove a host sender's messages from the pending list (`_build_review_context` includes all `pending` regardless). Host chatter keeps queuing; a real fix would skip/auto-ignore `host_jids` senders in the inbound path.
 
 ## Changelog
+
+- 2026-07-24 | conjectured: the 1.1.0 error-burst alarms were merely *insufficient* (they miss silence — the ISC-15 finding), but what they did fire on was real.
+  refuted by: a live `decrypt` alarm naming the cleaning channel and the Daria 3-month mute, raised by a decrypt failure in **"Property Bros"** — a personal group the bridge does not forward. The counter intercepted every Baileys decrypt error on the whole account (~60 groups); only 2 are allowlisted. Forwarding respected `group_allowlist` (`messages.upsert`, index.js), the alarm never did. So the 2026-07-23 entry diagnosed the alarms' recall gap and left an unexamined precision gap directly beneath it.
+  learned: an alarm's scope must match the scope of the thing it protects, or it degrades the channel every *other* alarm rides — ISC-15's silence findings, ISC-6/7's credit alerts and ISC-14's digest all arrive as HA persistent notifications, and a channel that cries wolf about cleaning is one you learn to swipe away. Corollary that nearly bit: the alarm text embedded its own remediation ("stop the add-on, reinstall it to wipe /data/auth, re-scan the QR") — a destructive, auth-losing action recommended by a **false** alarm. Alert copy is not a command; a notification must never be the sole trigger for a destructive step.
+  criterion now: ISC-17 (alarm precision — escalate only for allowlisted groups, stay loud on unattributable failures, verify-before-re-pair copy) added; shipped 1.2.0 and live-proven the same day.
 
 - 2026-07-24 | conjectured: a footer "VPS status" widget can just ping the box and show up/down.
   refuted by: naively, no — (1) raw ICMP isn't available in the add-on container, so a literal ping fails; (2) hardcoding the VPS host would leak personal infra into the public GitHub repo; (3) the hub is Basic-Auth, so a 200 check would read as "down" on a healthy box.
