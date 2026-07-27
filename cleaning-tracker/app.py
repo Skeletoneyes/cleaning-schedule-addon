@@ -59,6 +59,14 @@ DIGEST_LAST_FILE = DATA_DIR / "digest_last.json"
 DIGEST_ENABLED = bool(OPTIONS.get("digest_enabled", False))
 DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 
+# Nightly digest push to the VPS Telegram bot. The Pi initiates (the VPS is
+# egress-locked and cannot pull). Payload is built by ALLOWLIST — finding ids,
+# dates, severities, cleaner first names and the generated `why` line only.
+# Never guest names, WhatsApp text, quotes/evidence, tokens, or secrets.
+VPS_PUSH_ENABLED = bool(OPTIONS.get("vps_push_enabled", False))
+VPS_PUSH_URL = OPTIONS.get("vps_push_url", "")
+VPS_PUSH_SECRET = OPTIONS.get("vps_push_secret", "")
+
 # Channel-silence ("WhatsApp going dark") detection. Complements the bridge's
 # error-burst health alarms, which cannot see a quiet per-group mute (the Daria
 # failure: 3 months of silently-dropped messages, no error to count).
@@ -2683,6 +2691,7 @@ def _digest_compute_and_notify():
         message = "\n".join(lines) if lines else "No new findings."
 
     notified = _post_ha_notification(title, message)
+    _push_digest_to_vps(new_findings, resolved_count, result["counts"])
 
     DIGEST_LAST_FILE.write_text(json.dumps({
         "run_at": datetime.now().isoformat(timespec="seconds"),
@@ -2702,19 +2711,97 @@ def _digest_compute_and_notify():
     }
 
 
+def _push_digest_to_vps(new_findings, resolved_count, counts):
+    """POST the nightly digest to the VPS Telegram bot (allowlist-built payload).
+
+    Fires every night including clean ones — `heartbeat: true` is the VPS-side
+    dead-man's-switch signal, so a quiet night must still produce a POST.
+    Fail-loud: any failure posts an HA persistent notification.
+    """
+    if not (VPS_PUSH_ENABLED and VPS_PUSH_URL and VPS_PUSH_SECRET):
+        return False
+    payload = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "heartbeat": True,
+        "counts": {
+            "total": counts.get("total", 0),
+            "needs-attention": counts.get("needs-attention", 0),
+            "suggest": counts.get("suggest", 0),
+            "informational": counts.get("informational", 0),
+        },
+        "new": len(new_findings),
+        "resolved": resolved_count,
+        # Allowlist projection — NEVER pass findings through whole. `quote` and
+        # `evidence` (raw WhatsApp text) must not cross to the VPS.
+        "findings": [
+            {
+                "id": f.get("id"),
+                "detector": f.get("detector"),
+                "kind": f.get("kind"),
+                "severity": f.get("severity"),
+                "date": f.get("date"),
+                "cleaner": f.get("cleaner"),
+                "why": f.get("why"),
+            }
+            for f in new_findings
+        ],
+    }
+    try:
+        resp = requests.post(
+            VPS_PUSH_URL,
+            json=payload,
+            headers={"X-Push-Secret": VPS_PUSH_SECRET},
+            timeout=20,
+        )
+        if resp.status_code // 100 != 2:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        print(f"[vps-push] ok — {len(new_findings)} new, heartbeat sent")
+        return True
+    except Exception as e:
+        print(f"[vps-push] FAILED: {e}")
+        _post_ha_notification(
+            "Cleaning digest push failed",
+            f"Could not deliver the nightly digest to the VPS bot: {e}. "
+            "Telegram alerts will not fire until this is fixed.",
+        )
+        return False
+
+
 def _digest_scheduler():
-    """Background thread: sleeps until DIGEST_TIME each day, then runs the digest."""
+    """Background thread: nightly maintenance at DIGEST_TIME.
+
+    Order is load-bearing: sync the Airbnb iCal FIRST so the reconcile/digest
+    runs against fresh world state ("reconciling stale data produces confident
+    garbage"). Sync runs even when the digest is disabled — before 1.24.0,
+    sync only ran at process startup, so a quiet deploy-free stretch left
+    data.json days stale (the Oct 16-18 cancellation sat unapplied for 3 days).
+    """
     try:
         hour, minute = map(int, DIGEST_TIME.split(":"))
     except Exception:
         hour, minute = 8, 0
-    print(f"[digest] scheduler started — daily at {hour:02d}:{minute:02d}")
+    print(f"[digest] scheduler started — daily at {hour:02d}:{minute:02d} (sync then digest)")
     while True:
         now = datetime.now()
         next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if next_run <= now:
             next_run += timedelta(days=1)
         time.sleep((next_run - now).total_seconds())
+        if ICAL_URL:
+            try:
+                _, sync_err = sync_ical()
+                if sync_err:
+                    raise RuntimeError(sync_err)
+                print("[digest] nightly iCal sync ok")
+            except Exception as e:
+                print(f"[digest] nightly iCal sync FAILED: {e}")
+                _post_ha_notification(
+                    "Cleaning iCal sync failed",
+                    f"The nightly Airbnb calendar sync failed: {e}. "
+                    "Bookings may be stale until this is fixed.",
+                )
+        if not DIGEST_ENABLED:
+            continue
         try:
             r = _digest_compute_and_notify()
             print(f"[digest] ran: new={r['new']} resolved={r['resolved']} notified={r['notified']}")
@@ -3344,8 +3431,9 @@ if __name__ == "__main__":
     ensure_workers_started()
     print("WhatsApp parse workers started (pool=2).")
 
-    if DIGEST_ENABLED:
-        threading.Thread(target=_digest_scheduler, daemon=True, name="digest-scheduler").start()
+    # Always start — the thread owns the nightly iCal sync (1.24.0) even when
+    # the digest itself is disabled.
+    threading.Thread(target=_digest_scheduler, daemon=True, name="digest-scheduler").start()
 
     print("\nStarting server at http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)

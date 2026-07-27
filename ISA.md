@@ -2,10 +2,10 @@
 title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
-effort: E3
-phase: execute
-updated: 2026-07-24T12:00:00-07:00
-progress: 13/18
+effort: E4
+phase: build
+updated: 2026-07-27T10:30:00-07:00
+progress: 13/39
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -100,6 +100,30 @@ host never silently loses a same-day schedule change again.
 - [x] ISC-16: The home-page footer shows an ambient VPS health dot fed only by container-collectable "ping" signals (TCP-connect reachability + latency + HTTP status), the target host is a config option (never hardcoded — public repo), and the widget is hidden when unconfigured. *(shipped 1.23.0 + deployed + configured; `_vps_ping` verified against real/down/edge hosts; **in-browser confirmed 2026-07-24** — Chromium on the live add-on rendered a green dot reading "VPS online · 75ms · HTTP 401", zero console errors. Scope limit recorded: pings the box's web surface only — a crashed bot on an up box won't show red.)*
 
 - [x] ISC-17: A health alarm fires only for groups the bridge actually forwards. Decrypt failures in non-allowlisted groups are logged (Log tab) but never escalated to an HA persistent notification; failures with no parseable `remoteJid` still alarm (fail-loud on the unattributable case). Alarm text names checking before re-pairing, so a notification can never be the sole trigger for a destructive action. *(shipped 1.2.0; 5 predicate cases pass against the real log line + live allowlist; **live-proven in production 2026-07-24** — within seconds of deploy, two real `MessageCounterError` events in a non-allowlisted chat logged `decrypt failure in non-allowlisted group — not alarming` and raised nothing.)*
+
+### Nightly pipeline (2026-07-27, Council-specced: sync → sanitized push → subscription triage → Telegram)
+
+- [ ] ISC-18: The nightly scheduler calls `sync_ical()` strictly before the digest/reconcile each night (code order + live: `last_sync` advances daily without deploys).
+- [ ] ISC-19: The nightly sync runs even when `digest_enabled` is false (sync is not gated on digest).
+- [ ] ISC-20: A sync failure posts an HA persistent notification (fail-loud, same channel as credit breaker).
+- [ ] ISC-21: Post-deploy, the Oct 16–18 booking (missing from iCal since ~Jul 25) is `status: cancelled` in data.json.
+- [ ] ISC-22: Post-deploy, the May 14–16 2027 iCal reservation exists as a booking in data.json.
+- [ ] ISC-23: The push payload contains ONLY allowlisted fields (ts, heartbeat, counts, findings: id/detector/kind/severity/date/cleaner/why) — built by allowlist, not by deletion.
+- [ ] ISC-24: Anti: the serialized payload never contains the iCal token, any shared secret, WhatsApp message text, or the `quote`/`evidence` fields of findings.
+- [ ] ISC-25: The digest push POSTs to `vps_push_url` with `X-Push-Secret`; a non-2xx/unreachable result posts an HA notification.
+- [ ] ISC-26: The push fires every night including clean ones (`heartbeat: true` always present) so VPS-side silence detection has a daily signal.
+- [ ] ISC-27: New options `vps_push_enabled`/`vps_push_url`/`vps_push_secret` exist in the schema; with push disabled the nightly path runs with no errors and no POST.
+- [ ] ISC-28: Add-on 1.24.0 is the running version on the Pi (`ha addons info` version match, state started).
+- [ ] ISC-29: The bot exposes a localhost-only HTTP listener; a digest POST with the correct secret returns 200 and persists digest state to disk.
+- [ ] ISC-30: A POST with wrong/missing secret returns 401 and persists nothing.
+- [ ] ISC-31: `https://play.joshuamohan.com/cleaning/digest` routes through Caddy to the bot listener (external curl succeeds end-to-end with secret).
+- [ ] ISC-32: A digest with new findings triggers a subscription-billed triage pass and a Telegram message to Josh split into "Actions needed" vs "Unresolved conflicts" (bot log shows sendMessage ok + message_id).
+- [ ] ISC-33: A clean digest (zero new findings) sends NO Telegram message (quiet-when-clean, log-proven).
+- [ ] ISC-34: Dead-man's switch: last-digest-received age >25h triggers a Telegram alert; proven by synthetic stale stamp; a fresh digest resets it.
+- [ ] ISC-35: Anti: the bot gains no write path toward the Pi or bookings — no new outbound HTTP to the Pi, toolset/policy unchanged for the chat path.
+- [ ] ISC-36: Anti: a triage/SDK failure still delivers a plain formatted findings message (fallback), never silence.
+- [ ] ISC-37: The bot service restarts clean post-deploy (systemd active, no crash-loop, existing chat config intact in logs).
+- [ ] ISC-38: End-to-end live proof: a real digest run on the Pi produces a real Telegram message on Josh's phone.
 
 ## Test Strategy
 
