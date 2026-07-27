@@ -5,7 +5,7 @@ type: project
 effort: E4
 phase: execute
 updated: 2026-07-27T13:50:00-07:00
-progress: 36/42
+progress: 37/43
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -125,6 +125,7 @@ host never silently loses a same-day schedule change again.
 - [x] ISC-37: Bot restarts clean post-deploy. *(systemd active; "listener started" + "Bot started" log lines; 3 restarts, no crash-loop.)*
 - [x] ISC-38: End-to-end live proof on real data. *(Pi digest run → VPS receipt logged → Telegram message delivered to Josh's phone.)*
 - [x] ISC-40: Anti: an injected synthetic finding must never leave `counts` disagreeing with `findings` — a consumer keying off counts would read a stale-sync night as healthy. *(Cato cross-vendor finding, gpt-5.5; fixed 1.24.2 — counts incremented with the sentinel; live-verified push post-deploy.)*
+- [x] ISC-42: Every date in the Telegram message carries its year — the schedule spans >1 year ahead, so a bare "Jul 28" cannot be read. *(Josh caught this on the first real message, 2026-07-27. Root cause: the triage prompt's own worked example omitted years ("Jul 28, Jul 30, Aug 2") and the model reproduced the example, not the data — the findings JSON always carried full ISO dates. Fixed + live-verified: "4 unassigned bookings: Sep 8, Sep 10, Sep 18, Sep 20 (2026)". The sent message body is now logged so rendered output is inspectable — the bug was invisible in the data and only existed in the rendering.)*
 - [ ] ISC-41: Anti: no finding's `why` value may carry raw WhatsApp text, guest names, or evidence content across to the VPS. *(Cato blind-spot: field allowlists create false confidence when sensitive content can move INTO an allowed value. Verified safe by inspection 2026-07-27 — all 18 `why` sites in `reconcile.py` are f-string templates over structured fields (cleaner, date, uid); raw text lives only in `quote`, which is excluded. NOT yet enforced by a test — a future detector could regress this silently. Follow-up: assert in a unit test that every `why` template is constructed, never copied from `messages[].text`.)*
 - [x] ISC-39: A digest computed against a stale world cannot read as a healthy night — if `last_sync` is >26h old (or absent) at push time, a synthetic `pipeline:stale-sync` needs-attention finding is injected so staleness rides the normal triage → Telegram path and breaks quiet-when-clean. *(1.24.1; advisor-identified gap; code probe + py_compile; window chosen 26h > nightly cadence, aligned with the VPS 25h+1h dead-man.)*
 
