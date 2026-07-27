@@ -2727,6 +2727,7 @@ def _push_digest_to_vps(new_findings, resolved_count, counts):
     # quiet-when-clean. 26h > the 24h nightly cadence, < the 25h+1h dead-man
     # window on the VPS, so one missed sync alarms exactly once.
     new_findings = list(new_findings)
+    counts = dict(counts)
     try:
         last_sync = load_data().get("last_sync")
         age_h = None
@@ -2743,6 +2744,11 @@ def _push_digest_to_vps(new_findings, resolved_count, counts):
                 "cleaner": None,
                 "why": f"Airbnb iCal sync is stale ({age_txt} old) — tonight's digest may be reconciling outdated bookings. Check the cleaning-tracker add-on.",
             })
+            # Counts must agree with findings, or a downstream consumer keying
+            # off counts reads the stale-sync night as healthy — reintroducing
+            # the exact "looks fine" failure this sentinel exists to break.
+            counts["total"] = counts.get("total", 0) + 1
+            counts["needs-attention"] = counts.get("needs-attention", 0) + 1
     except Exception as e:
         print(f"[vps-push] freshness guard error (non-fatal): {e}")
     payload = {

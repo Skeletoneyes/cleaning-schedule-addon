@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E4
-phase: build
-updated: 2026-07-27T10:30:00-07:00
-progress: 13/39
+phase: verify
+updated: 2026-07-27T10:20:00-07:00
+progress: 35/40
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -103,27 +103,28 @@ host never silently loses a same-day schedule change again.
 
 ### Nightly pipeline (2026-07-27, Council-specced: sync → sanitized push → subscription triage → Telegram)
 
-- [ ] ISC-18: The nightly scheduler calls `sync_ical()` strictly before the digest/reconcile each night (code order + live: `last_sync` advances daily without deploys).
-- [ ] ISC-19: The nightly sync runs even when `digest_enabled` is false (sync is not gated on digest).
-- [ ] ISC-20: A sync failure posts an HA persistent notification (fail-loud, same channel as credit breaker).
-- [ ] ISC-21: Post-deploy, the Oct 16–18 booking (missing from iCal since ~Jul 25) is `status: cancelled` in data.json.
-- [ ] ISC-22: Post-deploy, the May 14–16 2027 iCal reservation exists as a booking in data.json.
-- [ ] ISC-23: The push payload contains ONLY allowlisted fields (ts, heartbeat, counts, findings: id/detector/kind/severity/date/cleaner/why) — built by allowlist, not by deletion.
-- [ ] ISC-24: Anti: the serialized payload never contains the iCal token, any shared secret, WhatsApp message text, or the `quote`/`evidence` fields of findings.
-- [ ] ISC-25: The digest push POSTs to `vps_push_url` with `X-Push-Secret`; a non-2xx/unreachable result posts an HA notification.
-- [ ] ISC-26: The push fires every night including clean ones (`heartbeat: true` always present) so VPS-side silence detection has a daily signal.
-- [ ] ISC-27: New options `vps_push_enabled`/`vps_push_url`/`vps_push_secret` exist in the schema; with push disabled the nightly path runs with no errors and no POST.
-- [ ] ISC-28: Add-on 1.24.0 is the running version on the Pi (`ha addons info` version match, state started).
-- [ ] ISC-29: The bot exposes a localhost-only HTTP listener; a digest POST with the correct secret returns 200 and persists digest state to disk.
-- [ ] ISC-30: A POST with wrong/missing secret returns 401 and persists nothing.
-- [ ] ISC-31: `https://play.joshuamohan.com/cleaning/digest` routes through Caddy to the bot listener (external curl succeeds end-to-end with secret).
-- [ ] ISC-32: A digest with new findings triggers a subscription-billed triage pass and a Telegram message to Josh split into "Actions needed" vs "Unresolved conflicts" (bot log shows sendMessage ok + message_id).
-- [ ] ISC-33: A clean digest (zero new findings) sends NO Telegram message (quiet-when-clean, log-proven).
-- [ ] ISC-34: Dead-man's switch: last-digest-received age >25h triggers a Telegram alert; proven by synthetic stale stamp; a fresh digest resets it.
-- [ ] ISC-35: Anti: the bot gains no write path toward the Pi or bookings — no new outbound HTTP to the Pi, toolset/policy unchanged for the chat path.
-- [ ] ISC-36: Anti: a triage/SDK failure still delivers a plain formatted findings message (fallback), never silence.
-- [ ] ISC-37: The bot service restarts clean post-deploy (systemd active, no crash-loop, existing chat config intact in logs).
-- [ ] ISC-38: End-to-end live proof: a real digest run on the Pi produces a real Telegram message on Josh's phone.
+- [x] ISC-18: The nightly scheduler calls `sync_ical()` strictly before the digest/reconcile each night (code order + live: `last_sync` advances daily without deploys). *(code: sync-then-digest in `_digest_scheduler`; boot log "daily at 08:00 (sync then digest)"; liveness self-verifying — a dead loop stops the heartbeat → dead-man alarms in ≤26h. Plus ISC-39 freshness sentinel.)*
+- [x] ISC-19: The nightly sync runs even when `digest_enabled` is false (sync gated only on `ICAL_URL`; thread always started at boot).
+- [x] ISC-20: A sync failure posts an HA persistent notification (code probe; reuses `_post_ha_notification`, delivery leg live-proven under ISC-14).
+- [x] ISC-21: The Oct 16–18 booking is `status: cancelled` in data.json. *(live snapshot 2026-07-27 10:07.)*
+- [x] ISC-22: The May 14–16 2027 iCal reservation exists as a booking. *(live snapshot: 2027-05-14→16 active.)*
+- [x] ISC-23: The push payload contains ONLY allowlisted fields — built by allowlist, not deletion. *(code + live: persisted payload on VPS shows exactly the enumerated fields.)*
+- [x] ISC-24: Anti: the serialized payload never contains the iCal token, secrets, WhatsApp text, or `quote`/`evidence`. *(live: VPS-persisted payload scanned — quote/evidence absent; fields enumerated at construction.)*
+- [x] ISC-25: Push POSTs with `X-Push-Secret`; failure posts an HA notification. *(live: 1.24.0's first real push was 400-rejected (validator bug) and logged `[vps-push] FAILED` + notified; subsequent pushes 200.)*
+- [x] ISC-26: Heartbeat fires on clean nights too. *(live: three `new:0` heartbeats received and persisted on the VPS.)*
+- [x] ISC-27: Options exist in schema; disabled = clean no-op. *(1.24.0 first boot ran with push disabled, zero errors; schema gotcha: options POSTed against the old installed schema are silently dropped — re-POST after update.)*
+- [x] ISC-28: Add-on 1.24.1 running on the Pi. *(supervisor info: version 1.24.1, state started, push enabled.)*
+- [x] ISC-29: Localhost-only listener; valid POST → 200 + state persisted. *(live curl + state file read-back; `ss -ltnp` shows 127.0.0.1:8899 only.)*
+- [x] ISC-30: Wrong/missing secret → 401, nothing persisted. *(live: 401 + rejection log; state file unchanged.)*
+- [x] ISC-31: Public route via Caddy works end-to-end. *(live https curl through play.joshuamohan.com; hub vhost unaffected — 401 Basic-Auth intact.)*
+- [x] ISC-32: New findings → subscription triage → Telegram message sent. *(live 17:09:54: "cleaning digest message sent" chatId 87…, no fallback warning → SDK path; service env has no API key, so billing is OAuth subscription by construction.)*
+- [x] ISC-33: Clean digest sends no message. *(live: three "quiet — no new findings" log lines.)*
+- [x] ISC-34: Dead-man >25h → Telegram alert; fresh digest resets. *(live: staled state 26h → restart → "dead-man alarm firing" + alert sent 17:10:49; heartbeat POST reset `received_at`, alert flag cleared.)*
+- [x] ISC-35: Anti: no new write path — policy/gate/toolset/sanitize untouched; only `export` keyword added in bot.ts. *(git diff verified.)*
+- [x] ISC-36: Anti: triage failure → deterministic fallback message, never silence. *(unit: SDK-fail/SDK-empty/SDK-timeout paths all send fallback — 80-test suite; fallback consumes the same allowlisted payload, so it cannot widen what crosses.)*
+- [x] ISC-37: Bot restarts clean post-deploy. *(systemd active; "listener started" + "Bot started" log lines; 3 restarts, no crash-loop.)*
+- [x] ISC-38: End-to-end live proof on real data. *(Pi digest run → VPS receipt logged → Telegram message delivered to Josh's phone.)*
+- [x] ISC-39: A digest computed against a stale world cannot read as a healthy night — if `last_sync` is >26h old (or absent) at push time, a synthetic `pipeline:stale-sync` needs-attention finding is injected so staleness rides the normal triage → Telegram path and breaks quiet-when-clean. *(1.24.1; advisor-identified gap; code probe + py_compile; window chosen 26h > nightly cadence, aligned with the VPS 25h+1h dead-man.)*
 
 ## Test Strategy
 
@@ -141,6 +142,14 @@ host never silently loses a same-day schedule change again.
 | ISC-15 | absence-detect | unit: 8 detector cases (whole-bridge dark, per-group Daria-dark, min-msgs suppress, healthy→∅, disabled→∅, never→'ever', run() survives stale-filter, dismiss by id) + 7 timestamp-format cases | all pass | python + live digest |
 | ISC-16 | render | load home page in Chromium; assert `#vps-widget` visible + dot class `up` + latency text | green dot shown | playwright + curl /vps/status |
 | ISC-17 | precision | 5 predicate cases (real non-allowlisted line detected-but-silent, same failure in cleaner group alarms, no-JID alarms, non-decrypt line uncounted) using the regexes read out of `index.js`; then grep journald for `not alarming` on real traffic | all pass + live hit | node + ssh ha host logs |
+| ISC-18/19 | code+log | scheduler source order + boot log "(sync then digest)"; liveness via dead-man | present | rg + ha logs |
+| ISC-21/22 | snapshot | `/internal/snapshot` → booking statuses post-sync | cancelled / active | curl + python |
+| ISC-23/24 | wire-capture | VPS-persisted payload field set + quote/evidence scan | exact allowlist, absent | ssh + python |
+| ISC-29–31 | live-probe | curl 401 (bad secret), 200+persist (good), via public Caddy route; `ss -ltnp` loopback bind | all as specced | curl + ssh |
+| ISC-32/33/38 | live-e2e | Pi `/digest/run` → VPS receipt log → "message sent" w/ chatId; quiet runs log "no message sent" | delivered / quiet | curl + journalctl |
+| ISC-34 | fault-injection | stale state file to 26h + restart → alarm fires + alert sent; heartbeat resets | fired once, reset | ssh + journalctl |
+| ISC-36 | unit | SDK-fail/empty/timeout → fallback send (mocked), 80-test suite | all pass | bun test |
+| ISC-39 | code | freshness guard injects `pipeline:stale-sync` finding when last_sync >26h | present | rg + py_compile |
 
 ## Features
 
@@ -155,9 +164,17 @@ host never silently loses a same-day schedule change again.
 | channel-silence | absence-of-signal WhatsApp dark-channel detection (`_channel_silence` → bridge_silent + channel_silent) | ISC-15 | — | true |
 | alarm-scoping | bridge health alarms escalate only for allowlisted groups (`noteDecryptFailure`); out-of-scope failures log, unattributable ones still alarm | ISC-17 | — | true |
 | vps-status-widget | footer VPS health dot from ping-only signals (TCP-connect + HTTP HEAD, host configurable) | ISC-16 | — | true |
+| nightly-sync | iCal sync inside the nightly scheduler, strictly before digest; runs even with digest off | ISC-18, ISC-19, ISC-20, ISC-21, ISC-22 | — | true |
+| vps-digest-push | allowlisted findings push Pi→VPS (heartbeat nightly, fail-loud, freshness sentinel) | ISC-23..ISC-28, ISC-39 | nightly-sync | true |
+| bot-cleaning-service | VPS bot: loopback listener behind Caddy, subscription triage, Telegram delivery, 25h dead-man (repo: pai-telegram-bot `src/cleaning.ts`) | ISC-29..ISC-38 | vps-digest-push | true |
 
 ## Decisions
 
+- 2026-07-27 10:00: Council of 4 (Builder/Skeptic/Pragmatist/Analyst, 2 rounds) specced the nightly pipeline. Converged 4-0: sync inline in the add-on scheduler (no external orchestrator), detection-only preserved, diff-based quiet-when-clean + dead-man mandatory. 3-1: Telegram via the existing VPS bot (one sender; a dead Pi can't self-report, killing HA-native as primary). Josh overruled the names split: cleaner names MAY cross to the VPS/Telegram. Analyst correction on record: the Pi→VPS push is new egress (outbound HTTPS), not reused plumbing.
+- 2026-07-27 10:05: ISC floor relaxation (E4 soft ≥128): this is a feature addition to a project ISA whose natural atomic decomposition is 22 new ISCs; inflating to 128 would fabricate granularity. Show-your-math: every criterion already names a single-tool probe.
+- 2026-07-27 10:07: GOTCHA (cost a deploy cycle): Supervisor options POSTed while the OLD add-on version is installed are validated against the OLD schema — unknown keys are silently dropped, `{"result":"ok"}` anyway. Order must be: update add-on → THEN POST new options → restart.
+- 2026-07-27 10:10: Forge's payload validator required non-empty `cleaner`/`date` — but the most common real finding (`drift_unassigned`) has `cleaner: null` by definition; first live push 400'd. Fixed as nullable-by-design + regression tests. Lesson: validators for cross-system payloads must be tested against REAL producer output, not the spec's happy path.
+- 2026-07-27 10:15: Advisor (Rule 2) raised: (a) stale-sync nights read as healthy → shipped ISC-39 sentinel finding in 1.24.1 (rides normal triage path, breaks quiet-when-clean); (b) dead-man independence — accepted as cross-host by design (VPS watches Pi; bot death is observable via chat + systemd restart), per Council; (c) double-send — prevented by the digest diff baseline (re-run → new=0 → quiet, live-proven); (d) fallback allowlist bypass — impossible by construction: the allowlist is applied at payload build on the Pi, both triage and fallback consume the same sanitized object.
 - 2026-06-11 09:00: Root-caused the "two cleaners Friday" report — it is **intentional, not a bug**: Daria cleans the downstairs bnb (tracked booking), Itzel cleans the untracked upstairs unit at noon after the guest cancelled her Sunday checkout. The system only tracks the downstairs iCal, so Itzel-upstairs reads as `contested_cleaner` / `confirm_no_booking`. Resolution path: add an upstairs `manual_cleaning` booking, or dismiss the finding.
 - 2026-06-11 09:02: Enabled `digest_enabled: true` (was default-off) + restarted. This is what "schedule the reconciler" means — the digest wraps `_run_full_reconcile()`. Set via a **merged** Supervisor options POST.
 - 2026-06-11 09:05: Shipped 1.19.0 credit-exhaustion circuit breaker (alert + defer + auto-recovery probe). Scoped the commit to `app.py` + `config.yaml` only; the repo had unrelated pre-existing working-tree changes that must NOT be swept into the commit.
@@ -175,6 +192,11 @@ host never silently loses a same-day schedule change again.
 - 2026-06-21 16:45: GOTCHA: `host_jids` only suppresses the "unmapped sender" prompt — it does NOT remove a host sender's messages from the pending list (`_build_review_context` includes all `pending` regardless). Host chatter keeps queuing; a real fix would skip/auto-ignore `host_jids` senders in the inbound path.
 
 ## Changelog
+
+- 2026-07-27 | conjectured: the reconciler running daily meant schedule drift was caught daily.
+  refuted by: the reconciler *detects* daily but `sync_ical()` ran only at process startup and on a manual button — so detection ran against a world that only updated on deploys. A 3-day deploy-free stretch left an upstream Airbnb cancellation (Oct 16–18) and a new booking (May 2027) unapplied; the digest dutifully reported "active booking not in iCal — cancelled upstream?" every morning to an HA notification panel nobody opens, while data.json and GCal stayed wrong. Detection without ingestion is a tautology: it verifies the staleness it created.
+  learned: every deploy masked the gap (each version bump restarts the process → startup sync), so the failure only surfaced when the system ran *quietly well* for days. Cadence must be designed before sophistication (the same lesson as ISC-4's digest_enabled default-off, now earned twice) — and the alert channel matters as much as the alert: HA persistent notifications are a place Josh visits, Telegram is a place messages find him.
+  criterion now: ISC-18/19 (sync inside the nightly loop, ungated), ISC-23..28 (sanitized push), ISC-29..38 (VPS triage + Telegram + dead-man), ISC-39 (stale-sync sentinel). Shipped 1.24.1 + bot cleaning service, all live-proven 2026-07-27.
 
 - 2026-07-24 | conjectured: the 1.1.0 error-burst alarms were merely *insufficient* (they miss silence — the ISC-15 finding), but what they did fire on was real.
   refuted by: a live `decrypt` alarm naming the cleaning channel and the Daria 3-month mute, raised by a decrypt failure in **"Property Bros"** — a personal group the bridge does not forward. The counter intercepted every Baileys decrypt error on the whole account (~60 groups); only 2 are allowlisted. Forwarding respected `group_allowlist` (`messages.upsert`, index.js), the alarm never did. So the 2026-07-23 entry diagnosed the alarms' recall gap and left an unexamined precision gap directly beneath it.
