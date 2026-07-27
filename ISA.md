@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E4
-phase: verify
-updated: 2026-07-27T10:20:00-07:00
-progress: 35/40
+phase: execute
+updated: 2026-07-27T13:50:00-07:00
+progress: 36/42
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -124,6 +124,8 @@ host never silently loses a same-day schedule change again.
 - [x] ISC-36: Anti: triage failure → deterministic fallback message, never silence. *(unit: SDK-fail/SDK-empty/SDK-timeout paths all send fallback — 80-test suite; fallback consumes the same allowlisted payload, so it cannot widen what crosses.)*
 - [x] ISC-37: Bot restarts clean post-deploy. *(systemd active; "listener started" + "Bot started" log lines; 3 restarts, no crash-loop.)*
 - [x] ISC-38: End-to-end live proof on real data. *(Pi digest run → VPS receipt logged → Telegram message delivered to Josh's phone.)*
+- [x] ISC-40: Anti: an injected synthetic finding must never leave `counts` disagreeing with `findings` — a consumer keying off counts would read a stale-sync night as healthy. *(Cato cross-vendor finding, gpt-5.5; fixed 1.24.2 — counts incremented with the sentinel; live-verified push post-deploy.)*
+- [ ] ISC-41: Anti: no finding's `why` value may carry raw WhatsApp text, guest names, or evidence content across to the VPS. *(Cato blind-spot: field allowlists create false confidence when sensitive content can move INTO an allowed value. Verified safe by inspection 2026-07-27 — all 18 `why` sites in `reconcile.py` are f-string templates over structured fields (cleaner, date, uid); raw text lives only in `quote`, which is excluded. NOT yet enforced by a test — a future detector could regress this silently. Follow-up: assert in a unit test that every `why` template is constructed, never copied from `messages[].text`.)*
 - [x] ISC-39: A digest computed against a stale world cannot read as a healthy night — if `last_sync` is >26h old (or absent) at push time, a synthetic `pipeline:stale-sync` needs-attention finding is injected so staleness rides the normal triage → Telegram path and breaks quiet-when-clean. *(1.24.1; advisor-identified gap; code probe + py_compile; window chosen 26h > nightly cadence, aligned with the VPS 25h+1h dead-man.)*
 
 ## Test Strategy
@@ -263,4 +265,16 @@ host never silently loses a same-day schedule change again.
 - ISC-12: boot-log — bridge 1.0.6, 95s past connect: `grep -c "init queries"` = 0; only logged event `backfill complete — switching to live mode`. (On 1.0.5 the same window always produced the 408 at ~46s.)
 - ISC-14: behavior — cleaning-tracker 1.20.1: `ha addons info` shows `homeassistant_api: true`; `POST /digest/run` → `{"notified":true,...}` (was `notified:false` pre-grant).
 - ISC-15: unit (2026-07-23) — `reconcile._channel_silence` 8/8 cases pass (whole-bridge dark → single `bridge_silent` dated today; per-group Daria-dark → `channel_silent` w/ "42 days"+label; min-msgs suppression; healthy→∅; disabled→∅; never-any→`bridge_silent` "ever"; `run()` keeps finding through `filter_and_sort`; dismiss by stable id `channel_silent:gD`). `_parse_msg_ts`+aggregation 7/7 formats (UTC-Z, naive, offset, date-only, space, garbage→None). Live: 1.22.0 deployed, clean boot, `POST /reconcile/run` HTTP 200 executed the detector — 0 silence findings (healthy; absence of `bridge_silent` proves it saw recent real messages). **Pending:** a real digest firing the notification when a channel actually goes dark.
+- ISC-18/19: code+log (2026-07-27) — `_digest_scheduler` calls `sync_ical()` then `_digest_compute_and_notify()`; `if not DIGEST_ENABLED: continue` sits BETWEEN them so sync is ungated. Boot log: `[digest] scheduler started — daily at 08:00 (sync then digest)`. Thread now started unconditionally at `__main__`.
+- ISC-21/22: snapshot (2026-07-27 10:07) — post-deploy `/internal/snapshot`: Oct 16–18 `status: cancelled` (was `active`); `2027-05-14 → 2027-05-16 active` now present. `last_sync` advanced to 10:07:43 from 3-day-old 07-24T08:26.
+- ISC-23/24: wire-capture — VPS-persisted `cleaning-digest.json` payload contains exactly `ts, heartbeat, counts{4}, new, resolved, findings[{id,detector,kind,severity,date,cleaner,why}]`; substring scan for `quote`/`evidence` on the serialized payload → False.
+- ISC-25: live — the first 1.24.0 push was rejected `400` by the bot validator; add-on logged `[vps-push] FAILED: HTTP 400` and posted the HA notification (fail-loud proven by a real failure, not a simulated one). Post-fix pushes return 200.
+- ISC-29/30/31: live-probe — `POST https://play.joshuamohan.com/cleaning/digest` with bad secret → `401` + log `push rejected: missing or invalid X-Push-Secret`, state file untouched; with correct secret → `{"ok":true}` 200 + state persisted. `ss -ltnp` on the VPS: `LISTEN 127.0.0.1:8899 users:(("bun"...))` — loopback only, never 0.0.0.0. Caddy `handle /cleaning/digest` added; hub vhost still returns its Basic-Auth 401 (unaffected).
+- ISC-32/38: live-e2e (2026-07-27 17:09) — dismiss/undismiss cycle on a real finding produced `new:1`; VPS logged `cleaning digest received {new:1, findingsCount:1}` then `cleaning digest message sent {chatId:87…, length:78}` with no fallback warning → the subscription SDK triage path ran. Service env carries no `ANTHROPIC_API_KEY` (systemd `ExecStartPre` refuses to boot with one), so billing is OAuth-subscription by construction.
+- ISC-33: live — three separate clean digests each logged `cleaning digest quiet — no new findings, no message sent`; zero Telegram sends.
+- ISC-34: fault-injection (17:10) — state `received_at` back-dated 26h + service restart → `cleaning pipeline dead-man alarm firing {reason:"stale"}` then `message sent {length:120}`. A fresh heartbeat POST reset `received_at` to now and cleared `last_alert_at`. (Start-time immediate check added by hand — Forge's version only checked hourly, so a restart could grant a dark pipeline an extra hour of silence.)
+- ISC-36: unit — `bun test` 80 pass / 0 fail / 146 expects across 3 files, incl. SDK-fail, SDK-empty and SDK-timeout (hung generator raced to a 50ms deadline) all producing a fallback send.
+- ISC-37: systemd — `systemctl is-active pai-telegram-bot` → active across 3 restarts; logs show `cleaning digest listener started {port:8899}` + `Bot started: @josh_vela_claude_bot`. `git diff src/bot.ts` = one `export` keyword; policy/gate/toolset/sanitize untouched.
+- ISC-39: code — `_push_digest_to_vps` computes `last_sync` age and appends `pipeline:stale-sync` when >26h or absent; `python3 -m py_compile app.py` clean; deployed 1.24.1.
+- ISC-40: code+live — `counts = dict(counts)` then `total`/`needs-attention` incremented alongside the sentinel; 1.24.2 deployed (`version: 1.24.2, state: started`), post-deploy digest push accepted 200.
 - ISC-16: in-browser (2026-07-24) — Chromium on live add-on 1.23.0: `#vps-widget` visible, `#vps-dot` class `vps-dot up`, text "VPS online · 75ms · HTTP 401", **0 console errors** (screenshot). `GET /vps/status` → `{"enabled":true,"reachable":true,"latency_ms":75,"http_status":401,"label":"VPS"}`. Options merge preserved all 16 keys (no secret wiped). `_vps_ping` verified against real/down/edge hosts.
