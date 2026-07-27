@@ -3,8 +3,8 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E4
-phase: execute
-updated: 2026-07-27T13:50:00-07:00
+phase: complete
+updated: 2026-07-27T14:10:00-07:00
 progress: 37/43
 ---
 
@@ -27,15 +27,28 @@ actually booked," "who was told," and "who agreed" was invisible until a
 cleaner showed up to a wrong door — or didn't show at all. The LLM and calendar
 layers add a second failure surface: when they break, they break *silently*.
 
+Two further failures, both found 2026-07-27, are about **liveness and reach**
+rather than detection. (1) The world-model only refreshed on process start:
+the reconciler ran daily but `sync_ical()` did not, so a deploy-free stretch
+had it confidently reconciling against days-old bookings — detection without
+ingestion verifies the staleness it created. (2) Findings landed in Home
+Assistant persistent notifications, a surface the host visits rather than one
+that reaches him. A correct finding nobody reads is indistinguishable from no
+finding at all.
+
 ## Vision
 
-The host opens one page and sees exactly which cleaners are out of sync with
-reality, and a shared calendar everyone trusts. WhatsApp chatter is read by the
-machine, not just humans — every confirm, decline, and schedule change becomes a
-fact the reconciler can cross-check, so conflicts surface the same day they're
-created, not the morning a clean is missed. When a dependency fails (no credits,
-calendar outage), the system says so out loud and self-heals when the dependency
-returns.
+The host doesn't open anything. Each morning the schedule has already
+re-checked itself against the world, and if something needs him he has a
+message — in plain language, naming what to do and what the system couldn't
+work out on its own. If nothing needs him, there is no message, and that
+silence is trustworthy because the system tells him when it has gone dark.
+Behind that: a shared calendar everyone trusts, and WhatsApp chatter read by
+the machine, not just humans — every confirm, decline, and schedule change
+becomes a fact the reconciler can cross-check, so conflicts surface the same
+day they're created, not the morning a clean is missed. When a dependency
+fails (no credits, calendar outage), the system says so out loud and self-heals
+when the dependency returns.
 
 ## Out of Scope
 
@@ -56,6 +69,18 @@ source of truth by design.
 - **Reads can be cheap and wrong-tolerant; writes to bookings must be
   deliberate.** Auto-applying an LLM judgment to a booking can move a real
   person to the wrong house — that bar is higher than surfacing a finding.
+- **Ingest before you judge.** Any check that runs on a schedule must refresh
+  its inputs on that same schedule, in that order. A detector reading a stale
+  world produces confident, well-formatted wrongness — and looks healthy while
+  doing it.
+- **A finding is not delivered until it reaches the human.** The alert channel
+  is part of the alert. Detection that lands somewhere the host doesn't visit
+  is indistinguishable from no detection, and it fails in the direction that
+  feels fine.
+- **Silence must be earned, and must be distinguishable from death.** Quiet
+  nights are the goal, so anything that stays quiet needs an independent
+  liveness signal — otherwise "nothing to report" and "the pipeline stopped"
+  render identically.
 
 ## Constraints
 
@@ -70,13 +95,29 @@ source of truth by design.
   degrade gracefully (alert + defer + recover) when it's unavailable.
 - Supervisor `addons` CLI namespace is deprecated → use `apps` (cosmetic warning
   for now; commands still work).
+- **The app stays on the Pi; only a derived read-model may cross to the VPS**
+  (Council ruling 2026-07-23, reaffirmed 2026-07-27). The VPS is deliberately
+  credential-free and egress-locked with no route back to the Pi, so **the Pi
+  initiates all cross-host traffic** — outbound HTTPS only, never a VPS pull.
+- **What may cross:** finding id, detector, kind, severity, date, cleaner first
+  name, and the generated `why` summary. Cleaner names are permitted (Josh's
+  ruling 2026-07-27 — they already appear in the shared Google Calendar).
+  **What may never cross:** guest names, raw WhatsApp text (`quote`/`evidence`),
+  the iCal token, and any secret. Enforced by building the payload from an
+  allowlist rather than deleting fields from a finding.
+- Supervisor validates an options POST against the **installed** add-on
+  version's schema — new option keys sent before the update lands are silently
+  dropped while still returning `{"result":"ok"}`. Update first, then set
+  options, then restart.
 
 ## Goal
 
-A self-checking cleaning scheduler whose calendar projection is dedup-clean, whose
-reconciler runs on a schedule and surfaces every cleaner conflict the day it
-appears, and whose LLM dependency fails loudly and recovers automatically — so the
-host never silently loses a same-day schedule change again.
+A self-checking cleaning scheduler whose calendar projection is dedup-clean, that
+nightly re-reads the world before judging it, surfaces every cleaner conflict the
+day it appears, and **delivers what needs a human to where the human actually is**
+— with silence reserved for genuinely clean nights and a dark pipeline announcing
+itself. Its LLM dependency fails loudly and recovers automatically, so the host
+never silently loses a same-day schedule change again.
 
 ## Criteria
 
@@ -173,6 +214,8 @@ host never silently loses a same-day schedule change again.
 
 ## Decisions
 
+- 2026-07-27 14:10: `refined:` Problem / Vision / Goal / Principles rewritten to match the ideal state the system now pursues. The old Vision opened "The host opens one page and sees…" — that was the correct ideal *before* delivery existed, and leaving it would have made the ISA describe a system one generation behind its own criteria. Three principles added (ingest-before-judge, a finding is not delivered until it reaches the human, silence must be earned and distinguishable from death), each earned by a specific failure this session rather than asserted.
+- 2026-07-27 14:05: Open backlog after this run (6 ISCs, none blocking): ISC-3 (2 stale GCal events, far-future, low priority), ISC-7.1 (credit-probe anti-loop, never observed live), ISC-11 (health banner on the home page, deferred), ISC-13 (Daria-group live forward test), ISC-15 (channel-silence live confirmation — needs a real dark channel), ISC-41 (test that no `why` value can carry raw text). ISC-41 is the only one this session created.
 - 2026-07-27 10:00: Council of 4 (Builder/Skeptic/Pragmatist/Analyst, 2 rounds) specced the nightly pipeline. Converged 4-0: sync inline in the add-on scheduler (no external orchestrator), detection-only preserved, diff-based quiet-when-clean + dead-man mandatory. 3-1: Telegram via the existing VPS bot (one sender; a dead Pi can't self-report, killing HA-native as primary). Josh overruled the names split: cleaner names MAY cross to the VPS/Telegram. Analyst correction on record: the Pi→VPS push is new egress (outbound HTTPS), not reused plumbing.
 - 2026-07-27 10:05: ISC floor relaxation (E4 soft ≥128): this is a feature addition to a project ISA whose natural atomic decomposition is 22 new ISCs; inflating to 128 would fabricate granularity. Show-your-math: every criterion already names a single-tool probe.
 - 2026-07-27 10:07: GOTCHA (cost a deploy cycle): Supervisor options POSTed while the OLD add-on version is installed are validated against the OLD schema — unknown keys are silently dropped, `{"result":"ok"}` anyway. Order must be: update add-on → THEN POST new options → restart.
