@@ -2720,6 +2720,31 @@ def _push_digest_to_vps(new_findings, resolved_count, counts):
     """
     if not (VPS_PUSH_ENABLED and VPS_PUSH_URL and VPS_PUSH_SECRET):
         return False
+    # Freshness guard (fail-closed-loudly): a digest computed against a stale
+    # world must not read as a healthy night. If the iCal sync hasn't
+    # succeeded in >26h, inject a synthetic needs-attention finding so the
+    # staleness rides the normal triage → Telegram path and breaks
+    # quiet-when-clean. 26h > the 24h nightly cadence, < the 25h+1h dead-man
+    # window on the VPS, so one missed sync alarms exactly once.
+    new_findings = list(new_findings)
+    try:
+        last_sync = load_data().get("last_sync")
+        age_h = None
+        if last_sync:
+            age_h = (datetime.now() - datetime.fromisoformat(last_sync)).total_seconds() / 3600
+        if age_h is None or age_h > 26:
+            age_txt = f"{age_h:.0f} hours" if age_h is not None else "unknown (never synced)"
+            new_findings.append({
+                "id": "pipeline:stale-sync",
+                "detector": "pipeline",
+                "kind": "stale_sync",
+                "severity": "needs-attention",
+                "date": date.today().isoformat(),
+                "cleaner": None,
+                "why": f"Airbnb iCal sync is stale ({age_txt} old) — tonight's digest may be reconciling outdated bookings. Check the cleaning-tracker add-on.",
+            })
+    except Exception as e:
+        print(f"[vps-push] freshness guard error (non-fatal): {e}")
     payload = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "heartbeat": True,
