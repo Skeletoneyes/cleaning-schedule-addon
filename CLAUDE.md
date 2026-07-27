@@ -89,6 +89,11 @@ resulting in an empty base image.
 - `dead_channel_min_msgs` — minimum historical message count before a group
   counts as an "active channel" worth watching for silence (default: 10;
   keeps one-off groups from false-alarming).
+- `vps_push_enabled` / `vps_push_url` / `vps_push_secret` — nightly digest push
+  to the VPS Telegram bot (1.24.x, default off). URL is the public Caddy route
+  (`https://<host>/cleaning/digest`); the secret must match
+  `CLEANING_PUSH_SECRET` in `/etc/pai-telegram-bot/env` on the VPS. **Never
+  committed** — public repo.
 - `vps_status_enabled` — toggle the footer VPS status widget (default: off).
 - `vps_status_url` — URL/host of the box to probe (e.g. a hub URL). **Never
   committed** — set in the HA UI. Empty = widget hidden.
@@ -496,6 +501,50 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
   `gcal_service_account_json` option. No OAuth flow, no consent screen,
   no refresh-token expiry. `scripts/gcal_auth.py` validates a downloaded
   key and prints the email to share with.
+
+### Nightly pipeline: sync → push → Telegram (1.24.x)
+
+The nightly job is **sync-then-digest, strictly ordered**, inside the existing
+`_digest_scheduler` thread. Before 1.24.0 `sync_ical()` ran *only* at process
+startup and on the manual button, so a deploy-free stretch left `data.json`
+stale while the reconciler confidently reconciled against it (a real Oct 16–18
+cancellation sat unapplied for 3 days). Two consequences worth keeping in mind:
+
+- The scheduler thread now starts **unconditionally**; `digest_enabled: false`
+  skips the digest but never the sync.
+- A sync failure posts an HA notification and the digest still runs (degraded,
+  loudly) rather than being skipped.
+
+`_push_digest_to_vps()` then POSTs the digest to the VPS Telegram bot. Design
+constraints, all load-bearing:
+
+- **Allowlist, not deletion.** The payload is *constructed* field-by-field
+  (`id, detector, kind, severity, date, cleaner, why` per finding). Findings
+  are never passed through whole — `quote`/`evidence` carry raw WhatsApp text
+  and must not cross. ⚠️ Cato's standing caveat (ISA ISC-41): the allowlist
+  protects *keys*, not *values* — a future detector that interpolates message
+  text into `why` would defeat it silently. All current `why` strings are
+  f-string templates over structured fields; keep it that way.
+- **The Pi initiates.** The VPS is egress-locked with no route back to the Pi,
+  so this is outbound HTTPS from the Pi — new egress, not the projection
+  plumbing.
+- **Heartbeat every night, including clean ones.** `heartbeat: true` is always
+  sent; the bot's 25h dead-man's switch depends on a quiet night still
+  producing a POST. Quiet-when-clean is the *bot's* decision (no findings → no
+  Telegram message), never the Pi's decision to skip the push.
+- **Freshness sentinel.** If `last_sync` is >26h old at push time, a synthetic
+  `pipeline:stale-sync` needs-attention finding is injected **and the counts
+  are incremented to match** — otherwise a stale night reads as healthy, which
+  is precisely the failure this whole feature exists to end.
+
+VPS side lives in `~/dev/pai-telegram-bot/src/cleaning.ts` (loopback listener
+on 8899 behind a Caddy `handle /cleaning/digest` route, subscription-billed
+triage with a deterministic fallback, Telegram delivery, dead-man's switch).
+
+**Deploy-order gotcha (cost a cycle):** Supervisor validates an options POST
+against the **installed** add-on version's schema — new keys sent before the
+update land are silently dropped with `{"result":"ok"}`. Always: `ha addons
+update` → *then* POST options → restart.
 
 ### Footer VPS status widget (`/vps/status`, 1.23.0)
 An ambient health dot in the home-page footer for a separate always-on box
