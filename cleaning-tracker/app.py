@@ -441,16 +441,27 @@ def cleaner_color(name: str) -> str:
 # ── iCal sync ────────────────────────────────────────────────────────────────
 
 def sync_ical():
-    """Fetch Airbnb iCal and merge into local data."""
+    """Fetch Airbnb iCal and merge into local data.
+
+    Records the per-attempt outcome to `sync_status.json` on every exit path.
+    That record lives HERE rather than in the nightly scheduler so it covers
+    every caller — the manual button, the startup sync and the nightly job all
+    prove the same way. `last_sync` advances only on success, so it answers
+    "when did a sync last work", never "did the most recent attempt work", and
+    those diverge exactly when it matters.
+    """
     data = load_data()
 
     if not ICAL_URL:
-        return data, "No iCal URL configured. Set it in the add-on options."
+        err = "No iCal URL configured. Set it in the add-on options."
+        _write_sync_status(False, err)
+        return data, err
 
     try:
         resp = requests.get(ICAL_URL, timeout=15)
         resp.raise_for_status()
     except Exception as e:
+        _write_sync_status(False, e)
         return data, str(e)
 
     cal = __import__("icalendar").Calendar.from_ical(resp.text)
@@ -498,6 +509,7 @@ def sync_ical():
 
     data["last_sync"] = datetime.now().isoformat()
     save_data(data)
+    _write_sync_status(True)
     return data, None
 
 
@@ -3278,10 +3290,9 @@ def _digest_scheduler():
                 _, sync_err = sync_ical()
                 if sync_err:
                     raise RuntimeError(sync_err)
-                _write_sync_status(True)
                 print("[digest] nightly iCal sync ok")
             except Exception as e:
-                _write_sync_status(False, e)
+                # sync_ical() already recorded the per-attempt outcome.
                 print(f"[digest] nightly iCal sync FAILED: {e}")
                 _post_ha_notification(
                     "Cleaning iCal sync failed",
