@@ -502,6 +502,43 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
   no refresh-token expiry. `scripts/gcal_auth.py` validates a downloaded
   key and prints the email to share with.
 
+### GCal push health (1.25.x) — and how to test an alarm
+
+The push now records its outcome to `/data/gcal_push_status.json` on **every**
+attempt (`ok`, `outcome`, `at`, `error`, `attempt`, `last_ok_at`,
+`last_timeout_at`, `stats`), visible off-host as the top-level
+`gcal_push_status` key in `/internal/snapshot`. That file is the first thing to
+read when the calendar looks wrong — it answers "did the write succeed?" in one
+glance, which before 1.25.0 required reconstructing intent from side effects
+because the only record was a `print()` into a log journald truncates in a day.
+
+The nightly order is **sync → push → reconcile**, all inside `_digest_scheduler`.
+The push waits up to `NIGHTLY_LOCK_WAIT_S` (120s) for the in-flight async push
+that `sync_ical()`'s `save_data()` just fired, rather than racing its lock and
+recording a false skip, and the whole thing is capped by `NIGHTLY_PUSH_BUDGET_S`
+(240s) so a wedged push can never hang the nightly job.
+
+**Why the order matters:** before 1.25.0 the reconcile read Google Calendar
+while that async push was still in flight, so every newly-arrived booking
+produced two phantom `gcal_missing_event` findings and a Telegram alert that
+resolved itself by morning. Diagnosed 2026-08-01 from the VPS bot journal —
+different bookings in each alert, always the newest reservation.
+
+**⚠️ Testing an alarm requires breaking the thing, on the deployed system.**
+`scripts/probe_push_alarm.py` points the add-on at a non-existent calendar id
+(so no write ever reaches the real shared calendar and there is no residue),
+then walks status → reconcile → digest → Telegram and back. This is not
+optional ceremony: the 1.25.0 unit suite was 27/27 green while a GCal outage
+made `/reconcile/run` return **500** and silenced the digest entirely — the new
+alarm was unreachable in exactly its own failure mode. Fixed in 1.25.1 by
+degrading (skip the content detector, emit `gcal_read_failed` saying drift is
+*unmeasured*, not absent) instead of raising.
+
+**Sanitize errors that become findings.** A Google `HttpError` embeds the
+request URL, which carries the calendar id. `reconcile._redact_error()` reduces
+URLs to scheme+host before they can ride a finding's `why` to the VPS — the
+payload allowlist protects *keys*, not *values* (ISC-41's standing caveat).
+
 ### Nightly pipeline: sync → push → Telegram (1.24.x)
 
 The nightly job is **sync-then-digest, strictly ordered**, inside the existing
