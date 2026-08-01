@@ -3,8 +3,8 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: verify
-updated: 2026-08-01T10:30:00-07:00
+phase: complete
+updated: 2026-08-01T11:10:00-07:00
 progress: 88/95
 ---
 
@@ -342,6 +342,16 @@ never silently loses a same-day schedule change again.
 - 2026-06-21 16:45: GOTCHA: `host_jids` only suppresses the "unmapped sender" prompt — it does NOT remove a host sender's messages from the pending list (`_build_review_context` includes all `pending` regardless). Host chatter keeps queuing; a real fix would skip/auto-ignore `host_jids` senders in the inbound path.
 
 ## Changelog
+
+- 2026-08-01 | conjectured: the host's Telegram alerts meant the Google Calendar push had silently failed and left the calendar wrong — the detector worked and the repair didn't.
+  refuted by: the VPS bot's journal, which retains what the add-on's 100-line log does not. Jul 29 quiet, **Jul 30 three new findings**, Jul 31 quiet, **Aug 1 three new findings** — and the two messages name *different bookings* (Jun 24/Jul 1 2027, then Jul 2/Jul 9 2027), each the newest reservation to arrive in the feed. The push was never broken. The nightly job ingests a new booking, `save_data()` fires the async push, and the reconcile reads Google Calendar milliseconds later while that push is still in flight. Every `gcal_missing_event` alert was manufactured by detection outrunning its own repair. Worse, the session's *own* opening diagnosis ("manual sync fixed it, 16 → 14") was itself an artifact: 16 came from the cached `/reconcile/last`, 14 from a fresh `/reconcile/run`, and the drop was attributed as cause and effect across two different measurements.
+  learned: **a system that cannot say what it did leaves you reconstructing intent from side effects, and the reconstruction will be confident and wrong.** Both the original bug and my own misdiagnosis have the same shape — an absent record filled in by inference. The durable lesson is narrower than "add logging": when a cache and a live probe are both available, comparing across them silently invents causation; re-probe both sides with the same method before attributing a fix. And the corollary that actually paid: the fix's real value was never the repair, it was that the *next* occurrence is answerable in one glance instead of an hour of journal forensics.
+  criterion now: ISC-43..93 shipped in 1.25.0 → 1.25.2 and live-verified, including fault injection that delivered a real Telegram message and recovered clean. ISC-94/95 deferred with stated reasons.
+
+- 2026-08-01 | conjectured: with the council's six changes shipped and 27 tests green, 1.25.0 was done.
+  refuted by: three independent gates, each catching what the previous one missed. **Fault injection** found that a bad calendar id made `/reconcile/run` return 500 — `fetch_tagged_events` raises by design, killing the whole reconcile, so the digest went *silent* during exactly the outage the new findings existed to announce; the alarm was unreachable in its own failure mode. **Cross-vendor audit** (gpt-5.5) found that an over-budget nightly push logged and returned without writing a status, so a wedged push read as healthy for up to 26h — and that the ISA criteria still described `gcal_sync_status` in `data.json` while the code shipped a sidecar, making the checklist look stricter than what it verified. **Advisor** found that a future-dated `last_ok_at` (the Pi has no RTC) suppressed staleness *forever*, and that the abandoned over-budget worker's late write clobbers the timeout record so a chronically wedging push reads as permanently healthy.
+  learned: every one of those five defects fails in the **same direction** — presenting as healthy while broken — including the ones introduced by the fix for that exact failure mode. The bias is not in any one author; it is in the shape of the work. Writing a health check means imagining the failure, and the branches you *don't* imagine are the ones that default to quiet. So the gates are not redundancy, they are the only mechanism that samples the unimagined branch, and **the fault injection had to run against the deployed system, not the tests** — 27 green tests said nothing about a reconcile that 500s.
+  criterion now: ISC-60, ISC-86..93 added and shipped; the deploy sequence for this project now ends in fault injection, not in a green suite.
 
 - 2026-07-27 | conjectured: the reconciler running daily meant schedule drift was caught daily.
   refuted by: the reconciler *detects* daily but `sync_ical()` ran only at process startup and on a manual button — so detection ran against a world that only updated on deploys. A 3-day deploy-free stretch left an upstream Airbnb cancellation (Oct 16–18) and a new booking (May 2027) unapplied; the digest dutifully reported "active booking not in iCal — cancelled upstream?" every morning to an HA notification panel nobody opens, while data.json and GCal stayed wrong. Detection without ingestion is a tautology: it verifies the staleness it created.
