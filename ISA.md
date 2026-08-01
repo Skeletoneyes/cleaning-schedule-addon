@@ -3,7 +3,7 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: verify
+phase: complete
 updated: 2026-08-01T11:10:00-07:00
 progress: 111/121
 ---
@@ -392,6 +392,21 @@ never silently loses a same-day schedule change again.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog
+
+- 2026-08-01 | conjectured: the liveness chain terminated at a single unmonitored process (the VPS bot), so closing it required something outside the system — a third-party uptime pinger or a dead-man service.
+  refuted by: that framing assumes a CHAIN. The Pi was already independently watched by the VPS's 25h dead-man, so having the Pi also watch the bot makes it a CYCLE, and a cycle has no unmonitored terminus. Better still, the dead-bot detector already existed — `_push_digest_to_vps` has always posted "Telegram alerts will not fire until this is fixed" — it was just delivered to the Home Assistant notification panel, the one surface this ISA's own Principles say the host does not visit. So the fix was a delivery change, not a new mechanism, and it needed no third party.
+  learned: **before building a detector, check whether the signal already exists and is merely landing somewhere nobody looks.** The same principle that produced "a finding is not delivered until it reaches the human" applies to the system's own health, and it had not been applied there. Corollary that nearly cost a thread: the instinct was to add a dedicated polling watcher, which would have been one more thing that dies silently in order to reach a conclusion an existing proven path already reaches. The advisor's counter-correction is recorded honestly as ISC-120 — the two directions are independent *downstream of the Pi's NIC* and share LAN, router, modem, ISP and power upstream, so a WAN or mains outage defeats both. That is the right place to stop, because it is the one failure two people in a house notice within minutes for free.
+  criterion now: ISC-96..119 shipped across 1.26.0 → 1.26.4 and live-verified; ISC-114 sits at `[DEFERRED-VERIFY]` pending Josh confirming his phone actually buzzed, and ISC-120/121 are open with stated reasons.
+
+- 2026-08-01 | conjectured: deriving an attested value from durable state is safer than letting a caller pass it in, because a caller can lie by omission.
+  refuted by: the cross-vendor audit. `sync_ok` was derived from the *freshness* of `last_sync`, which advances only on success — so if tonight's sync threw but yesterday's succeeded, the value was ~24h old, inside the 26h window, and the attestation reported success for a stage that had just failed. Freshness of the last success and outcome of the latest attempt are different facts, and `last_sync` could only ever answer the first. The derivation removed one lie and bought another.
+  learned: **"derived from durable state" is not automatically safer — it is only as good as the question the stored fact actually answers.** The fix was not to go back to a passed-in value but to store the right fact: a per-attempt record written on every exit path of `sync_ical()`, so the manual button, the startup sync and the nightly job all prove the same way. A related catch from the same pass: distinguishing *absent* from *corrupt* matters, because a corrupt record that degrades into the freshness fallback produces a lying attestation, which is worse than silence since it satisfies the absence alarm too.
+  criterion now: ISC-116 (per-attempt sync outcome) and ISC-118 (fail closed on corrupt) added and shipped in 1.26.3/1.26.4.
+
+- 2026-08-01 | conjectured: the add-on's `print()` diagnostics — the `[gcal]`, `[digest]`, `[vps-push]` lines the whole fail-loudly strategy rests on — were reaching the log.
+  refuted by: trying to confirm a phone escalation had fired and finding werkzeug's access lines in journald but none of the app's own. Python block-buffers stdout when it is not a TTY, so those lines sat in a buffer until it filled. It also explains an anomaly noticed at the very start of this session and not chased: no "[digest] ran:" lines despite the digest demonstrably running nightly.
+  learned: **a diagnostic you cannot read at the moment you need it is not a diagnostic**, and the retroactive consequence is the sharper half — every prior conclusion of the form "the logs showed no errors, so that stage was fine" carries no evidence and must be re-derived. This is the same shape as the session's other two measurement errors: reading a cached reconcile as if it were live, and reading "0 persistent notifications" from an endpoint that cannot see persistent notifications at all. Three instruments, three clean readings, none of which could see the thing being asked about.
+  criterion now: ISC-115 (`PYTHONUNBUFFERED=1`) shipped in 1.26.1; log lines confirmed visible in real time immediately afterwards.
 
 - 2026-08-01 | conjectured: the host's Telegram alerts meant the Google Calendar push had silently failed and left the calendar wrong — the detector worked and the repair didn't.
   refuted by: the VPS bot's journal, which retains what the add-on's 100-line log does not. Jul 29 quiet, **Jul 30 three new findings**, Jul 31 quiet, **Aug 1 three new findings** — and the two messages name *different bookings* (Jun 24/Jul 1 2027, then Jul 2/Jul 9 2027), each the newest reservation to arrive in the feed. The push was never broken. The nightly job ingests a new booking, `save_data()` fires the async push, and the reconcile reads Google Calendar milliseconds later while that push is still in flight. Every `gcal_missing_event` alert was manufactured by detection outrunning its own repair. Worse, the session's *own* opening diagnosis ("manual sync fixed it, 16 → 14") was itself an artifact: 16 came from the cached `/reconcile/last`, 14 from a fresh `/reconcile/run`, and the drop was attributed as cause and effect across two different measurements.

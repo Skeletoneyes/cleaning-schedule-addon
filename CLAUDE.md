@@ -539,6 +539,50 @@ request URL, which carries the calendar id. `reconcile._redact_error()` reduces
 URLs to scheme+host before they can ride a finding's `why` to the VPS — the
 payload allowlist protects *keys*, not *values* (ISC-41's standing caveat).
 
+### Liveness: attestation + the mutual-watch cycle (1.26.x)
+
+The nightly payload carries an `attestation` block — `sync_ok`, `push_outcome`,
+`reconcile_ok`. Before this, the heartbeat only proved the Pi *reached* the VPS:
+a Pi whose sync threw, whose push was skipped and whose reconcile returned
+garbage but which still completed the POST satisfied the 25h dead-man forever.
+
+**`sync_ok` reads a per-attempt record (`/data/sync_status.json`), not
+`last_sync`.** This distinction bit once already: `last_sync` advances only on
+success, so it answers "when did a sync last work", never "did the most recent
+attempt work" — and a failure tonight was masked by a success yesterday for up
+to 26h. The record is written inside `sync_ical()` on every exit path, so the
+manual button, the startup sync and the nightly job all prove the same way. An
+*absent* record falls back to freshness (fresh install); a *corrupt* one fails
+closed, because a lying attestation also satisfies the absence alarm and is
+therefore worse than silence.
+
+The VPS counts consecutive receipts reporting any non-ok stage — its own clock,
+its own counter, never a Pi-supplied timestamp — and alarms once per episode at
+three. `push_outcome: "disabled"` counts as ok. A *malformed* attestation
+rejects the whole payload rather than degrading to "unknown", so a broken Pi
+cannot downgrade itself out of the alarm. This is **distinct from** the 25h
+dead-man, which is the deadline-based *absence* alarm; a counter over received
+payloads can never increment on absence, so both are required.
+
+**Two alarms watch each other.** The VPS watches the Pi (dead-man → Telegram);
+the Pi watches the bot (`GET /cleaning/health`, secret-gated, probed inline
+during the nightly job — deliberately not a watcher thread, which would be one
+more thing that dies quietly). Critical add-on alerts escalate to
+`phone_notify_service` (a config option — **never hardcode a device name**,
+public repo), which rides Home Assistant → Nabu Casa → the phone.
+
+⚠️ **State the independence claim accurately.** The two directions share no
+infrastructure *downstream of the Pi's NIC*; upstream they share the LAN,
+router, modem, ISP and house power. A WAN or mains outage defeats both — and is
+deliberately not defended against, because two people in the house notice it
+within minutes for free. Do not write "shares no infrastructure" unqualified.
+
+**`PYTHONUNBUFFERED=1` is load-bearing** (Dockerfile). Without it Python
+block-buffers stdout and every `[gcal]` / `[digest]` / `[vps-push]` / `[notify]`
+line sits in a buffer until it fills — they were effectively invisible in
+journald for the whole 1.24–1.25 era. Any past reasoning of the form "the logs
+showed nothing, so that stage was fine" from before 1.26.1 is void.
+
 ### Nightly pipeline: sync → push → Telegram (1.24.x)
 
 The nightly job is **sync-then-digest, strictly ordered**, inside the existing
