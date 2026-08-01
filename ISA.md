@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: complete
 updated: 2026-08-01T11:10:00-07:00
-progress: 111/121
+progress: 112/121
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -266,7 +266,7 @@ never silently loses a same-day schedule change again.
 - [x] ISC-112: Anti: the notify service name is a config option, never hardcoded — this repo is public (the `vps_status_url` precedent).
 - [x] ISC-113: Anti: an unconfigured or failing phone-notify path must not break the notification it was meant to escalate.
 - [x] ISC-115: The add-on's own log lines are readable in real time — `PYTHONUNBUFFERED=1`, without which every fail-loudly `print()` sat in a block buffer until it filled.
-- [DEFERRED-VERIFY] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
+- [x] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
 
 ## Test Strategy
 
@@ -388,7 +388,7 @@ never silently loses a same-day schedule change again.
 - ISC-111: live — `[notify] phone escalation sent via notify.<service>` observed after an induced push failure.
 - ISC-112: unit — `mobile_app_` appears nowhere in `app.py`; the service name is a config option.
 - ISC-113: code+unit — `_post_phone_notification` is called first, wrapped in a bare except, and returns False on failure; it cannot unwind the panel notification.
-- ISC-114: `[DEFERRED-VERIFY]` — live fault injection — push URL pointed at a 404, digest run, log shows `[vps-push] FAILED: HTTP 404` then `[notify] phone escalation sent`. Config restored; `[vps-push] ok` confirmed. **Blocked on Josh confirming the phone actually buzzed.** Marking this `[x]` was an overclaim — the evidence line said confirmation was still needed while the box said done. Home Assistant accepting the notify call is not the phone displaying it, and this project's own principle is that a finding is not delivered until it reaches the human. Follow-up: ISC-114-confirm.
+- ISC-114: `[DEFERRED-VERIFY]` — live fault injection — push URL pointed at a 404, digest run, log shows `[vps-push] FAILED: HTTP 404` then `[notify] phone escalation sent`. Config restored; `[vps-push] ok` confirmed. **CONFIRMED by Josh 2026-08-01: the Home Assistant app notifications arrived on his phone.** Worth recording how nearly this was mis-closed: he first replied "yes I got the telegram message", which would have read as confirmation — but the VPS journal shows zero Telegram sends after 17:57 UTC, while the phone test ran at ~19:06 and by design sends nothing through Telegram (the whole point was that the VPS path was broken). The message he had was the earlier Google Calendar alarm on a different channel. Two alarms, two channels, one ambiguous word; taking it at face value would have closed the criterion on the wrong evidence.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog
