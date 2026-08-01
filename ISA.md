@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: complete
+phase: plan
 updated: 2026-08-01T11:10:00-07:00
-progress: 88/95
+progress: 88/114
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -238,6 +238,28 @@ never silently loses a same-day schedule change again.
 - [ ] ISC-94: The nightly heartbeat should attest per-stage outcomes (`sync_ok`, `push_outcome`, `reconcile_ok`) rather than merely proving arrival, so the VPS dead-man cannot be satisfied by a Pi that reached the push while doing no real work. *(Advisor finding 2026-08-01; DEFERRED — this changes the VPS bot's contract, which is a different system from the six changes this session was scoped to. Fields are booleans/enums, so the crossing allowlist is unaffected.)*
 - [ ] ISC-95: The liveness chain terminates at a single unmonitored VPS process, and ISC-16 records that the footer widget cannot see a crashed bot on a live box — so "Pi silent + bot dead" renders identically to a quiet clean night. *(Advisor finding 2026-08-01; DEFERRED — closing it needs something outside this system, e.g. an external uptime pinger. Recorded rather than pretended away.)*
 - [x] ISC-85: Antecedent: the host can tell, from the Telegram message alone, that the *push* failed rather than that the calendar drifted.
+
+### Liveness: attestation + closing the watch cycle (2026-08-01, advisor-driven)
+
+- [ ] ISC-96: The nightly payload carries an `attestation` block with `sync_ok`, `push_outcome` and `reconcile_ok`.
+- [ ] ISC-97: `sync_ok` and `push_outcome` are derived from durable state (`last_sync`, the push-status sidecar), not passed in — an attestation that can be omitted can lie by omission.
+- [ ] ISC-98: Anti: the attestation adds only booleans and enums — it must not widen what crosses to the VPS.
+- [ ] ISC-99: The VPS validates the attestation shape and rejects a malformed one without resetting the dead-man.
+- [ ] ISC-100: An absent attestation (older add-on) is treated as *unknown* — it neither increments nor resets the consecutive-failure counter.
+- [ ] ISC-101: The VPS counts consecutive receipts reporting any non-ok stage, using its own counter and its own clock — never a Pi-supplied timestamp.
+- [ ] ISC-102: Three consecutive non-ok receipts send a Telegram alert naming which stage failed.
+- [ ] ISC-103: The alert fires once per episode, not on every subsequent receipt.
+- [ ] ISC-104: A fully-ok receipt resets the counter and clears the episode.
+- [ ] ISC-105: `push_outcome: "disabled"` counts as ok — GCal off is a valid configuration, not a fault.
+- [ ] ISC-106: The bot serves `GET /cleaning/health` reporting uptime and last-digest age.
+- [ ] ISC-107: Anti: the health endpoint requires the push secret — it must not expose activity data publicly.
+- [ ] ISC-108: Caddy routes `/cleaning/health` to the bot listener.
+- [ ] ISC-109: The nightly job probes bot health inline (no new thread — a watcher thread is one more thing that can die silently).
+- [ ] ISC-110: A bot that is reachable but unhealthy is caught, not only an unreachable one.
+- [ ] ISC-111: Critical add-on alerts reach the phone via a configurable notify service, in addition to the notification panel.
+- [ ] ISC-112: Anti: the notify service name is a config option, never hardcoded — this repo is public (the `vps_status_url` precedent).
+- [ ] ISC-113: Anti: an unconfigured or failing phone-notify path must not break the notification it was meant to escalate.
+- [ ] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
 
 ## Test Strategy
 

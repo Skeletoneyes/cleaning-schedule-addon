@@ -1,0 +1,223 @@
+"""Unit tests for the attestation + liveness work (ISC-96..114).
+
+`_build_attestation` and `_probe_bot_health` live in app.py, which imports
+flask / icalendar / anthropic — none installed on a dev box and none needed by
+the logic under test. Same approach as test_gcal_repair.py: extract the real
+source text via `ast` and exec it against injected fakes, so a rename or a
+reshape fails here loudly rather than passing against a stale copy.
+
+Run: python3 scripts/test_attestation.py
+"""
+from __future__ import annotations
+
+import ast
+import sys
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+APP_DIR = ROOT / "cleaning-tracker"
+
+
+def _extract(names, ns):
+    src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    found = {n.name: n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names}
+    missing = set(names) - set(found)
+    if missing:
+        raise AssertionError(f"app.py is missing expected function(s): {sorted(missing)}")
+    mod = ast.Module(body=[found[n] for n in names], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(mod), "<app-pure>", "exec"), ns)
+    return ns
+
+
+class FakeResponse:
+    def __init__(self, status=200, body=None, raises=None):
+        self.status_code = status
+        self._body = body or {}
+        self._raises = raises
+
+    def json(self):
+        if self._raises:
+            raise self._raises
+        return self._body
+
+
+def build_ns(*, last_sync, gcal_enabled=True, push_status=None):
+    """A namespace mimicking app.py's module globals for the extracted funcs."""
+    return {
+        "datetime": datetime,
+        "print": lambda *a, **k: None,
+        "load_data": lambda: {"last_sync": last_sync},
+        "GCAL_ENABLED": gcal_enabled,
+        "_read_gcal_status": lambda: push_status,
+    }
+
+
+NOW = datetime.now()
+
+
+# ── ISC-96/97/105: attestation derived from durable state ───────────────────
+
+class BuildAttestation(unittest.TestCase):
+    def _attest(self, reconcile_ok=True, **kw):
+        ns = build_ns(**kw)
+        _extract(["_build_attestation"], ns)
+        return ns["_build_attestation"](reconcile_ok)
+
+    def test_all_healthy(self):
+        a = self._attest(last_sync=NOW.isoformat(), push_status={"outcome": "ok"})
+        self.assertEqual(a, {"sync_ok": True, "push_outcome": "ok", "reconcile_ok": True})
+
+    def test_stale_sync_reports_not_ok(self):
+        old = (NOW - timedelta(hours=40)).isoformat()
+        self.assertFalse(self._attest(last_sync=old, push_status={"outcome": "ok"})["sync_ok"])
+
+    def test_absent_sync_reports_not_ok(self):
+        self.assertFalse(self._attest(last_sync=None, push_status={"outcome": "ok"})["sync_ok"])
+
+    def test_future_dated_sync_is_broken_not_fresh(self):
+        """Same reasoning as the staleness guard: the Pi has no RTC."""
+        future = (NOW + timedelta(hours=10)).isoformat()
+        self.assertFalse(self._attest(last_sync=future, push_status={"outcome": "ok"})["sync_ok"])
+
+    def test_benign_skew_still_ok(self):
+        near = (NOW + timedelta(minutes=5)).isoformat()
+        self.assertTrue(self._attest(last_sync=near, push_status={"outcome": "ok"})["sync_ok"])
+
+    def test_unparseable_sync_reports_not_ok_and_does_not_raise(self):
+        self.assertFalse(self._attest(last_sync="garbage", push_status={"outcome": "ok"})["sync_ok"])
+
+    def test_gcal_disabled_is_disabled_not_a_fault(self):
+        """ISC-105 — GCal switched off is a valid configuration."""
+        a = self._attest(last_sync=NOW.isoformat(), gcal_enabled=False, push_status=None)
+        self.assertEqual(a["push_outcome"], "disabled")
+
+    def test_never_pushed_is_never_not_ok(self):
+        a = self._attest(last_sync=NOW.isoformat(), push_status=None)
+        self.assertEqual(a["push_outcome"], "never")
+
+    def test_push_outcome_passes_through(self):
+        for outcome in ("ok", "skipped", "failed", "timeout"):
+            a = self._attest(last_sync=NOW.isoformat(), push_status={"outcome": outcome})
+            self.assertEqual(a["push_outcome"], outcome)
+
+    def test_reconcile_ok_is_reported_as_given(self):
+        a = self._attest(reconcile_ok=False, last_sync=NOW.isoformat(), push_status={"outcome": "ok"})
+        self.assertFalse(a["reconcile_ok"])
+
+    def test_only_booleans_and_one_string_cross(self):
+        """ISC-98 — the attestation must not widen the crossing allowlist."""
+        a = self._attest(last_sync=NOW.isoformat(), push_status={"outcome": "ok", "error": "secret!"})
+        self.assertEqual(set(a), {"sync_ok", "push_outcome", "reconcile_ok"})
+        self.assertIsInstance(a["sync_ok"], bool)
+        self.assertIsInstance(a["reconcile_ok"], bool)
+        self.assertIsInstance(a["push_outcome"], str)
+        self.assertNotIn("secret!", str(a))
+
+
+# ── ISC-109/110: the inline bot-health probe ────────────────────────────────
+
+class ProbeBotHealth(unittest.TestCase):
+    def _probe(self, *, response=None, exc=None, enabled=True,
+               url="https://example.com/cleaning/digest", secret="s3cret"):
+        class FakeRequests:
+            @staticmethod
+            def get(u, headers=None, timeout=None):
+                FakeRequests.last = {"url": u, "headers": headers}
+                if exc:
+                    raise exc
+                return response
+        ns = {
+            "requests": FakeRequests,
+            "print": lambda *a, **k: None,
+            "VPS_PUSH_ENABLED": enabled,
+            "VPS_PUSH_URL": url,
+            "VPS_PUSH_SECRET": secret,
+        }
+        _extract(["_probe_bot_health"], ns)
+        return ns["_probe_bot_health"](), FakeRequests
+
+    def test_healthy_bot(self):
+        (ok, detail), _ = self._probe(
+            response=FakeResponse(200, {"ok": True, "uptime_s": 900, "last_digest_age_s": 120}))
+        self.assertTrue(ok)
+        self.assertIn("900", detail)
+
+    def test_probes_the_health_path_not_the_digest_path(self):
+        _, fake = self._probe(response=FakeResponse(200, {"ok": True}))
+        self.assertTrue(fake.last["url"].endswith("/cleaning/health"))
+
+    def test_sends_the_push_secret(self):
+        _, fake = self._probe(response=FakeResponse(200, {"ok": True}))
+        self.assertEqual(fake.last["headers"]["X-Push-Secret"], "s3cret")
+
+    def test_reachable_but_unhealthy_is_caught(self):
+        """ISC-110 — the case a web-surface ping structurally cannot see."""
+        (ok, detail), _ = self._probe(response=FakeResponse(200, {"ok": False}))
+        self.assertFalse(ok)
+        self.assertIn("not ok", detail)
+
+    def test_non_2xx_is_unhealthy(self):
+        (ok, detail), _ = self._probe(response=FakeResponse(502))
+        self.assertFalse(ok)
+        self.assertIn("502", detail)
+
+    def test_unauthorized_is_unhealthy(self):
+        (ok, _), _ = self._probe(response=FakeResponse(401))
+        self.assertFalse(ok)
+
+    def test_connection_error_is_unhealthy_not_a_crash(self):
+        (ok, detail), _ = self._probe(exc=OSError("connection refused"))
+        self.assertFalse(ok)
+        self.assertIn("refused", detail)
+
+    def test_unconfigured_is_skipped_not_failed(self):
+        """An unconfigured probe must not manufacture a nightly alarm."""
+        (ok, detail), _ = self._probe(enabled=False)
+        self.assertTrue(ok)
+        self.assertIn("skipped", detail)
+
+    def test_unexpected_url_shape_is_skipped_not_failed(self):
+        (ok, detail), _ = self._probe(url="https://example.com/something-else")
+        self.assertTrue(ok)
+        self.assertIn("skipped", detail)
+
+    def test_malformed_json_is_unhealthy_not_a_crash(self):
+        (ok, _), _ = self._probe(response=FakeResponse(200, raises=ValueError("not json")))
+        self.assertFalse(ok)
+
+
+# ── ISC-111/112/113: phone escalation is opt-in and non-fatal ───────────────
+
+class PhoneEscalation(unittest.TestCase):
+    def test_service_name_is_not_hardcoded_anywhere(self):
+        """ISC-112 — this repo is public; a device name must not be committed."""
+        src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+        self.assertNotIn("mobile_app_", src)
+
+    def test_escalation_is_opt_in_per_call(self):
+        """ISC-111 — routine findings must not buzz a phone every morning."""
+        src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+        self.assertIn("to_phone=False", src, "default must be off")
+
+    def test_only_pipeline_failures_escalate(self):
+        """The phone is reserved for 'nobody would otherwise find out'."""
+        src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count("to_phone=True"), 4,
+                         "expected exactly: vps push failed, ical sync failed, "
+                         "reconcile failed, bot unhealthy")
+
+    def test_escalation_failure_cannot_break_the_notification(self):
+        """ISC-113 — it amplifies an alert; it must not be able to unwind it."""
+        src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+        i = src.index("def _post_phone_notification")
+        body = src[i:src.index("def _post_ha_notification")]
+        self.assertIn("except Exception", body)
+        self.assertIn("return False", body)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

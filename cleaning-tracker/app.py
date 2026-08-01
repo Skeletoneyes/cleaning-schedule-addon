@@ -86,6 +86,14 @@ VPS_PUSH_ENABLED = bool(OPTIONS.get("vps_push_enabled", False))
 VPS_PUSH_URL = OPTIONS.get("vps_push_url", "")
 VPS_PUSH_SECRET = OPTIONS.get("vps_push_secret", "")
 
+# Escalation channel for alerts that must not wait for someone to open Home
+# Assistant. A persistent notification is a place the host *visits*; this is a
+# place a message *finds* him — and critically it does not route through the
+# VPS or Telegram, so it still works when the thing that failed IS the bot.
+# Never hardcode the service name: this repo is public (same rule as
+# vps_status_url). Empty = no phone escalation, panel notification only.
+PHONE_NOTIFY_SERVICE = (OPTIONS.get("phone_notify_service", "") or "").strip()
+
 # Channel-silence ("WhatsApp going dark") detection. Complements the bridge's
 # error-burst health alarms, which cannot see a quiet per-group mute (the Daria
 # failure: 3 months of silently-dropped messages, no error to count).
@@ -2825,7 +2833,49 @@ def reconcile_undismiss():
     return jsonify({"undismissed": finding_id, "was_dismissed": bool(removed)})
 
 
-def _post_ha_notification(title, message, notification_id="cleaning_digest"):
+def _post_phone_notification(title, message):
+    """Escalate to the host's phone via a configured HA notify service.
+
+    Deliberately best-effort and non-fatal: this is an *escalation* of a
+    notification that has already been posted, so a failure here must never
+    prevent or unwind the panel notification it was meant to amplify. Returns
+    True only on a confirmed 2xx.
+
+    Delivery rides Home Assistant (→ Nabu Casa → the phone's push service),
+    which shares no infrastructure with the VPS or Telegram. That is the whole
+    point: it is the one channel still standing when the failure being reported
+    is the Telegram bot itself.
+    """
+    if not (PHONE_NOTIFY_SERVICE and SUPERVISOR_TOKEN):
+        return False
+    try:
+        r = requests.post(
+            f"http://supervisor/core/api/services/notify/{PHONE_NOTIFY_SERVICE}",
+            headers={
+                "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"title": title, "message": message},
+            timeout=10,
+        )
+        r.raise_for_status()
+        print(f"[notify] phone escalation sent via notify.{PHONE_NOTIFY_SERVICE}")
+        return True
+    except Exception as e:
+        print(f"[notify] phone escalation FAILED via notify.{PHONE_NOTIFY_SERVICE}: {e}")
+        return False
+
+
+def _post_ha_notification(title, message, notification_id="cleaning_digest", to_phone=False):
+    """Post a persistent notification; optionally also escalate to the phone.
+
+    `to_phone` is opt-in per call rather than on by default — the panel is the
+    right home for routine findings, and an alert that buzzes a phone every
+    morning stops being an alert. Reserve it for the cases where nobody would
+    otherwise find out: the pipeline itself being broken.
+    """
+    if to_phone:
+        _post_phone_notification(title, message)
     if not SUPERVISOR_TOKEN:
         print("[digest] no SUPERVISOR_TOKEN — cannot post HA notification")
         return False
@@ -2852,7 +2902,25 @@ def _digest_compute_and_notify():
     Returns a dict with new/resolved/total/notified/message. Safe to call from
     both the HTTP route and the background scheduler.
     """
-    result = _run_full_reconcile()
+    try:
+        result = _run_full_reconcile()
+    except Exception as e:
+        # A reconcile that dies used to take the whole digest with it: no push,
+        # no heartbeat, and therefore SILENCE — which reads as a clean night
+        # until the VPS dead-man eventually fires a day later with a vague
+        # "nothing arrived". Attestation exists precisely so a broken stage can
+        # announce itself, so send a degraded heartbeat saying reconcile failed
+        # rather than saying nothing at all.
+        print(f"[digest] reconcile FAILED, sending degraded heartbeat: {e}")
+        _push_digest_to_vps([], 0, {}, reconcile_ok=False)
+        _post_ha_notification(
+            "Cleaning reconcile failed",
+            f"The nightly reconcile could not complete: {e}. "
+            "Conflicts are unmeasured until this is fixed — not absent.",
+            notification_id="cleaning_reconcile_failed",
+            to_phone=True,
+        )
+        raise
 
     baseline = {}
     if DIGEST_LAST_FILE.exists():
@@ -2934,7 +3002,76 @@ def _digest_compute_and_notify():
     }
 
 
-def _push_digest_to_vps(new_findings, resolved_count, counts):
+def _build_attestation(reconcile_ok):
+    """Report what the pipeline actually DID, not merely that it phoned home.
+
+    The heartbeat alone proves the Pi reached the VPS. A Pi whose sync throws,
+    whose push is skipped and whose reconcile returns garbage — but which still
+    completes the final POST — satisfies the dead-man indefinitely, degrading it
+    from a liveness signal into a "TCP still works" signal. (Advisor finding,
+    2026-08-01.)
+
+    `sync_ok` and `push_outcome` are DERIVED from durable state rather than
+    passed in by the caller. That is deliberate: an attestation a caller
+    assembles is an attestation a caller can quietly omit a stage from, and the
+    omission would look identical to success. Reading the same files the
+    reconciler reads means this cannot claim work that left no trace.
+
+    Only booleans and an enum string cross the wire, so the payload allowlist
+    is unaffected — no guest data, no secrets, nothing new in kind.
+    """
+    try:
+        last_sync = load_data().get("last_sync")
+        sync_ok = False
+        if last_sync:
+            age_h = (datetime.now() - datetime.fromisoformat(last_sync)).total_seconds() / 3600
+            sync_ok = -1 <= age_h <= 26  # same window as the stale-sync sentinel; a future date is broken, not fresh
+    except Exception as e:
+        print(f"[attest] sync_ok undeterminable, reporting False: {e}")
+        sync_ok = False
+
+    if not GCAL_ENABLED:
+        push_outcome = "disabled"
+    else:
+        status = _read_gcal_status()
+        push_outcome = (status or {}).get("outcome") or "never"
+
+    return {
+        "sync_ok": bool(sync_ok),
+        "push_outcome": str(push_outcome),
+        "reconcile_ok": bool(reconcile_ok),
+    }
+
+
+def _probe_bot_health():
+    """Ask the VPS bot whether it is actually alive, not merely reachable.
+
+    Derived from VPS_PUSH_URL rather than configured separately, so the health
+    probe and the digest push can never drift onto different hosts.
+
+    Returns (ok: bool, detail: str). A reachable-but-unhealthy bot is the case
+    that matters — a crashed process behind a live web server looks identical to
+    a healthy one from the outside, which is exactly what the footer status
+    widget cannot see (ISC-16).
+    """
+    if not (VPS_PUSH_ENABLED and VPS_PUSH_URL and VPS_PUSH_SECRET):
+        return True, "not configured — skipped"
+    url = VPS_PUSH_URL.replace("/cleaning/digest", "/cleaning/health")
+    if url == VPS_PUSH_URL:
+        return True, "push url has an unexpected shape — health probe skipped"
+    try:
+        r = requests.get(url, headers={"X-Push-Secret": VPS_PUSH_SECRET}, timeout=15)
+        if r.status_code // 100 != 2:
+            return False, f"HTTP {r.status_code}"
+        body = r.json()
+        if not body.get("ok"):
+            return False, f"bot reports not ok: {str(body)[:120]}"
+        return True, f"uptime {body.get('uptime_s')}s, last digest {body.get('last_digest_age_s')}s ago"
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True):
     """POST the nightly digest to the VPS Telegram bot (allowlist-built payload).
 
     Fires every night including clean ones — `heartbeat: true` is the VPS-side
@@ -2985,6 +3122,9 @@ def _push_digest_to_vps(new_findings, resolved_count, counts):
         },
         "new": len(new_findings),
         "resolved": resolved_count,
+        # Booleans and one enum string only — the crossing allowlist is
+        # unchanged in kind, so this widens nothing.
+        "attestation": _build_attestation(reconcile_ok),
         # Allowlist projection — NEVER pass findings through whole. `quote` and
         # `evidence` (raw WhatsApp text) must not cross to the VPS.
         "findings": [
@@ -3017,6 +3157,12 @@ def _push_digest_to_vps(new_findings, resolved_count, counts):
             "Cleaning digest push failed",
             f"Could not deliver the nightly digest to the VPS bot: {e}. "
             "Telegram alerts will not fire until this is fixed.",
+            # to_phone: this is the ONE alert Telegram cannot deliver, because
+            # the thing that failed is the Telegram path. Without escalating to
+            # a channel that doesn't route through the VPS, a dead bot is
+            # indistinguishable from a quiet clean night — the exact recursion
+            # the advisor flagged 2026-08-01 as the chain's unmonitored end.
+            to_phone=True,
         )
         return False
 
@@ -3069,6 +3215,10 @@ def _digest_scheduler():
                     "Cleaning iCal sync failed",
                     f"The nightly Airbnb calendar sync failed: {e}. "
                     "Bookings may be stale until this is fixed.",
+                    # to_phone: everything downstream reconciles against these
+                    # bookings, so a silent sync failure makes every later
+                    # answer confidently wrong.
+                    to_phone=True,
                 )
         if GCAL_ENABLED:
             try:
@@ -3080,6 +3230,24 @@ def _digest_scheduler():
                 _nightly_gcal_push()
             except Exception as e:
                 print(f"[digest] nightly gcal push wrapper error: {e}")
+        # Probe the bot BEFORE the digest, inline — deliberately not a watcher
+        # thread. A dedicated poller would be one more thing that dies quietly,
+        # to reach a conclusion this already reaches. The push-failure path
+        # catches an *unreachable* bot; this catches a bot that is listening but
+        # not working, which from the outside looks identical to a healthy one.
+        if VPS_PUSH_ENABLED:
+            healthy, detail = _probe_bot_health()
+            print(f"[bot-health] {'ok' if healthy else 'UNHEALTHY'} — {detail}")
+            if not healthy:
+                _post_ha_notification(
+                    "Cleaning Telegram bot unhealthy",
+                    f"The VPS bot did not report healthy: {detail}. "
+                    "Tonight's digest may not reach Telegram — this message came "
+                    "by a different route for that reason.",
+                    notification_id="cleaning_bot_health",
+                    to_phone=True,
+                )
+
         if not DIGEST_ENABLED:
             continue
         try:

@@ -1,5 +1,5 @@
 name: Cleaning Schedule Tracker
-version: "1.25.2"
+version: "1.26.0"
 slug: cleaning-tracker
 description: Airbnb cleaning schedule tracker with iCal sync and AI-powered WhatsApp parsing
 init: false
@@ -37,6 +37,7 @@ options:
   vps_push_enabled: false
   vps_push_url: ""
   vps_push_secret: ""
+  phone_notify_service: ""
 schema:
   ical_url: url
   anthropic_api_key: password
@@ -58,3 +59,4 @@ schema:
   vps_push_enabled: bool
   vps_push_url: str?
   vps_push_secret: password?
+  phone_notify_service: str?
