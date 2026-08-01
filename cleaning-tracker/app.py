@@ -202,6 +202,13 @@ def _gcal_push(data, lock_timeout_s=0):
         "error": verdict["error"],
         "attempt": attempt,
         "last_ok_at": last_ok_at,
+        # Carried forward, never cleared by a success. A push that blows its
+        # nightly budget every night but eventually finishes would otherwise
+        # have its timeout record clobbered by its own late writer, and a
+        # chronically wedging push would read as permanently healthy — a
+        # last-writer-wins failure in the quiet direction. (Advisor finding,
+        # 2026-08-01.) The reconciler ages this out on its own.
+        "last_timeout_at": (prev or {}).get("last_timeout_at"),
         "stats": stats,
     }
     _write_gcal_status(status)
@@ -260,10 +267,34 @@ def _nightly_gcal_push():
         thread.start()
         thread.join(NIGHTLY_PUSH_BUDGET_S)
         if thread.is_alive():
+            # Record the timeout as a first-class not-ok fact. Without this the
+            # previous ok:true record stands, _run_full_reconcile reads it, and
+            # a wedged push presents as a healthy one for up to PUSH_STALE_HOURS
+            # — the exact "positive-looking failure" this release exists to end,
+            # smuggled back in through the timeout branch. (Cross-vendor audit
+            # finding, gpt-5.5, 2026-08-01.)
+            #
+            # The thread is still running and will write its own status if it
+            # ever finishes; that later write legitimately wins, because a push
+            # that eventually succeeded really is ok.
+            prev = _read_gcal_status() or {}
+            _write_gcal_status({
+                "ok": False,
+                "outcome": "timeout",
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "error": (
+                    f"nightly push exceeded its {NIGHTLY_PUSH_BUDGET_S}s budget and "
+                    "was still running; the calendar may not have converged"
+                ),
+                "attempt": prev.get("attempt", 0) + 1,
+                "last_ok_at": prev.get("last_ok_at"),
+                "last_timeout_at": datetime.now().isoformat(timespec="seconds"),
+                "stats": None,
+            })
             print(
                 f"[gcal] nightly push still running after {NIGHTLY_PUSH_BUDGET_S}s "
-                "budget — NOT blocking the digest further; the push continues "
-                "in the background and will persist its own status when done"
+                "budget — NOT blocking the digest further; recorded outcome=timeout "
+                "so the reconciler cannot read this as healthy"
             )
             return
         print("[gcal] nightly push finished within budget")

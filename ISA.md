@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: execute
+phase: verify
 updated: 2026-08-01T10:30:00-07:00
-progress: 37/85
+progress: 88/95
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -173,61 +173,71 @@ never silently loses a same-day schedule change again.
 ### GCal repair reliability (2026-08-01, Council-specced: timeout → honest classification → persisted status → ordered nightly → staleness → correlated findings)
 
 **Bounded network calls**
-- [ ] ISC-43: `_build_service` passes an explicit HTTP timeout to the Google client — no Calendar call can block indefinitely.
-- [ ] ISC-44: The timeout is a named module constant, not an inline magic number.
-- [ ] ISC-45: Anti: the timeout must not be shorter than a normal full sync (list + inserts) — validated against a measured real sync duration, not guessed.
+- [x] ISC-43: `_build_service` passes an explicit HTTP timeout to the Google client — no Calendar call can block indefinitely.
+- [x] ISC-44: The timeout is a named module constant, not an inline magic number.
+- [x] ISC-45: Anti: the timeout must not be shorter than a normal full sync (list + inserts) — validated against a measured real sync duration, not guessed.
 
 **Honest push classification**
-- [ ] ISC-46: `_gcal_push` treats a `{"skipped": 1}` return as NOT a success.
-- [ ] ISC-47: `_gcal_push` resolves exactly three outcomes — ok / skipped / failed — and they are distinguishable at the call site.
-- [ ] ISC-48: The log line emitted for a skip differs textually from the one emitted for a success.
+- [x] ISC-46: `_gcal_push` treats a `{"skipped": 1}` return as NOT a success.
+- [x] ISC-47: `_gcal_push` resolves exactly three outcomes — ok / skipped / failed — and they are distinguishable at the call site.
+- [x] ISC-48: The log line emitted for a skip differs textually from the one emitted for a success.
 
 **Push outcome as persisted state**
-- [ ] ISC-49: A successful push writes `gcal_sync_status` into `data.json`.
-- [ ] ISC-50: A failed push writes `gcal_sync_status` with a non-null `error` string.
-- [ ] ISC-51: A skipped push writes `gcal_sync_status` with `ok: false` and a skip reason.
-- [ ] ISC-52: `gcal_sync_status` carries all four fields — `ok`, `at`, `error`, `attempt`.
-- [ ] ISC-53: `gcal_sync_status.at` is ISO-8601 and parses with `datetime.fromisoformat`.
-- [ ] ISC-54: Anti: a failure to write the status record must never corrupt `data.json` nor raise out of the push path.
-- [ ] ISC-55: Anti: `gcal_sync_status` must never contain a credential — no service-account JSON, no iCal token.
+- [x] ISC-49: A successful push writes a push-status record to the `gcal_push_status.json` sidecar (see Decisions 2026-08-01 10:45 for why a sidecar and not `data.json`).
+- [x] ISC-50: A failed push writes a push-status record with a non-null `error` string.
+- [x] ISC-51: A skipped push writes a push-status record with `ok: false` and a skip reason.
+- [x] ISC-52: The push-status record carries all four fields — `ok`, `at`, `error`, `attempt` — plus `last_ok_at` and `stats`.
+- [x] ISC-53: The push-status `at` is ISO-8601 and parses with `datetime.fromisoformat`.
+- [x] ISC-54: Anti: a failure to write the status record must never corrupt `data.json` nor raise out of the push path.
+- [x] ISC-55: Anti: the push-status record must never contain a credential — no service-account JSON, no iCal token, and no calendar id leaked through an error string.
 
 **Ordered nightly repair-then-detect**
-- [ ] ISC-56: `_digest_scheduler` calls the GCal push inline (not via `threading.Thread`) strictly between `sync_ical()` and the digest.
-- [ ] ISC-57: The nightly push is time-bounded — a wedged network call cannot hang the digest thread past the timeout budget.
-- [ ] ISC-58: The nightly job re-attempts the push when the last recorded status was not-ok, giving traffic-independent retry cadence.
-- [ ] ISC-59: Anti: `save_data()` remains asynchronous for every non-nightly caller — the UI and WhatsApp parse paths must not block on Google.
-- [ ] ISC-60: Anti: a total Google Calendar outage must not prevent the digest and reconcile from running at all.
-- [ ] ISC-61: Anti: detection stays unconditional — the reconciler must never skip observing GCal because the push reported success.
+- [x] ISC-56: `_digest_scheduler` calls the GCal push inline (not via `threading.Thread`) strictly between `sync_ical()` and the digest.
+- [x] ISC-57: The nightly push is time-bounded — a wedged network call cannot hang the digest thread past the timeout budget.
+- [x] ISC-58: The nightly job re-attempts the push when the last recorded status was not-ok, giving traffic-independent retry cadence.
+- [x] ISC-59: Anti: `save_data()` remains asynchronous for every non-nightly caller — the UI and WhatsApp parse paths must not block on Google.
+- [x] ISC-60: Anti: a total Google Calendar outage must not prevent the digest and reconcile from running at all.
+- [x] ISC-61: Anti: detection stays unconditional — the reconciler must never skip observing GCal because the push reported success.
 
 **Staleness assertion**
-- [ ] ISC-62: A `pipeline:stale-push` needs-attention finding is injected when the last *successful* push is older than the threshold.
-- [ ] ISC-63: The staleness threshold is a documented constant greater than the nightly cadence.
-- [ ] ISC-64: `counts` agree with `findings` when the stale-push sentinel is injected (the ISC-40 lesson, applied a second time).
-- [ ] ISC-65: The stale-push finding is dated today so the STALE_DAYS filter cannot auto-suppress it.
-- [ ] ISC-66: The stale-push finding id is stable, so the digest diff alarms once rather than every morning.
-- [ ] ISC-67: An absent `gcal_sync_status` (never pushed) counts as stale, not as healthy.
+- [x] ISC-62: A `pipeline:stale-push` needs-attention finding is injected when the last *successful* push is older than the threshold.
+- [x] ISC-63: The staleness threshold is a documented constant greater than the nightly cadence.
+- [x] ISC-64: `counts` agree with `findings` when the stale-push sentinel is injected (the ISC-40 lesson, applied a second time).
+- [x] ISC-65: The stale-push finding is dated today so the STALE_DAYS filter cannot auto-suppress it.
+- [x] ISC-66: The stale-push finding id is stable, so the digest diff alarms once rather than every morning.
+- [x] ISC-67: An absent push-status record (never pushed) counts as stale, not as healthy.
 
 **Split diagnosis, correlated alert**
-- [ ] ISC-68: A distinct `gcal_push_failed` finding kind exists, separate from `gcal_missing_event`.
-- [ ] ISC-69: While a push failure is active, correlated `gcal_missing_event` / `gcal_stale_event` findings are absorbed into it rather than reported alongside it.
-- [ ] ISC-70: Absorption is scoped to GCal-projection findings — unrelated drift findings still surface normally.
-- [ ] ISC-71: Anti: correlation must never suppress a GCal finding while the push is healthy.
-- [ ] ISC-72: The new finding kinds cross to the VPS through the existing allowlist unchanged (id, detector, kind, severity, date, cleaner, why).
-- [ ] ISC-73: Anti: no `why` on the new finding kinds carries a secret, a guest name, or raw WhatsApp text.
+- [x] ISC-68: A distinct `gcal_push_failed` finding kind exists, separate from `gcal_missing_event`.
+- [x] ISC-69: While a push failure is active, correlated `gcal_missing_event` / `gcal_stale_event` findings are absorbed into it rather than reported alongside it.
+- [x] ISC-70: Absorption is scoped to GCal-projection findings — unrelated drift findings still surface normally.
+- [x] ISC-71: Anti: correlation must never suppress a GCal finding while the push is healthy.
+- [x] ISC-72: The new finding kinds cross to the VPS through the existing allowlist unchanged (id, detector, kind, severity, date, cleaner, why).
+- [x] ISC-73: Anti: no `why` on the new finding kinds carries a secret, a guest name, or raw WhatsApp text.
 
 **Ship and prove**
-- [ ] ISC-74: `config.yaml` version bumped.
-- [ ] ISC-75: `py_compile` passes on every changed Python file.
-- [ ] ISC-76: The new logic has unit tests and they pass.
-- [ ] ISC-77: Work is committed and pushed to the GitHub remote.
-- [ ] ISC-78: The Pi is running the new add-on version (Supervisor reports it).
-- [ ] ISC-79: Post-deploy live reconcile returns the same 14 pre-existing findings — no regression introduced.
-- [ ] ISC-80: Live: a real successful push writes `gcal_sync_status.ok == true` into the live snapshot.
-- [ ] ISC-81: Fault injection — with the push deliberately broken, a `gcal_push_failed` finding appears in a live reconcile.
-- [ ] ISC-82: Fault injection — the broken push produces a real Telegram message, proving the alarm reaches the host.
-- [ ] ISC-83: Recovery — restoring the good config clears the finding and returns `gcal_sync_status.ok` to true.
-- [ ] ISC-84: Anti: fault injection leaves no residue — the real calendar id is restored and no junk events remain on the shared calendar.
-- [ ] ISC-85: Antecedent: the host can tell, from the Telegram message alone, that the *push* failed rather than that the calendar drifted.
+- [x] ISC-74: `config.yaml` version bumped.
+- [x] ISC-75: `py_compile` passes on every changed Python file.
+- [x] ISC-76: The new logic has unit tests and they pass.
+- [x] ISC-77: Work is committed and pushed to the GitHub remote.
+- [x] ISC-78: The Pi is running the new add-on version (Supervisor reports it).
+- [x] ISC-79: Post-deploy live reconcile returns the same 14 pre-existing findings — no regression introduced.
+- [x] ISC-80: Live: a real successful push writes `gcal_push_status.ok == true` into the live snapshot.
+- [x] ISC-81: Fault injection — with the push deliberately broken, a `gcal_push_failed` finding appears in a live reconcile.
+- [x] ISC-82: Fault injection — the broken push produces a real Telegram message, proving the alarm reaches the host.
+- [x] ISC-83: Recovery — restoring the good config clears the finding and returns `gcal_sync_status.ok` to true.
+- [x] ISC-84: Anti: fault injection leaves no residue — the real calendar id is restored and no junk events remain on the shared calendar.
+- [x] ISC-86: A nightly push that exceeds its budget and is still running records `outcome: timeout, ok: false` — a wedged push must never present as a healthy one.
+- [x] ISC-87: A GCal read failure degrades the reconcile instead of killing it, and produces a `gcal_read_failed` finding saying content drift is *unmeasured*, not absent.
+- [x] ISC-88: Anti: a Google `HttpError` string must not carry the calendar id into a finding's `why` — URLs are reduced to scheme+host before crossing to the VPS.
+- [x] ISC-89: A future-dated `last_ok_at` (Pi has no RTC; a power cut can write ahead of true time) is treated as implausible and alarms, rather than suppressing staleness forever.
+- [x] ISC-90: Benign clock skew under an hour does not alarm — the future-date guard must not become the opposite bug.
+- [x] ISC-91: A recent budget-exceeded push surfaces as `gcal_push_timeout` even when a later writer recorded `ok` — the late-writer race must not erase the timeout.
+- [x] ISC-92: That timeout finding ages out, so a historic slow push does not alarm forever.
+- [x] ISC-93: Anti: a corrupt or unparseable push-status record collapses into the same loud branch as an absent one — never into healthy.
+- [ ] ISC-94: The nightly heartbeat should attest per-stage outcomes (`sync_ok`, `push_outcome`, `reconcile_ok`) rather than merely proving arrival, so the VPS dead-man cannot be satisfied by a Pi that reached the push while doing no real work. *(Advisor finding 2026-08-01; DEFERRED — this changes the VPS bot's contract, which is a different system from the six changes this session was scoped to. Fields are booleans/enums, so the crossing allowlist is unaffected.)*
+- [ ] ISC-95: The liveness chain terminates at a single unmonitored VPS process, and ISC-16 records that the footer widget cannot see a crashed bot on a live box — so "Pi silent + bot dead" renders identically to a quiet clean night. *(Advisor finding 2026-08-01; DEFERRED — closing it needs something outside this system, e.g. an external uptime pinger. Recorded rather than pretended away.)*
+- [x] ISC-85: Antecedent: the host can tell, from the Telegram message alone, that the *push* failed rather than that the calendar drifted.
 
 ## Test Strategy
 
@@ -391,28 +401,46 @@ never silently loses a same-day schedule change again.
 
 ## Verification
 
-- ISC-1: invariant — `curl <gcal ical>` → `BEGIN:VEVENT` count 92; distinct (dtstart+summary) 92. No duplicates.
-- ISC-2: invariant — 46 Airbnb stay intervals sorted; assertion `end > next_start` matched 0 times. "checked 46 stays" / "real overlaps: 0".
-- ISC-4: boot-log — `[digest] scheduler started — daily at 08:00`; Supervisor info `digest_enabled: true`, `version: 1.19.0`, `state: started`.
-- ISC-5: behavior — fresh `/reconcile/run` after facts reprocess emitted `[needs-attention] contested_cleaner date=2026-06-12 cleaner=Itzel :: Itzel confirmed for 2026-06-12 but booking is assigned to Daria`.
-- ISC-6: unit — `_is_low_balance_error` matched the real 400 string and rejected 429 / parse-fail / network / none (ALL PASS); module imported on server with no traceback.
-- ISC-7: code — `_credit_recovery_loop` requeues deferred ids and posts "credits restored" (reuses proven `_post_ha_notification` / `enqueue_message`). Not yet observed firing live.
-- ISC-8: safety — `/admin/reprocess-facts` → `{"stale":4,"extracted":4,"errors":0}`; June 12 booking cleaner still `Daria` post-reprocess.
-- ISC-9: behavior — live POST `apply=1` without `confirm_apply` → `HTTP 409` `{"needs_confirmation":true,"new_messages":1,"haiku_calls":2,...}`; message count `1053→1053` (inserted nothing, no tokens). Confirmed path gated behind `confirm_apply=1`.
-- ISC-10: reachability — `GET /internal/snapshot` + `X-Shared-Secret` → HTTP 200, 913KB.
-- ISC-12: boot-log — bridge 1.0.6, 95s past connect: `grep -c "init queries"` = 0; only logged event `backfill complete — switching to live mode`. (On 1.0.5 the same window always produced the 408 at ~46s.)
-- ISC-14: behavior — cleaning-tracker 1.20.1: `ha addons info` shows `homeassistant_api: true`; `POST /digest/run` → `{"notified":true,...}` (was `notified:false` pre-grant).
-- ISC-15: unit (2026-07-23) — `reconcile._channel_silence` 8/8 cases pass (whole-bridge dark → single `bridge_silent` dated today; per-group Daria-dark → `channel_silent` w/ "42 days"+label; min-msgs suppression; healthy→∅; disabled→∅; never-any→`bridge_silent` "ever"; `run()` keeps finding through `filter_and_sort`; dismiss by stable id `channel_silent:gD`). `_parse_msg_ts`+aggregation 7/7 formats (UTC-Z, naive, offset, date-only, space, garbage→None). Live: 1.22.0 deployed, clean boot, `POST /reconcile/run` HTTP 200 executed the detector — 0 silence findings (healthy; absence of `bridge_silent` proves it saw recent real messages). **Pending:** a real digest firing the notification when a channel actually goes dark.
-- ISC-18/19: code+log (2026-07-27) — `_digest_scheduler` calls `sync_ical()` then `_digest_compute_and_notify()`; `if not DIGEST_ENABLED: continue` sits BETWEEN them so sync is ungated. Boot log: `[digest] scheduler started — daily at 08:00 (sync then digest)`. Thread now started unconditionally at `__main__`.
-- ISC-21/22: snapshot (2026-07-27 10:07) — post-deploy `/internal/snapshot`: Oct 16–18 `status: cancelled` (was `active`); `2027-05-14 → 2027-05-16 active` now present. `last_sync` advanced to 10:07:43 from 3-day-old 07-24T08:26.
-- ISC-23/24: wire-capture — VPS-persisted `cleaning-digest.json` payload contains exactly `ts, heartbeat, counts{4}, new, resolved, findings[{id,detector,kind,severity,date,cleaner,why}]`; substring scan for `quote`/`evidence` on the serialized payload → False.
-- ISC-25: live — the first 1.24.0 push was rejected `400` by the bot validator; add-on logged `[vps-push] FAILED: HTTP 400` and posted the HA notification (fail-loud proven by a real failure, not a simulated one). Post-fix pushes return 200.
-- ISC-29/30/31: live-probe — `POST https://play.joshuamohan.com/cleaning/digest` with bad secret → `401` + log `push rejected: missing or invalid X-Push-Secret`, state file untouched; with correct secret → `{"ok":true}` 200 + state persisted. `ss -ltnp` on the VPS: `LISTEN 127.0.0.1:8899 users:(("bun"...))` — loopback only, never 0.0.0.0. Caddy `handle /cleaning/digest` added; hub vhost still returns its Basic-Auth 401 (unaffected).
-- ISC-32/38: live-e2e (2026-07-27 17:09) — dismiss/undismiss cycle on a real finding produced `new:1`; VPS logged `cleaning digest received {new:1, findingsCount:1}` then `cleaning digest message sent {chatId:87…, length:78}` with no fallback warning → the subscription SDK triage path ran. Service env carries no `ANTHROPIC_API_KEY` (systemd `ExecStartPre` refuses to boot with one), so billing is OAuth-subscription by construction.
-- ISC-33: live — three separate clean digests each logged `cleaning digest quiet — no new findings, no message sent`; zero Telegram sends.
-- ISC-34: fault-injection (17:10) — state `received_at` back-dated 26h + service restart → `cleaning pipeline dead-man alarm firing {reason:"stale"}` then `message sent {length:120}`. A fresh heartbeat POST reset `received_at` to now and cleared `last_alert_at`. (Start-time immediate check added by hand — Forge's version only checked hourly, so a restart could grant a dark pipeline an extra hour of silence.)
-- ISC-36: unit — `bun test` 80 pass / 0 fail / 146 expects across 3 files, incl. SDK-fail, SDK-empty and SDK-timeout (hung generator raced to a 50ms deadline) all producing a fallback send.
-- ISC-37: systemd — `systemctl is-active pai-telegram-bot` → active across 3 restarts; logs show `cleaning digest listener started {port:8899}` + `Bot started: @josh_vela_claude_bot`. `git diff src/bot.ts` = one `export` keyword; policy/gate/toolset/sanitize untouched.
-- ISC-39: code — `_push_digest_to_vps` computes `last_sync` age and appends `pipeline:stale-sync` when >26h or absent; `python3 -m py_compile app.py` clean; deployed 1.24.1.
-- ISC-40: code+live — `counts = dict(counts)` then `total`/`needs-attention` incremented alongside the sentinel; 1.24.2 deployed (`version: 1.24.2, state: started`), post-deploy digest push accepted 200.
-- ISC-16: in-browser (2026-07-24) — Chromium on live add-on 1.23.0: `#vps-widget` visible, `#vps-dot` class `vps-dot up`, text "VPS online · 75ms · HTTP 401", **0 console errors** (screenshot). `GET /vps/status` → `{"enabled":true,"reachable":true,"latency_ms":75,"http_status":401,"label":"VPS"}`. Options merge preserved all 16 keys (no secret wiped). `_vps_ping` verified against real/down/edge hosts.
+- ISC-43: code — `AuthorizedHttp(creds, httplib2.Http(timeout=HTTP_TIMEOUT_S))` passed as `http=` (not `credentials=`, which googleapiclient rejects together).
+- ISC-44: code — `HTTP_TIMEOUT_S = 30` module constant in `gcal.py`.
+- ISC-45: measured — two real full syncs timed at 0.73s and 0.61s against a 30s per-call timeout; the nightly path is separately bounded by a 240s join().
+- ISC-46: unit — `test_skipped_is_not_success`: `{'skipped': 1}` → ok False, outcome 'skipped'. This was the whole bug.
+- ISC-47: unit — `test_three_outcomes_are_distinguishable`: {ok, skipped, failed} all reachable and distinct.
+- ISC-48: code — `[gcal] SKIPPED — another sync already running` vs `[gcal] synced: {...}` vs `[gcal] push FAILED: ...`.
+- ISC-49: live — `/internal/snapshot` after a real push: `ok: true, outcome: ok, at: 2026-08-01T10:52:46`.
+- ISC-50: live fault injection — bad calendar id → `ok: false, outcome: failed, error: 'Google API error: <HttpError 404 ...>'`.
+- ISC-51: unit — classification path verified; skip persists through the same `_write_gcal_status` call as every other outcome.
+- ISC-52: live — all four fields present plus `last_ok_at` and `stats`.
+- ISC-53: live — `at: 2026-08-01T10:52:46` parses with `datetime.fromisoformat`.
+- ISC-54: code — `_write_gcal_status` writes a temp file then `os.replace()`s it, wrapped in a bare except that only prints.
+- ISC-55: live+unit — snapshot inspected; `_redact_error` strips URLs to scheme+host so the calendar id cannot ride a finding.
+- ISC-56: code — `_digest_scheduler` order is `sync_ical()` → `_nightly_gcal_push()` → digest, with the push called inline, not via `threading.Thread` at the call site.
+- ISC-57: code — inner lock wait 120s < outer `join()` budget 240s, so a lock wait cannot consume the budget and mask a wedged push.
+- ISC-58: unit — `_should_retry_push` over ok/failed/skipped/absent; the nightly job runs regardless of traffic, which is the cadence Dov's quiet-week attack required.
+- ISC-59: grep — `app.py:308` still `threading.Thread(target=_gcal_push, args=(snapshot,), daemon=True).start()`; interactive callers unchanged.
+- ISC-60: live fault injection — **caught a real pre-existing defect.** At 1.25.0 a bad calendar id made `/reconcile/run` return **500**: `fetch_tagged_events` raises by design, killing the whole reconcile, so the digest went silent during exactly the outage the new findings exist to announce. Fixed in 1.25.1; re-probed → **200** with both findings present.
+- ISC-61: grep — no early-return keyed on push success in `reconcile.py`; the calendar re-read is unconditional.
+- ISC-62: live — `gcal_push_failed` + `stale_push` emitted during the injected outage.
+- ISC-63: unit — `test_threshold_exceeds_nightly_cadence`: 26h > the 24h cadence.
+- ISC-64: live — during the fault, `counts.total == len(findings)` (16 == 16). Injected inside `run()` before `filter_and_sort`, so counts derive from findings; the ISC-40 bug cannot recur by construction.
+- ISC-65: unit — every push-health finding dated today, not the status timestamp.
+- ISC-66: unit — ids stable across repeated calls (`pipeline:gcal-push-failed`, `pipeline:stale-push`).
+- ISC-67: unit — `gcal_status=None` → `stale_push`. Never pushed is not healthy.
+- ISC-68: live — `gcal_push_failed` appears as its own kind alongside, not inside, the calendar-content kinds.
+- ISC-69: unit — `test_failed_push_absorbs_gcal_findings`. Not exercised live: the injected fault also broke the *read*, so the content detector was skipped and there was nothing to absorb.
+- ISC-70: live — all 14 `drift_unassigned` findings survived the outage untouched; only calendar-content findings are ever dropped.
+- ISC-71: unit — `test_healthy_push_passes_gcal_findings_through`.
+- ISC-72: live — the VPS received and rendered both new kinds through the unchanged allowlist.
+- ISC-73: live — the delivered Telegram body contains `https://www.googleapis.com/…` with the calendar id stripped.
+- ISC-74: file — `config.yaml` version `1.25.1`.
+- ISC-75: bash — `py_compile` clean on `app.py`, `gcal.py`, `reconcile.py`.
+- ISC-76: bash — 36 tests, all pass (`scripts/test_gcal_repair.py`).
+- ISC-77: git — `bf7d989` + `ff608d8` pushed to `origin/master`.
+- ISC-78: ssh — `ha addons info` reports version `1.25.1`, state `started`.
+- ISC-79: live — post-recovery reconcile returns the same 14 `drift_unassigned` findings as before the work began.
+- ISC-80: live — `gcal_push_status.ok == true` in the snapshot after a real push.
+- ISC-81: live — `gcal_push_failed` present in a fresh reconcile while broken.
+- ISC-82: live — VPS journal `cleaning digest message sent`, chatId 876…, 462 chars, naming the API failure.
+- ISC-83: live — config restored → push `ok: true`, all pipeline findings cleared, counts back to 14.
+- ISC-84: live — recovery sync reported `inserted: 0, deleted: 0`; the probe used a non-existent calendar id so no write ever reached the shared calendar. Host temp files removed.
+- ISC-85: live — delivered message reads 'the calendar write did not succeed' and 'drift is currently unmeasured', not 'events missing'.

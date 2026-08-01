@@ -204,6 +204,55 @@ class PushHealth(unittest.TestCase):
                 self.assertNotIn(banned, low)
 
 
+# ── Advisor findings 2026-08-01: the quiet-direction failures ───────────────
+
+class QuietDirectionFailures(unittest.TestCase):
+    """Three ways the staleness detector could fail SILENTLY — each one reads
+    as healthy while the pipeline is broken, which is the failure direction
+    this whole release exists to eliminate."""
+
+    def test_future_dated_success_does_not_suppress_forever(self):
+        """The Pi has no RTC. A power cut can write a timestamp ahead of true
+        time; a plain `age >= threshold` test then reads negative forever."""
+        future = datetime.now() + timedelta(hours=48)
+        kinds = {f["kind"] for f in R._gcal_push_health(_status(ok=True, last_ok_at=future), TODAY)}
+        self.assertIn("stale_push", kinds)
+
+    def test_benign_clock_skew_is_tolerated(self):
+        """A few seconds of skew must not alarm — that would be the opposite bug."""
+        near = datetime.now() + timedelta(minutes=2)
+        kinds = {f["kind"] for f in R._gcal_push_health(_status(ok=True, last_ok_at=near), TODAY)}
+        self.assertNotIn("stale_push", kinds)
+
+    def test_recent_timeout_surfaces_even_when_a_later_push_succeeded(self):
+        """The late-writer race: the abandoned worker finishes at 08:12 and
+        writes ok:true, clobbering the 08:08 timeout. A chronically wedging
+        push would otherwise read as permanently healthy."""
+        st = _status(ok=True, last_ok_at=datetime.now())
+        st["last_timeout_at"] = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+        kinds = {f["kind"] for f in R._gcal_push_health(st, TODAY)}
+        self.assertIn("gcal_push_timeout", kinds)
+
+    def test_old_timeout_ages_out(self):
+        """It must not alarm forever either — a stale timeout is history."""
+        st = _status(ok=True, last_ok_at=datetime.now())
+        st["last_timeout_at"] = (datetime.now() - timedelta(hours=200)).isoformat(timespec="seconds")
+        kinds = {f["kind"] for f in R._gcal_push_health(st, TODAY)}
+        self.assertNotIn("gcal_push_timeout", kinds)
+
+    def test_unparseable_last_ok_is_loud_not_quiet(self):
+        """A corrupt timestamp must collapse into the same branch as absent."""
+        st = _status(ok=True)
+        st["last_ok_at"] = "not-a-timestamp"
+        kinds = {f["kind"] for f in R._gcal_push_health(st, TODAY)}
+        self.assertIn("stale_push", kinds)
+
+    def test_empty_status_dict_is_stale(self):
+        """A corrupt sidecar that parses to {} must not read as healthy."""
+        kinds = {f["kind"] for f in R._gcal_push_health({}, TODAY)}
+        self.assertIn("stale_push", kinds)
+
+
 # ── ISC-60: a GCal outage must degrade, not kill the run ────────────────────
 
 class ReadFailure(unittest.TestCase):

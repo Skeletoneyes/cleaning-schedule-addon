@@ -26,6 +26,7 @@ from datetime import date, datetime, timedelta
 RECONCILER_VERSION = "reconciler-v1"
 CONFIRM_THRESHOLD = 0.85
 PUSH_STALE_HOURS = 26
+CLOCK_SKEW_TOLERANCE_H = 1  # tolerate benign skew; beyond this, a future date is a broken clock
 
 _SEVERITY_RANK = {"needs-attention": 0, "suggest": 1, "informational": 2}
 
@@ -234,6 +235,32 @@ def _gcal_push_health(gcal_status, today_str, now=None, gcal_read_error=None):
             "evidence": [],
         })
 
+    # A push that blew its budget recently is worth saying out loud even if a
+    # later writer recorded ok — "it converged, eventually, after we stopped
+    # waiting" is a different health state from "it converged".
+    last_timeout_at = (gcal_status or {}).get("last_timeout_at")
+    if last_timeout_at:
+        try:
+            since = (now - datetime.fromisoformat(last_timeout_at)).total_seconds() / 3600
+        except (ValueError, TypeError):
+            since = 0
+        if -CLOCK_SKEW_TOLERANCE_H <= since < PUSH_STALE_HOURS:
+            out.append({
+                "id": "pipeline:gcal-push-timeout",
+                "detector": "pipeline",
+                "kind": "gcal_push_timeout",
+                "severity": "needs-attention",
+                "booking_uid": None,
+                "cleaner": None,
+                "date": today_str,
+                "why": (
+                    f"a Google Calendar push exceeded its time budget {since:.1f}h ago — "
+                    "the calendar may still have converged afterwards, but the push is "
+                    "running slow enough that the nightly job stopped waiting for it"
+                ),
+                "evidence": [],
+            })
+
     last_ok_at = (gcal_status or {}).get("last_ok_at")
     age_desc = None
     if not last_ok_at:
@@ -242,7 +269,15 @@ def _gcal_push_health(gcal_status, today_str, now=None, gcal_read_error=None):
         try:
             last_ok_dt = datetime.fromisoformat(last_ok_at)
             age_hours = (now - last_ok_dt).total_seconds() / 3600
-            if age_hours >= PUSH_STALE_HOURS:
+            if age_hours < -CLOCK_SKEW_TOLERANCE_H:
+                # A future-dated success. The Pi has no RTC, so a power cut can
+                # leave it writing timestamps ahead of true time; once NTP
+                # corrects, a plain `age >= threshold` test reads negative and
+                # suppresses staleness FOREVER. Implausible is not healthy —
+                # collapse it into the same loud branch as absent. (Advisor
+                # finding, 2026-08-01.)
+                age_desc = f"dated {abs(age_hours):.1f}h in the future — clock is wrong"
+            elif age_hours >= PUSH_STALE_HOURS:
                 age_desc = f"{age_hours:.1f}h ago"
         except (ValueError, TypeError):
             age_desc = f"unparseable timestamp {last_ok_at!r}"
