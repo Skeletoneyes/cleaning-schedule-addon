@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-01T11:10:00-07:00
-progress: 112/121
+updated: 2026-08-01T12:30:00-07:00
+progress: 115/122
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -235,8 +235,8 @@ never silently loses a same-day schedule change again.
 - [x] ISC-91: A recent budget-exceeded push surfaces as `gcal_push_timeout` even when a later writer recorded `ok` — the late-writer race must not erase the timeout.
 - [x] ISC-92: That timeout finding ages out, so a historic slow push does not alarm forever.
 - [x] ISC-93: Anti: a corrupt or unparseable push-status record collapses into the same loud branch as an absent one — never into healthy.
-- [ ] ISC-94: The nightly heartbeat should attest per-stage outcomes (`sync_ok`, `push_outcome`, `reconcile_ok`) rather than merely proving arrival, so the VPS dead-man cannot be satisfied by a Pi that reached the push while doing no real work. *(Advisor finding 2026-08-01; DEFERRED — this changes the VPS bot's contract, which is a different system from the six changes this session was scoped to. Fields are booleans/enums, so the crossing allowlist is unaffected.)*
-- [ ] ISC-95: The liveness chain terminates at a single unmonitored VPS process, and ISC-16 records that the footer widget cannot see a crashed bot on a live box — so "Pi silent + bot dead" renders identically to a quiet clean night. *(Advisor finding 2026-08-01; DEFERRED — closing it needs something outside this system, e.g. an external uptime pinger. Recorded rather than pretended away.)*
+- [x] ISC-94: The nightly heartbeat should attest per-stage outcomes (`sync_ok`, `push_outcome`, `reconcile_ok`) rather than merely proving arrival, so the VPS dead-man cannot be satisfied by a Pi that reached the push while doing no real work. *(Advisor finding 2026-08-01. **DONE same day** — Josh approved taking it next; implemented and live-verified as ISC-96..105 in 1.26.0→1.26.4. Fields are booleans/enums, so the crossing allowlist was unaffected as predicted.)*
+- [x] ISC-95: The liveness chain terminates at a single unmonitored VPS process, and ISC-16 records that the footer widget cannot see a crashed bot on a live box — so "Pi silent + bot dead" renders identically to a quiet clean night. *(Advisor finding 2026-08-01. **DONE same day, and the framing was wrong** — closing it needed nothing outside the system. The chain is a cycle once the Pi watches the bot back, because the VPS dead-man already watches the Pi. Implemented as ISC-106..113. The residual honest caveat is ISC-120.)*
 - [x] ISC-85: Antecedent: the host can tell, from the Telegram message alone, that the *push* failed rather than that the calendar drifted.
 
 ### Liveness: attestation + closing the watch cycle (2026-08-01, advisor-driven)
@@ -245,7 +245,7 @@ never silently loses a same-day schedule change again.
 - [x] ISC-116: `sync_ok` reflects the outcome of THIS run's sync attempt, not the freshness of the last successful one — a failure tonight must not be masked by a success yesterday.
 - [x] ISC-118: Anti: a corrupt (as opposed to absent) sync record fails closed — it must never degrade into the freshness fallback and claim a success it cannot prove.
 - [x] ISC-119: A deadline-based absence alarm exists and is distinct from the consecutive-non-ok counter — a counter over received payloads can never increment on absence. *(The 25h dead-man, checked hourly; re-verified intact after this session's edits: 9 staleness tests pass.)*
-- [ ] ISC-120: The independence claim must be written accurately: the two watch directions share no infrastructure **downstream of the Pi's NIC**, but upstream they share the LAN, router, modem, ISP and house power. *(Advisor correction — a future session would otherwise read "shares no infrastructure" and believe a case is covered that isn't. Deliberately left open until the doc wording is corrected everywhere it appears.)*
+- [x] ISC-120: The independence claim must be written accurately: the two watch directions share no infrastructure **downstream of the Pi's NIC**, but upstream they share the LAN, router, modem, ISP and house power. *(Advisor correction. Written into `CLAUDE.md` § Liveness as an explicit ⚠️ paragraph naming the shared upstream — LAN, router, modem, ISP, house power — and stating that a WAN or mains outage defeats both directions and is deliberately undefended, because two people in a house notice it within minutes for free.)*
 - [ ] ISC-121: `/cleaning/health` asserts the web listener, not that the Telegram poll loop is alive — a wedged poller returns 200. *(Advisor finding; deferred. Closing it needs a last-successful-Telegram-interaction timestamp on the bot.)*
 - [x] ISC-117: Anti: the bot-health probe must not silently disable itself when the push URL shape drifts — an unusable URL reports unhealthy, and a moved route still probes correctly.
 - [x] ISC-97: `sync_ok` and `push_outcome` are derived from durable state (`last_sync`, the push-status sidecar), not passed in — an attestation that can be omitted can lie by omission.
