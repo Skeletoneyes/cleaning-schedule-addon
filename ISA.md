@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: verify
 updated: 2026-08-01T11:10:00-07:00
-progress: 108/115
+progress: 109/117
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -242,6 +242,8 @@ never silently loses a same-day schedule change again.
 ### Liveness: attestation + closing the watch cycle (2026-08-01, advisor-driven)
 
 - [x] ISC-96: The nightly payload carries an `attestation` block with `sync_ok`, `push_outcome` and `reconcile_ok`.
+- [x] ISC-116: `sync_ok` reflects the outcome of THIS run's sync attempt, not the freshness of the last successful one — a failure tonight must not be masked by a success yesterday.
+- [x] ISC-117: Anti: the bot-health probe must not silently disable itself when the push URL shape drifts — an unusable URL reports unhealthy, and a moved route still probes correctly.
 - [x] ISC-97: `sync_ok` and `push_outcome` are derived from durable state (`last_sync`, the push-status sidecar), not passed in — an attestation that can be omitted can lie by omission.
 - [x] ISC-98: Anti: the attestation adds only booleans and enums — it must not widen what crosses to the VPS.
 - [x] ISC-99: The VPS validates the attestation shape and rejects a malformed one without resetting the dead-man.
@@ -260,7 +262,7 @@ never silently loses a same-day schedule change again.
 - [x] ISC-112: Anti: the notify service name is a config option, never hardcoded — this repo is public (the `vps_status_url` precedent).
 - [x] ISC-113: Anti: an unconfigured or failing phone-notify path must not break the notification it was meant to escalate.
 - [x] ISC-115: The add-on's own log lines are readable in real time — `PYTHONUNBUFFERED=1`, without which every fail-loudly `print()` sat in a block buffer until it filled.
-- [x] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
+- [DEFERRED-VERIFY] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
 
 ## Test Strategy
 
@@ -382,7 +384,7 @@ never silently loses a same-day schedule change again.
 - ISC-111: live — `[notify] phone escalation sent via notify.<service>` observed after an induced push failure.
 - ISC-112: unit — `mobile_app_` appears nowhere in `app.py`; the service name is a config option.
 - ISC-113: code+unit — `_post_phone_notification` is called first, wrapped in a bare except, and returns False on failure; it cannot unwind the panel notification.
-- ISC-114: live fault injection — push URL pointed at a 404, digest run, log shows `[vps-push] FAILED: HTTP 404` then `[notify] phone escalation sent`. Config restored; `[vps-push] ok` confirmed. **Josh to confirm the phone actually buzzed** — HA accepting the call is not the same as the phone showing it.
+- ISC-114: `[DEFERRED-VERIFY]` — live fault injection — push URL pointed at a 404, digest run, log shows `[vps-push] FAILED: HTTP 404` then `[notify] phone escalation sent`. Config restored; `[vps-push] ok` confirmed. **Blocked on Josh confirming the phone actually buzzed.** Marking this `[x]` was an overclaim — the evidence line said confirmation was still needed while the box said done. Home Assistant accepting the notify call is not the phone displaying it, and this project's own principle is that a finding is not delivered until it reaches the human. Follow-up: ISC-114-confirm.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog

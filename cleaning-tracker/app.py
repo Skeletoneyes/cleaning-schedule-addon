@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
 from flask import Flask, render_template_string, request, redirect, jsonify, abort, Response
@@ -55,6 +55,7 @@ GCAL_SERVICE_ACCOUNT_JSON = OPTIONS.get("gcal_service_account_json", "")
 # (_nightly_gcal_push) share one durable record the reconciler can read
 # instead of a print() that journald truncates within a day.
 GCAL_STATUS_FILE = DATA_DIR / "gcal_push_status.json"
+SYNC_STATUS_FILE = DATA_DIR / "sync_status.json"
 PUSH_STALE_HOURS = 26
 NIGHTLY_PUSH_BUDGET_S = 240
 # How long the nightly repair path will WAIT for gcal.py's _SYNC_LOCK instead
@@ -2334,6 +2335,7 @@ def internal_snapshot():
         },
         "data": data,
         "gcal_push_status": _read_gcal_status(),
+        "sync_status": _read_sync_status(),
     })
 
 
@@ -3002,6 +3004,43 @@ def _digest_compute_and_notify():
     }
 
 
+def _read_sync_status():
+    """Per-attempt outcome of the last iCal sync, or None if never recorded.
+
+    Never raises — an unreadable record means "we don't know", which the caller
+    must treat as weaker evidence, not as success.
+    """
+    try:
+        if not SYNC_STATUS_FILE.exists():
+            return None
+        with open(SYNC_STATUS_FILE) as f:
+            status = json.load(f)
+        return status if isinstance(status, dict) else None
+    except Exception as e:
+        print(f"[sync] failed to read sync status: {e}")
+        return None
+
+
+def _write_sync_status(ok, error=None):
+    """Record what THIS sync attempt did. Never raises.
+
+    Separate from `last_sync` on purpose: `last_sync` advances only on success,
+    so it answers "when did a sync last work", never "did the most recent
+    attempt work". Those differ exactly when it matters most.
+    """
+    try:
+        tmp = SYNC_STATUS_FILE.with_name(f"{SYNC_STATUS_FILE.name}.tmp{os.getpid()}")
+        with open(tmp, "w") as f:
+            json.dump({
+                "ok": bool(ok),
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "error": (str(error)[:300] if error else None),
+            }, f, indent=2)
+        os.replace(tmp, SYNC_STATUS_FILE)
+    except Exception as e:
+        print(f"[sync] failed to persist sync status: {e}")
+
+
 def _build_attestation(reconcile_ok):
     """Report what the pipeline actually DID, not merely that it phoned home.
 
@@ -3020,12 +3059,32 @@ def _build_attestation(reconcile_ok):
     Only booleans and an enum string cross the wire, so the payload allowlist
     is unaffected — no guest data, no secrets, nothing new in kind.
     """
+    def _fresh(ts):
+        if not ts:
+            return False
+        try:
+            age_h = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 3600
+        except (ValueError, TypeError):
+            return False
+        # A future date is a broken clock, not freshness (the Pi has no RTC).
+        return -1 <= age_h <= 26
+
+    # Read the PER-ATTEMPT sync outcome, not merely how fresh the last success
+    # is. Deriving sync_ok from `last_sync` age alone was wrong and shipped
+    # briefly in 1.26.0: if tonight's sync throws but yesterday's succeeded,
+    # last_sync is ~24h old, inside the window, and the attestation cheerfully
+    # reports sync_ok:true for a stage that just failed — recreating the exact
+    # "an old good fact masks a new failure" pattern this whole feature exists
+    # to eliminate. (Cross-vendor audit finding, gpt-5.5, 2026-08-01.)
     try:
-        last_sync = load_data().get("last_sync")
-        sync_ok = False
-        if last_sync:
-            age_h = (datetime.now() - datetime.fromisoformat(last_sync)).total_seconds() / 3600
-            sync_ok = -1 <= age_h <= 26  # same window as the stale-sync sentinel; a future date is broken, not fresh
+        sync_status = _read_sync_status()
+        if sync_status is not None:
+            sync_ok = bool(sync_status.get("ok")) and _fresh(sync_status.get("at"))
+        else:
+            # No per-attempt record yet (first run after upgrade). Fall back to
+            # freshness so the attestation degrades to the old, weaker signal
+            # rather than reporting a hard false and alarming on nothing.
+            sync_ok = _fresh(load_data().get("last_sync"))
     except Exception as e:
         print(f"[attest] sync_ok undeterminable, reporting False: {e}")
         sync_ok = False
@@ -3056,9 +3115,20 @@ def _probe_bot_health():
     """
     if not (VPS_PUSH_ENABLED and VPS_PUSH_URL and VPS_PUSH_SECRET):
         return True, "not configured — skipped"
-    url = VPS_PUSH_URL.replace("/cleaning/digest", "/cleaning/health")
-    if url == VPS_PUSH_URL:
-        return True, "push url has an unexpected shape — health probe skipped"
+    # Swap the PATH rather than substring-replacing, so the probe keeps working
+    # if the route is ever mounted somewhere else. The old substring form
+    # silently returned "healthy, skipped" on any unrecognised shape, which
+    # meant a config drift could disable the monitor without ever saying so —
+    # a fallback that switches off the very thing it is guarding.
+    # (Cross-vendor audit finding, gpt-5.5, 2026-08-01.)
+    try:
+        parts = urlsplit(VPS_PUSH_URL)
+        if not (parts.scheme and parts.netloc):
+            raise ValueError("no scheme/host")
+        base = parts.path.rsplit("/", 1)[0] if "/" in parts.path else ""
+        url = urlunsplit((parts.scheme, parts.netloc, f"{base}/health", "", ""))
+    except Exception as e:
+        return False, f"cannot derive a health URL from the configured push URL ({e})"
     try:
         r = requests.get(url, headers={"X-Push-Secret": VPS_PUSH_SECRET}, timeout=15)
         if r.status_code // 100 != 2:
@@ -3208,8 +3278,10 @@ def _digest_scheduler():
                 _, sync_err = sync_ical()
                 if sync_err:
                     raise RuntimeError(sync_err)
+                _write_sync_status(True)
                 print("[digest] nightly iCal sync ok")
             except Exception as e:
+                _write_sync_status(False, e)
                 print(f"[digest] nightly iCal sync FAILED: {e}")
                 _post_ha_notification(
                     "Cleaning iCal sync failed",

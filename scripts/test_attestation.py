@@ -15,6 +15,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "cleaning-tracker"
@@ -45,7 +46,7 @@ class FakeResponse:
         return self._body
 
 
-def build_ns(*, last_sync, gcal_enabled=True, push_status=None):
+def build_ns(*, last_sync, gcal_enabled=True, push_status=None, sync_status=None):
     """A namespace mimicking app.py's module globals for the extracted funcs."""
     return {
         "datetime": datetime,
@@ -53,6 +54,7 @@ def build_ns(*, last_sync, gcal_enabled=True, push_status=None):
         "load_data": lambda: {"last_sync": last_sync},
         "GCAL_ENABLED": gcal_enabled,
         "_read_gcal_status": lambda: push_status,
+        "_read_sync_status": lambda: sync_status,
     }
 
 
@@ -70,6 +72,39 @@ class BuildAttestation(unittest.TestCase):
     def test_all_healthy(self):
         a = self._attest(last_sync=NOW.isoformat(), push_status={"outcome": "ok"})
         self.assertEqual(a, {"sync_ok": True, "push_outcome": "ok", "reconcile_ok": True})
+
+    def test_tonights_failure_is_not_masked_by_yesterdays_success(self):
+        """The bug gpt-5.5 caught in 1.26.0: `last_sync` is ~24h old and inside
+        the freshness window, so a freshness-derived sync_ok reported true for a
+        stage that had just failed — an old good fact masking a new failure,
+        which is the exact pattern this feature exists to eliminate."""
+        yesterday = (NOW - timedelta(hours=24)).isoformat()
+        a = self._attest(
+            last_sync=yesterday,
+            sync_status={"ok": False, "at": NOW.isoformat(), "error": "feed 500"},
+            push_status={"outcome": "ok"})
+        self.assertFalse(a["sync_ok"])
+
+    def test_per_attempt_success_reports_ok(self):
+        a = self._attest(last_sync=NOW.isoformat(),
+                         sync_status={"ok": True, "at": NOW.isoformat()},
+                         push_status={"outcome": "ok"})
+        self.assertTrue(a["sync_ok"])
+
+    def test_stale_per_attempt_record_is_not_ok(self):
+        """A sync that succeeded but 40h ago is not a healthy nightly."""
+        old = (NOW - timedelta(hours=40)).isoformat()
+        a = self._attest(last_sync=old,
+                         sync_status={"ok": True, "at": old},
+                         push_status={"outcome": "ok"})
+        self.assertFalse(a["sync_ok"])
+
+    def test_absent_record_falls_back_to_freshness(self):
+        """First run after upgrade: degrade to the old weaker signal rather
+        than hard-failing and alarming on nothing."""
+        a = self._attest(last_sync=NOW.isoformat(), sync_status=None,
+                         push_status={"outcome": "ok"})
+        self.assertTrue(a["sync_ok"])
 
     def test_stale_sync_reports_not_ok(self):
         old = (NOW - timedelta(hours=40)).isoformat()
@@ -133,6 +168,8 @@ class ProbeBotHealth(unittest.TestCase):
         ns = {
             "requests": FakeRequests,
             "print": lambda *a, **k: None,
+            "urlsplit": urlsplit,
+            "urlunsplit": urlunsplit,
             "VPS_PUSH_ENABLED": enabled,
             "VPS_PUSH_URL": url,
             "VPS_PUSH_SECRET": secret,
@@ -180,10 +217,19 @@ class ProbeBotHealth(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("skipped", detail)
 
-    def test_unexpected_url_shape_is_skipped_not_failed(self):
-        (ok, detail), _ = self._probe(url="https://example.com/something-else")
-        self.assertTrue(ok)
-        self.assertIn("skipped", detail)
+    def test_route_moved_still_probes_correctly(self):
+        """Path swap, not substring replace — the probe survives a moved route."""
+        _, fake = self._probe(url="https://example.com/api/v2/cleaning/digest",
+                              response=FakeResponse(200, {"ok": True}))
+        self.assertEqual(fake.last["url"], "https://example.com/api/v2/cleaning/health")
+
+    def test_unusable_url_is_unhealthy_not_silently_skipped(self):
+        """gpt-5.5's finding: the old fallback returned healthy-and-skipped on
+        any unrecognised shape, so config drift could switch the monitor off
+        without ever saying so — a guard that disables itself."""
+        (ok, detail), _ = self._probe(url="not-a-url")
+        self.assertFalse(ok)
+        self.assertIn("cannot derive", detail)
 
     def test_malformed_json_is_unhealthy_not_a_crash(self):
         (ok, _), _ = self._probe(response=FakeResponse(200, raises=ValueError("not json")))
