@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: plan
+phase: verify
 updated: 2026-08-01T11:10:00-07:00
-progress: 88/114
+progress: 108/115
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -241,25 +241,26 @@ never silently loses a same-day schedule change again.
 
 ### Liveness: attestation + closing the watch cycle (2026-08-01, advisor-driven)
 
-- [ ] ISC-96: The nightly payload carries an `attestation` block with `sync_ok`, `push_outcome` and `reconcile_ok`.
-- [ ] ISC-97: `sync_ok` and `push_outcome` are derived from durable state (`last_sync`, the push-status sidecar), not passed in — an attestation that can be omitted can lie by omission.
-- [ ] ISC-98: Anti: the attestation adds only booleans and enums — it must not widen what crosses to the VPS.
-- [ ] ISC-99: The VPS validates the attestation shape and rejects a malformed one without resetting the dead-man.
-- [ ] ISC-100: An absent attestation (older add-on) is treated as *unknown* — it neither increments nor resets the consecutive-failure counter.
-- [ ] ISC-101: The VPS counts consecutive receipts reporting any non-ok stage, using its own counter and its own clock — never a Pi-supplied timestamp.
-- [ ] ISC-102: Three consecutive non-ok receipts send a Telegram alert naming which stage failed.
-- [ ] ISC-103: The alert fires once per episode, not on every subsequent receipt.
-- [ ] ISC-104: A fully-ok receipt resets the counter and clears the episode.
-- [ ] ISC-105: `push_outcome: "disabled"` counts as ok — GCal off is a valid configuration, not a fault.
-- [ ] ISC-106: The bot serves `GET /cleaning/health` reporting uptime and last-digest age.
-- [ ] ISC-107: Anti: the health endpoint requires the push secret — it must not expose activity data publicly.
-- [ ] ISC-108: Caddy routes `/cleaning/health` to the bot listener.
-- [ ] ISC-109: The nightly job probes bot health inline (no new thread — a watcher thread is one more thing that can die silently).
-- [ ] ISC-110: A bot that is reachable but unhealthy is caught, not only an unreachable one.
-- [ ] ISC-111: Critical add-on alerts reach the phone via a configurable notify service, in addition to the notification panel.
-- [ ] ISC-112: Anti: the notify service name is a config option, never hardcoded — this repo is public (the `vps_status_url` precedent).
-- [ ] ISC-113: Anti: an unconfigured or failing phone-notify path must not break the notification it was meant to escalate.
-- [ ] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
+- [x] ISC-96: The nightly payload carries an `attestation` block with `sync_ok`, `push_outcome` and `reconcile_ok`.
+- [x] ISC-97: `sync_ok` and `push_outcome` are derived from durable state (`last_sync`, the push-status sidecar), not passed in — an attestation that can be omitted can lie by omission.
+- [x] ISC-98: Anti: the attestation adds only booleans and enums — it must not widen what crosses to the VPS.
+- [x] ISC-99: The VPS validates the attestation shape and rejects a malformed one without resetting the dead-man.
+- [x] ISC-100: An absent attestation (older add-on) is treated as *unknown* — it neither increments nor resets the consecutive-failure counter.
+- [x] ISC-101: The VPS counts consecutive receipts reporting any non-ok stage, using its own counter and its own clock — never a Pi-supplied timestamp.
+- [x] ISC-102: Three consecutive non-ok receipts send a Telegram alert naming which stage failed.
+- [x] ISC-103: The alert fires once per episode, not on every subsequent receipt.
+- [x] ISC-104: A fully-ok receipt resets the counter and clears the episode.
+- [x] ISC-105: `push_outcome: "disabled"` counts as ok — GCal off is a valid configuration, not a fault.
+- [x] ISC-106: The bot serves `GET /cleaning/health` reporting uptime and last-digest age.
+- [x] ISC-107: Anti: the health endpoint requires the push secret — it must not expose activity data publicly.
+- [x] ISC-108: Caddy routes `/cleaning/health` to the bot listener.
+- [x] ISC-109: The nightly job probes bot health inline (no new thread — a watcher thread is one more thing that can die silently).
+- [x] ISC-110: A bot that is reachable but unhealthy is caught, not only an unreachable one.
+- [x] ISC-111: Critical add-on alerts reach the phone via a configurable notify service, in addition to the notification panel.
+- [x] ISC-112: Anti: the notify service name is a config option, never hardcoded — this repo is public (the `vps_status_url` precedent).
+- [x] ISC-113: Anti: an unconfigured or failing phone-notify path must not break the notification it was meant to escalate.
+- [x] ISC-115: The add-on's own log lines are readable in real time — `PYTHONUNBUFFERED=1`, without which every fail-loudly `print()` sat in a block buffer until it filled.
+- [x] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
 
 ## Test Strategy
 
@@ -362,6 +363,27 @@ never silently loses a same-day schedule change again.
 - 2026-06-21 16:30: Cleared the 607-message review queue: 598 were one-time transcript-**backfill** chatter (not live), 9 were stale live items from before the LID senders were mapped. Bulk-set to `ignored` via the `/internal/snapshot` → edit → `/internal/restore` round-trip (the only bulk-write path since `/data` is private; restore backs up to `data.json.bak`). LID→cleaner/host mappings were already correct (192…→Itzel, 162…/697…→host).
 - 2026-07-24 12:00: GOTCHA: the documented session-corruption fix ("re-pair fresh": uninstall + reinstall to wipe `/data/auth`) is correct but had no **precondition**. Applied on the strength of an alarm alone it costs the auth state to fix nothing — today's alarm was raised by an unrelated personal group. Before re-pairing, confirm the failures are (a) still arriving and (b) in an allowlisted group; `ha addons logs` truncates to ~100 lines and the on-connect group listing floods it, so read journald (`ha host logs --identifier addon_27cbea7f_whatsapp-bridge --lines 400`). Note the observed failures are all `fromMe: true` linked-device echoes scattered across personal groups — benign for cleaning data, now correctly silent, but an ongoing pattern rather than a one-off.
 - 2026-06-21 16:45: GOTCHA: `host_jids` only suppresses the "unmapped sender" prompt — it does NOT remove a host sender's messages from the pending list (`_build_review_context` includes all `pending` regardless). Host chatter keeps queuing; a real fix would skip/auto-ignore `host_jids` senders in the inbound path.
+
+- ISC-96: live — persisted VPS state shows `attestation: {sync_ok:true, push_outcome:"ok", reconcile_ok:true}`.
+- ISC-97: code+unit — `sync_ok` from `last_sync`, `push_outcome` from the push-status sidecar; 11 tests over stale/absent/future/unparseable/disabled/never.
+- ISC-98: live — payload top-level keys are exactly `attestation, counts, findings, heartbeat, new, resolved, ts`; the block is two booleans and one enum string.
+- ISC-99: unit (bot) — a malformed attestation rejects the whole payload rather than degrading to undefined, so a broken Pi cannot downgrade itself into the unknown bucket. `attestation: null` is rejected too (`typeof null === 'object'`).
+- ISC-100: unit (bot) — `attestationIsOk(undefined)` returns null; the transition carries the counter forward unchanged.
+- ISC-101: code (bot) — `nextAttestationState` is pure and the caller stamps `new Date()`; no Pi-supplied timestamp is used.
+- ISC-102: unit (bot) — alarm fires at exactly 3, not at 2, and names the failed stages.
+- ISC-103: unit (bot) — `last_attestation_alert_at` gates repeat sends; once per episode.
+- ISC-104: unit (bot) — an ok receipt resets the counter to 0 and clears the episode. Live: counter 0 after recovery.
+- ISC-105: unit (bot) — `push_outcome: "disabled"` yields ok. GCal off is valid config, not a fault.
+- ISC-106: live — `GET /cleaning/health` returned `{ok, service, uptime_s, last_digest_received_at, last_digest_age_s, consecutive_non_ok}`; age tracked a real receipt (3851s → 3.0s).
+- ISC-107: live — 401 without the secret through the public vhost; 200 with it.
+- ISC-108: live — Caddy `handle /cleaning/health` added, `caddy validate` clean, reloaded; 404 on a sibling path.
+- ISC-109: code — probe runs inline in `_digest_scheduler` before the digest; no new thread.
+- ISC-110: unit — `{ok: false}` from a reachable bot is caught; this is the case a web-surface ping structurally cannot see (ISC-16).
+- ISC-111: live — `[notify] phone escalation sent via notify.<service>` observed after an induced push failure.
+- ISC-112: unit — `mobile_app_` appears nowhere in `app.py`; the service name is a config option.
+- ISC-113: code+unit — `_post_phone_notification` is called first, wrapped in a bare except, and returns False on failure; it cannot unwind the panel notification.
+- ISC-114: live fault injection — push URL pointed at a 404, digest run, log shows `[vps-push] FAILED: HTTP 404` then `[notify] phone escalation sent`. Config restored; `[vps-push] ok` confirmed. **Josh to confirm the phone actually buzzed** — HA accepting the call is not the same as the phone showing it.
+- ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog
 
