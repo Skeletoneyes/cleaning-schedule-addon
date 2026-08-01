@@ -204,6 +204,62 @@ class PushHealth(unittest.TestCase):
                 self.assertNotIn(banned, low)
 
 
+# ── ISC-60: a GCal outage must degrade, not kill the run ────────────────────
+
+class ReadFailure(unittest.TestCase):
+    """Found by fault injection 2026-08-01: a bad calendar id made
+    fetch_tagged_events raise, which killed the entire reconcile (HTTP 500).
+    The digest then produced nothing at all — silence during exactly the
+    outage the push-health findings exist to announce."""
+
+    def test_read_error_produces_a_finding(self):
+        out = R._gcal_push_health(_status(ok=True, last_ok_at=datetime.now()), TODAY,
+                                  gcal_read_error="HttpError 404 when requesting ...")
+        kinds = {f["kind"] for f in out}
+        self.assertIn("gcal_read_failed", kinds)
+
+    def test_read_error_says_unmeasured_not_absent(self):
+        out = R._gcal_push_health(None, TODAY, gcal_read_error="boom")
+        read = [f for f in out if f["kind"] == "gcal_read_failed"][0]
+        self.assertIn("unmeasured", read["why"])
+
+    def test_no_read_error_is_quiet(self):
+        out = R._gcal_push_health(_status(ok=True, last_ok_at=datetime.now()), TODAY)
+        self.assertEqual(out, [])
+
+
+class ErrorRedaction(unittest.TestCase):
+    """ISC-73/ISC-41 — the allowlist protects keys, not values. A Google
+    HttpError embeds the request URL, which carries the calendar id."""
+
+    REAL = ("Google API error: <HttpError 404 when requesting "
+            "https://www.googleapis.com/calendar/v3/calendars/"
+            "d829ade0fb3b75be6faeb05f9f133d1eb2470dcd@group.calendar.google.com"
+            "/events?alt=json returned 'Not Found'>")
+
+    def test_calendar_id_is_stripped_from_url(self):
+        red = R._redact_error(self.REAL)
+        self.assertNotIn("d829ade0fb3b75be6faeb05f9f133d1eb2470dcd", red)
+        self.assertNotIn("group.calendar.google.com/events", red)
+
+    def test_host_is_kept_so_the_error_stays_diagnosable(self):
+        self.assertIn("googleapis.com", R._redact_error(self.REAL))
+
+    def test_status_code_survives(self):
+        self.assertIn("404", R._redact_error(self.REAL))
+
+    def test_bounded_length(self):
+        self.assertLessEqual(len(R._redact_error("x" * 5000)), 161)
+
+    def test_empty_error_is_handled(self):
+        self.assertTrue(R._redact_error(None))
+
+    def test_redaction_applies_to_the_push_failed_why(self):
+        st = _status(ok=False, outcome="failed", error=self.REAL, last_ok_at=datetime.now())
+        why = [f for f in R._gcal_push_health(st, TODAY) if f["kind"] == "gcal_push_failed"][0]["why"]
+        self.assertNotIn("d829ade0fb3b75be6faeb05f9f133d1eb2470dcd", why)
+
+
 # ── ISC-64, ISC-68..71: correlation inside run() ────────────────────────────
 
 def _fake_gcal_findings(*_a, **_k):

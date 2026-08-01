@@ -20,6 +20,7 @@ Findings schema:
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 
 RECONCILER_VERSION = "reconciler-v1"
@@ -30,7 +31,7 @@ _SEVERITY_RANK = {"needs-attention": 0, "suggest": 1, "informational": 2}
 
 
 def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silence=None,
-        gcal_status=None):
+        gcal_status=None, gcal_read_error=None):
     today = today or date.today()
     today_str = today.isoformat()
     bookings = data.get("bookings", {})
@@ -55,7 +56,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     # injected a stale-push sentinel downstream of counts and left counts
     # disagreeing with findings; a consumer keying off counts read a bad
     # night as healthy. Never repeat that.
-    push_health = _gcal_push_health(gcal_status, today_str)
+    push_health = _gcal_push_health(gcal_status, today_str, gcal_read_error=gcal_read_error)
     findings.extend(push_health)
 
     # Correlate: once we know the GCal WRITE pipe itself is broken or stale,
@@ -166,7 +167,24 @@ def _drift(items):
 # and both ids are stable strings so the nightly digest diff alarms once, not
 # every morning the push stays broken.
 
-def _gcal_push_health(gcal_status, today_str, now=None):
+def _redact_error(msg, limit=160):
+    """Make an exception string safe to put in a `why` that crosses to the VPS.
+
+    Google's HttpError embeds the full request URL, which contains the calendar
+    id. That id is not in this public repo and lives in /data/options.json with
+    the other configured secrets, so it must not ride the digest payload to the
+    VPS — the VPS is credential-free by design and the allowlist protects keys,
+    not values (ISC-41's standing caveat, applied here deliberately). Strip any
+    URL down to its scheme+host and cap the length; the status code and reason
+    are what a human needs, and the full text is still in the add-on log.
+    """
+    if not msg:
+        return "no error message recorded"
+    out = re.sub(r"https?://([^/\s]+)\S*", r"https://\1/…", str(msg))
+    return out[:limit] + ("…" if len(out) > limit else "")
+
+
+def _gcal_push_health(gcal_status, today_str, now=None, gcal_read_error=None):
     """Pure. Findings about the push itself (never about calendar content).
 
     Emits at most two:
@@ -180,9 +198,26 @@ def _gcal_push_health(gcal_status, today_str, now=None):
     now = now or datetime.now()
     out = []
 
+    if gcal_read_error:
+        out.append({
+            "id": "pipeline:gcal-read-failed",
+            "detector": "pipeline",
+            "kind": "gcal_read_failed",
+            "severity": "needs-attention",
+            "booking_uid": None,
+            "cleaner": None,
+            "date": today_str,
+            "why": (
+                f"could not read Google Calendar ({_redact_error(gcal_read_error)}) — "
+                "calendar-content checks were skipped this run, so drift there is "
+                "currently unmeasured rather than absent"
+            ),
+            "evidence": [],
+        })
+
     if gcal_status is not None and not gcal_status.get("ok"):
         outcome = gcal_status.get("outcome") or "unknown"
-        error = gcal_status.get("error") or "no error message recorded"
+        error = _redact_error(gcal_status.get("error"))
         out.append({
             "id": "pipeline:gcal-push-failed",
             "detector": "pipeline",

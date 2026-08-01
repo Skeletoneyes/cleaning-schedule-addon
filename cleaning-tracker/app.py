@@ -2618,9 +2618,26 @@ def _run_full_reconcile():
     drift_items = [it for bk in buckets for it in bk["items"]] + unassigned
     ical_events = _fetch_ical_events()
     gcal_events = None
+    gcal_read_error = None
     data_for_detectors = data
     if GCAL_ENABLED:
-        gcal_events = gcal_mod.fetch_tagged_events(GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID)
+        # fetch_tagged_events() raises by design ("fail loudly, no fallbacks").
+        # That was right when a GCal read failure meant one detector produced
+        # nothing; it is wrong now. An unreachable calendar used to kill the
+        # WHOLE reconcile, so the digest produced no findings, sent no Telegram
+        # message, and went quiet — during exactly the outage the push-health
+        # findings exist to announce. Caught 2026-08-01 by fault injection
+        # (ISC-60): a bad calendar id made /reconcile/run return 500.
+        #
+        # Degrade instead: skip the calendar-content detector (we genuinely
+        # cannot compare against a calendar we cannot read) and pass the read
+        # error through so it becomes a finding. Loud, but not fatal.
+        try:
+            gcal_events = gcal_mod.fetch_tagged_events(GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID)
+        except Exception as e:
+            gcal_read_error = str(e)
+            gcal_events = None
+            print(f"[reconcile] GCal read FAILED, continuing without it: {e}")
         data_for_detectors = json.loads(json.dumps(data, default=str))
         for b in data_for_detectors.get("bookings", {}).values():
             b["_needs_notify"] = needs_notify(b)
@@ -2630,6 +2647,7 @@ def _run_full_reconcile():
         gcal_events=gcal_events,
         silence=_compute_silence_input(data),
         gcal_status=_read_gcal_status(),
+        gcal_read_error=gcal_read_error,
     )
     try:
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
