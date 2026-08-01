@@ -50,6 +50,25 @@ GCAL_ENABLED = bool(OPTIONS.get("gcal_enabled", False))
 GCAL_CALENDAR_ID = OPTIONS.get("gcal_calendar_id", "")
 GCAL_SERVICE_ACCOUNT_JSON = OPTIONS.get("gcal_service_account_json", "")
 
+# Persisted outcome of the last GCal push attempt (D2/D3). Lets the async
+# fire-and-forget push (save_data()) and the synchronous nightly retry
+# (_nightly_gcal_push) share one durable record the reconciler can read
+# instead of a print() that journald truncates within a day.
+GCAL_STATUS_FILE = DATA_DIR / "gcal_push_status.json"
+PUSH_STALE_HOURS = 26
+NIGHTLY_PUSH_BUDGET_S = 240
+# How long the nightly repair path will WAIT for gcal.py's _SYNC_LOCK instead
+# of racing it. Without this, _nightly_gcal_push() runs milliseconds behind
+# the async push sync_ical() -> save_data() just spawned, loses the race for
+# the lock every time, gets {"skipped": 1} back, and _classify_push correctly
+# (but wrongly, in this context) reports that as a failure — manufacturing a
+# false "gcal_push_failed" alarm nearly every single night. Waiting lets the
+# nightly pass either do the work itself or converge behind the concurrent
+# push and then run its own fast, idempotent, honestly-"ok" pass. Must stay
+# comfortably below NIGHTLY_PUSH_BUDGET_S so a lock wait alone can't consume
+# the whole nightly budget and mask a genuinely wedged push.
+NIGHTLY_LOCK_WAIT_S = 120
+
 WHATSAPP_SHARED_SECRET = OPTIONS.get(
     "whatsapp_shared_secret", os.environ.get("WHATSAPP_SHARED_SECRET", "")
 )
@@ -84,21 +103,172 @@ VPS_STATUS_TTL = 45  # seconds — cache probe result; footer polls every 60s
 _VPS_STATUS_CACHE = {"result": None, "at": 0.0}
 
 
-def _gcal_push(data):
-    """Fire-and-forget GCal projection after a write. Errors are swallowed so
-    a GCal outage never blocks the local app."""
+def _classify_push(stats, err, exc=None):
+    """Pure. Classify a sync_to_gcal() outcome into an honest verdict.
+
+    A skip (gcal.py's non-blocking lock was already held) and a real
+    failure both come back from sync_to_gcal() as "no error", which is why
+    the old caller logged a skip as a success. Precedence: exc -> failed;
+    err -> failed; stats with truthy "skipped" -> skipped; stats truthy ->
+    ok; stats falsy/None with no err -> failed ("no stats returned").
+
+    Returns {"ok": bool, "outcome": "ok"|"skipped"|"failed", "error": str|None}.
+    """
+    if exc is not None:
+        return {"ok": False, "outcome": "failed", "error": str(exc)}
+    if err:
+        return {"ok": False, "outcome": "failed", "error": str(err)}
+    if stats and stats.get("skipped"):
+        return {"ok": False, "outcome": "skipped", "error": "another sync already running"}
+    if stats:
+        return {"ok": True, "outcome": "ok", "error": None}
+    return {"ok": False, "outcome": "failed", "error": "no stats returned"}
+
+
+def _read_gcal_status():
+    """Return the persisted GCal push status dict, or None if absent/unreadable.
+
+    Never raises — a corrupt or missing status file just means "we don't
+    know", not a crash.
+    """
+    try:
+        if not GCAL_STATUS_FILE.exists():
+            return None
+        with open(GCAL_STATUS_FILE) as f:
+            status = json.load(f)
+        return status if isinstance(status, dict) else None
+    except Exception as e:
+        print(f"[gcal] failed to read push status: {e}")
+        return None
+
+
+def _write_gcal_status(status):
+    """Persist the GCal push status dict to GCAL_STATUS_FILE.
+
+    Never raises — a failure here must not corrupt data.json nor propagate
+    into the push path. Writes to a temp file in the same directory and
+    os.replace()s it into place so a crash mid-write can't leave a partial
+    (unparseable) status file behind.
+    """
+    try:
+        tmp_path = GCAL_STATUS_FILE.with_name(f"{GCAL_STATUS_FILE.name}.tmp{os.getpid()}")
+        with open(tmp_path, "w") as f:
+            json.dump(status, f, indent=2, default=str)
+        os.replace(tmp_path, GCAL_STATUS_FILE)
+    except Exception as e:
+        print(f"[gcal] failed to persist push status: {e}")
+
+
+def _gcal_push(data, lock_timeout_s=0):
+    """Run the GCal projection, classify the outcome honestly, persist it,
+    and return the status dict. Never raises. Returns None if GCAL_ENABLED
+    is false (unchanged early exit) — no status is written in that case,
+    since a disabled projection has nothing to report.
+
+    Distinguishes "skipped" (another sync already running) from a genuine
+    failure — before this, both surfaced identically as a swallowed
+    exception or a mislabeled "synced" log line, and a stuck GCal push could
+    go unnoticed indefinitely because journald truncates within a day.
+
+    lock_timeout_s defaults to 0 (non-blocking — race the lock, skip if
+    busy), which is exactly the prior fire-and-forget behaviour and is what
+    save_data()'s async dispatch still uses. Only _nightly_gcal_push passes
+    a positive value, because racing an async push it just triggered a
+    moment earlier is a false-alarm generator, not a health signal.
+    """
     if not GCAL_ENABLED:
-        return
+        return None
+
+    prev = _read_gcal_status()
+    stats, err, exc = None, None, None
     try:
         stats, err = gcal_mod.sync_to_gcal(
             data, GCAL_SERVICE_ACCOUNT_JSON, GCAL_CALENDAR_ID,
+            lock_timeout_s=lock_timeout_s,
         )
-        if err:
-            print(f"[gcal] sync error: {err}")
-        elif stats:
-            print(f"[gcal] synced: {stats}")
     except Exception as e:
-        print(f"[gcal] unexpected: {e}")
+        exc = e
+
+    verdict = _classify_push(stats, err, exc)
+    at = datetime.now().isoformat(timespec="seconds")
+    prev_ok = (prev or {}).get("ok")
+    attempt = 1 if (prev is None or prev_ok is True) else (prev or {}).get("attempt", 0) + 1
+    last_ok_at = at if verdict["ok"] else (prev or {}).get("last_ok_at")
+
+    status = {
+        "ok": verdict["ok"],
+        "outcome": verdict["outcome"],
+        "at": at,
+        "error": verdict["error"],
+        "attempt": attempt,
+        "last_ok_at": last_ok_at,
+        "stats": stats,
+    }
+    _write_gcal_status(status)
+
+    if verdict["outcome"] == "skipped":
+        print("[gcal] SKIPPED — another sync already running")
+    elif verdict["outcome"] == "failed":
+        print(f"[gcal] push FAILED: {verdict['error']}")
+    else:
+        print(f"[gcal] synced: {stats}")
+
+    return status
+
+
+def _should_retry_push(status):
+    """Pure. True when status is None or status.get("ok") is not True."""
+    return status is None or status.get("ok") is not True
+
+
+def _nightly_gcal_push():
+    """Run the GCal projection synchronously-with-a-budget, for the nightly
+    digest path only.
+
+    Builds an annotated snapshot the same way /gcal/sync does (load_data(),
+    then set b["_needs_notify"] = needs_notify(b) on every booking), runs
+    _gcal_push in a background thread and join()s it with a
+    NIGHTLY_PUSH_BUDGET_S deadline. If the thread is still alive at the
+    deadline, log loudly and return WITHOUT waiting further — the digest
+    must proceed regardless; a wedged push must never hang the nightly job.
+    (The push thread is a daemon and keeps running in the background; it
+    will still persist its own status via _write_gcal_status when it
+    eventually finishes.) Never raises.
+
+    Passes lock_timeout_s=NIGHTLY_LOCK_WAIT_S into _gcal_push (unlike every
+    async caller, which uses the default non-blocking 0). This call runs
+    moments after _digest_scheduler's sync_ical() -> save_data(), which just
+    fired its own async push on a separate thread — without a wait, this
+    nightly push would race that in-flight push for gcal.py's _SYNC_LOCK,
+    lose almost every time, get back {"skipped": 1}, and _classify_push
+    would correctly-but-wrongly record that as a failed nightly push: a
+    fabricated alarm nearly every night. Waiting up to NIGHTLY_LOCK_WAIT_S
+    (kept well under NIGHTLY_PUSH_BUDGET_S, the outer join() deadline) lets
+    this pass either do the work itself or converge behind the concurrent
+    push and then run its own fast, idempotent, honestly-"ok" pass.
+    """
+    try:
+        with DATA_LOCK:
+            data = load_data()
+        for b in data.get("bookings", {}).values():
+            b["_needs_notify"] = needs_notify(b)
+
+        thread = threading.Thread(
+            target=_gcal_push, args=(data,),
+            kwargs={"lock_timeout_s": NIGHTLY_LOCK_WAIT_S}, daemon=True,
+        )
+        thread.start()
+        thread.join(NIGHTLY_PUSH_BUDGET_S)
+        if thread.is_alive():
+            print(
+                f"[gcal] nightly push still running after {NIGHTLY_PUSH_BUDGET_S}s "
+                "budget — NOT blocking the digest further; the push continues "
+                "in the background and will persist its own status when done"
+            )
+            return
+        print("[gcal] nightly push finished within budget")
+    except Exception as e:
+        print(f"[gcal] nightly push wrapper error: {e}")
 
 
 def ingress_prefix():
@@ -2102,7 +2272,9 @@ def internal_snapshot():
     Same auth model as the WhatsApp inbound endpoint: loopback is open, remote
     callers must present X-Shared-Secret. API keys and the GCal service-account
     JSON are never returned; the Airbnb iCal URL is returned so the caller can
-    pull the upstream feed itself.
+    pull the upstream feed itself. Also includes the persisted GCal push
+    status so pipeline health is verifiable off-host, not just from journald
+    (which truncates within a day).
     """
     remote = request.remote_addr or ""
     if remote not in ("127.0.0.1", "::1"):
@@ -2122,6 +2294,7 @@ def internal_snapshot():
             "gcal_calendar_id": GCAL_CALENDAR_ID,
         },
         "data": data,
+        "gcal_push_status": _read_gcal_status(),
     })
 
 
@@ -2456,6 +2629,7 @@ def _run_full_reconcile():
         ical_events=ical_events,
         gcal_events=gcal_events,
         silence=_compute_silence_input(data),
+        gcal_status=_read_gcal_status(),
     )
     try:
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
@@ -2801,11 +2975,27 @@ def _push_digest_to_vps(new_findings, resolved_count, counts):
 def _digest_scheduler():
     """Background thread: nightly maintenance at DIGEST_TIME.
 
-    Order is load-bearing: sync the Airbnb iCal FIRST so the reconcile/digest
-    runs against fresh world state ("reconciling stale data produces confident
-    garbage"). Sync runs even when the digest is disabled — before 1.24.0,
-    sync only ran at process startup, so a quiet deploy-free stretch left
-    data.json days stale (the Oct 16-18 cancellation sat unapplied for 3 days).
+    Order is strictly load-bearing, repair-then-detect, three steps:
+
+      1. Sync the Airbnb iCal FIRST so the reconcile/digest runs against
+         fresh world state ("reconciling stale data produces confident
+         garbage").
+      2. Retry the Google Calendar push, synchronously-with-a-budget
+         (_nightly_gcal_push). This is the repair step: if the async push
+         from the last save() failed or got skipped, the nightly job is the
+         retry cadence (no queue, no backoff library) — and it runs BEFORE
+         the reconciler reads GCal, closing the race where
+         _digest_scheduler used to sync_ical() (which fires an async push)
+         and immediately reconcile against Google Calendar while that push
+         was potentially still in flight or still broken.
+      3. Run the digest/reconcile, which now sees the freshest calendar
+         state this pipeline can produce.
+
+    Steps 1 and 2 both run even when the digest is disabled — before
+    1.24.0, sync only ran at process startup, so a quiet deploy-free stretch
+    left data.json days stale (the Oct 16-18 cancellation sat unapplied for
+    3 days); the same "don't let a disabled digest silently disable upkeep"
+    rationale extends to the GCal push repair added in 1.25.0.
     """
     try:
         hour, minute = map(int, DIGEST_TIME.split(":"))
@@ -2831,6 +3021,16 @@ def _digest_scheduler():
                     f"The nightly Airbnb calendar sync failed: {e}. "
                     "Bookings may be stale until this is fixed.",
                 )
+        if GCAL_ENABLED:
+            try:
+                is_retry = _should_retry_push(_read_gcal_status())
+                print(
+                    "[gcal] nightly push starting"
+                    + (" (retry — prior push was not ok)" if is_retry else "")
+                )
+                _nightly_gcal_push()
+            except Exception as e:
+                print(f"[digest] nightly gcal push wrapper error: {e}")
         if not DIGEST_ENABLED:
             continue
         try:

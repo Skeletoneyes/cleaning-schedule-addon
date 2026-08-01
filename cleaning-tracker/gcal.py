@@ -19,7 +19,9 @@ from datetime import datetime, date, timedelta
 _SYNC_LOCK = threading.Lock()
 
 try:
+    import httplib2
     from google.oauth2 import service_account
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     _GCAL_AVAILABLE = True
@@ -30,6 +32,12 @@ except ImportError:
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 SOURCE_TAG = "cleaning-tracker"
 LOCAL_TZ = "America/Vancouver"
+
+# No Calendar API call may block forever. Every service built by
+# _build_service() carries this as an explicit HTTP timeout so a network
+# stall can't wedge the sync thread (or, via _nightly_gcal_push, the nightly
+# digest scheduler) indefinitely.
+HTTP_TIMEOUT_S = 30
 
 # GCal provides 11 event colours (ids "1"–"11"). We map a cleaner name onto
 # one of them deterministically — lossy compared to the HSL hash in app.py
@@ -56,7 +64,12 @@ def _build_service(service_account_json):
     else:
         info = service_account_json
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    # Bound HTTP timeout. AuthorizedHttp wraps the timed httplib2.Http with
+    # credential auto-refresh; build() takes http= instead of credentials=
+    # (googleapiclient rejects both together) so the timeout actually reaches
+    # every request the service makes, not just the token refresh.
+    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=HTTP_TIMEOUT_S))
+    return build("calendar", "v3", http=authed_http, cache_discovery=False)
 
 
 def _fmt_time_12h(clean_time: str) -> str:
@@ -303,18 +316,31 @@ def fetch_tagged_events(service_account_json, calendar_id):
     return events
 
 
-def sync_to_gcal(data, service_account_json, calendar_id):
+def sync_to_gcal(data, service_account_json, calendar_id, *, lock_timeout_s=0):
     """Run a full diff-and-patch sync. Returns (stats, error).
 
     stats = {"inserted": N, "patched": N, "deleted": N}
+
+    lock_timeout_s: 0 (default) preserves the original non-blocking
+    behaviour every existing (async, fire-and-forget) caller relies on — if
+    another sync already holds _SYNC_LOCK, return immediately with
+    {"skipped": 1} rather than waiting. A positive value instead waits up to
+    that many seconds to acquire the lock before giving up, for callers that
+    would rather converge behind an in-flight sync than race it and record a
+    false "skipped" failure. If the timed wait also fails, that's a genuine
+    skip and is reported the same way.
     """
     if not _GCAL_AVAILABLE:
         return None, "google-api-python-client not installed"
     if not (service_account_json and calendar_id):
         return None, "Google Calendar credentials not configured"
 
-    if not _SYNC_LOCK.acquire(blocking=False):
-        return {"skipped": 1}, None  # another sync is already running
+    if lock_timeout_s <= 0:
+        acquired = _SYNC_LOCK.acquire(blocking=False)
+    else:
+        acquired = _SYNC_LOCK.acquire(timeout=lock_timeout_s)
+    if not acquired:
+        return {"skipped": 1}, None  # another sync is already running (or still is, after waiting)
 
     try:
         service = _build_service(service_account_json)

@@ -24,11 +24,13 @@ from datetime import date, datetime, timedelta
 
 RECONCILER_VERSION = "reconciler-v1"
 CONFIRM_THRESHOLD = 0.85
+PUSH_STALE_HOURS = 26
 
 _SEVERITY_RANK = {"needs-attention": 0, "suggest": 1, "informational": 2}
 
 
-def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silence=None):
+def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silence=None,
+        gcal_status=None):
     today = today or date.today()
     today_str = today.isoformat()
     bookings = data.get("bookings", {})
@@ -47,6 +49,31 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
         findings.extend(_ical_vs_bookings(bookings, ical_events, today_str))
     if gcal_events is not None:
         findings.extend(_bookings_vs_gcal(data, gcal_events, today_str))
+
+    # Injected here, inside run(), BEFORE dedup — so counts derived downstream
+    # by filter_and_sort automatically include these findings. A prior design
+    # injected a stale-push sentinel downstream of counts and left counts
+    # disagreeing with findings; a consumer keying off counts read a bad
+    # night as healthy. Never repeat that.
+    push_health = _gcal_push_health(gcal_status, today_str)
+    findings.extend(push_health)
+
+    # Correlate: once we know the GCal WRITE pipe itself is broken or stale,
+    # every bookings_vs_gcal finding is downstream noise explained by that
+    # one root cause — drop them and fold the count into the push-health
+    # finding's `why`. Only bookings_vs_gcal is downstream of the push; no
+    # other detector's findings are ever dropped here.
+    if push_health:
+        suppressed = [f for f in findings if f.get("detector") == "bookings_vs_gcal"]
+        if suppressed:
+            plural = "s" if len(suppressed) != 1 else ""
+            note = (
+                f" {len(suppressed)} calendar-content finding{plural} are "
+                "suppressed as downstream of this."
+            )
+            for f in push_health:
+                f["why"] = f["why"] + note
+            findings = [f for f in findings if f.get("detector") != "bookings_vs_gcal"]
 
     # Stable dedup on id — a later detector shouldn't re-emit what an earlier
     # one already claimed.
@@ -122,6 +149,85 @@ def _drift(items):
             "why": lead + why_map.get(k, k),
             "evidence": [],
         })
+    return out
+
+
+# ── Detector 8: GCal push health (pipeline, not calendar content) ──────────
+# Findings about the WRITE PATH itself, as opposed to what bookings_vs_gcal
+# finds by comparing calendar *content*. gcal_status is the dict persisted by
+# app.py's _gcal_push() (D2/D3) — {"ok", "outcome", "at", "error", "attempt",
+# "last_ok_at", "stats"}. A failed/skipped push means the calendar may be
+# stale because the WRITE failed, which is a different story from "the
+# calendar drifted" (bookings_vs_gcal's story) and needs to say so explicitly
+# so a human doesn't chase the wrong repair.
+#
+# Both findings are dated today_str (NOT gcal_status["at"]) so filter_and_sort's
+# STALE_DAYS suppression can never drop the very signal this exists to raise,
+# and both ids are stable strings so the nightly digest diff alarms once, not
+# every morning the push stays broken.
+
+def _gcal_push_health(gcal_status, today_str, now=None):
+    """Pure. Findings about the push itself (never about calendar content).
+
+    Emits at most two:
+      1. "pipeline:gcal-push-failed" — when gcal_status is present and not ok.
+      2. "pipeline:stale-push" — when last_ok_at is absent or older than
+         PUSH_STALE_HOURS. A missing/None gcal_status counts as stale (never
+         pushed is not healthy).
+
+    `now` is injectable for tests; defaults to datetime.now().
+    """
+    now = now or datetime.now()
+    out = []
+
+    if gcal_status is not None and not gcal_status.get("ok"):
+        outcome = gcal_status.get("outcome") or "unknown"
+        error = gcal_status.get("error") or "no error message recorded"
+        out.append({
+            "id": "pipeline:gcal-push-failed",
+            "detector": "pipeline",
+            "kind": "gcal_push_failed",
+            "severity": "needs-attention",
+            "booking_uid": None,
+            "cleaner": None,
+            "date": today_str,
+            "why": (
+                f"the last Google Calendar push {outcome} ({error}) — the "
+                "calendar may be out of date because the WRITE failed, not "
+                "because the calendar itself drifted"
+            ),
+            "evidence": [],
+        })
+
+    last_ok_at = (gcal_status or {}).get("last_ok_at")
+    age_desc = None
+    if not last_ok_at:
+        age_desc = "never" if gcal_status is None else "no successful push recorded"
+    else:
+        try:
+            last_ok_dt = datetime.fromisoformat(last_ok_at)
+            age_hours = (now - last_ok_dt).total_seconds() / 3600
+            if age_hours >= PUSH_STALE_HOURS:
+                age_desc = f"{age_hours:.1f}h ago"
+        except (ValueError, TypeError):
+            age_desc = f"unparseable timestamp {last_ok_at!r}"
+
+    if age_desc is not None:
+        out.append({
+            "id": "pipeline:stale-push",
+            "detector": "pipeline",
+            "kind": "stale_push",
+            "severity": "needs-attention",
+            "booking_uid": None,
+            "cleaner": None,
+            "date": today_str,
+            "why": (
+                f"no successful Google Calendar push in over {PUSH_STALE_HOURS}h "
+                f"(last success: {age_desc}) — the calendar may be silently stale"
+            ),
+            "evidence": [],
+        })
+
     return out
 
 
