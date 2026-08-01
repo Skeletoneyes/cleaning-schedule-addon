@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: verify
 updated: 2026-08-01T11:10:00-07:00
-progress: 109/117
+progress: 111/121
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -243,6 +243,10 @@ never silently loses a same-day schedule change again.
 
 - [x] ISC-96: The nightly payload carries an `attestation` block with `sync_ok`, `push_outcome` and `reconcile_ok`.
 - [x] ISC-116: `sync_ok` reflects the outcome of THIS run's sync attempt, not the freshness of the last successful one — a failure tonight must not be masked by a success yesterday.
+- [x] ISC-118: Anti: a corrupt (as opposed to absent) sync record fails closed — it must never degrade into the freshness fallback and claim a success it cannot prove.
+- [x] ISC-119: A deadline-based absence alarm exists and is distinct from the consecutive-non-ok counter — a counter over received payloads can never increment on absence. *(The 25h dead-man, checked hourly; re-verified intact after this session's edits: 9 staleness tests pass.)*
+- [ ] ISC-120: The independence claim must be written accurately: the two watch directions share no infrastructure **downstream of the Pi's NIC**, but upstream they share the LAN, router, modem, ISP and house power. *(Advisor correction — a future session would otherwise read "shares no infrastructure" and believe a case is covered that isn't. Deliberately left open until the doc wording is corrected everywhere it appears.)*
+- [ ] ISC-121: `/cleaning/health` asserts the web listener, not that the Telegram poll loop is alive — a wedged poller returns 200. *(Advisor finding; deferred. Closing it needs a last-successful-Telegram-interaction timestamp on the bot.)*
 - [x] ISC-117: Anti: the bot-health probe must not silently disable itself when the push URL shape drifts — an unusable URL reports unhealthy, and a moved route still probes correctly.
 - [x] ISC-97: `sync_ok` and `push_outcome` are derived from durable state (`last_sync`, the push-status sidecar), not passed in — an attestation that can be omitted can lie by omission.
 - [x] ISC-98: Anti: the attestation adds only booleans and enums — it must not widen what crosses to the VPS.

@@ -3017,20 +3017,32 @@ def _digest_compute_and_notify():
 
 
 def _read_sync_status():
-    """Per-attempt outcome of the last iCal sync, or None if never recorded.
+    """Per-attempt outcome of the last iCal sync. Never raises.
 
-    Never raises — an unreadable record means "we don't know", which the caller
-    must treat as weaker evidence, not as success.
+    Returns:
+        None            — no record has ever been written (a fresh install or
+                          an upgrade); the caller may fall back to a weaker
+                          signal.
+        {"unreadable"}  — a record EXISTS but could not be parsed. This is not
+                          the same thing, and conflating them is dangerous: SD
+                          wear is the common Pi death, and a corrupt record
+                          that degrades into "fall back to freshness" can
+                          report sync_ok:true off a stale-but-recent success.
+                          A lying attestation is strictly worse than silence,
+                          because it also satisfies the absence alarm.
+                          (Advisor finding, 2026-08-01.)
     """
     try:
         if not SYNC_STATUS_FILE.exists():
             return None
         with open(SYNC_STATUS_FILE) as f:
             status = json.load(f)
-        return status if isinstance(status, dict) else None
+        if not isinstance(status, dict):
+            return {"unreadable": True}
+        return status
     except Exception as e:
-        print(f"[sync] failed to read sync status: {e}")
-        return None
+        print(f"[sync] sync status exists but is unreadable — failing closed: {e}")
+        return {"unreadable": True}
 
 
 def _write_sync_status(ok, error=None):
@@ -3090,7 +3102,10 @@ def _build_attestation(reconcile_ok):
     # to eliminate. (Cross-vendor audit finding, gpt-5.5, 2026-08-01.)
     try:
         sync_status = _read_sync_status()
-        if sync_status is not None:
+        if sync_status is not None and sync_status.get("unreadable"):
+            # Fail closed. We cannot prove the sync ran, so we must not claim it.
+            sync_ok = False
+        elif sync_status is not None:
             sync_ok = bool(sync_status.get("ok")) and _fresh(sync_status.get("at"))
         else:
             # No per-attempt record yet (first run after upgrade). Fall back to

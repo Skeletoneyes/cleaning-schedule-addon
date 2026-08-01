@@ -99,6 +99,16 @@ class BuildAttestation(unittest.TestCase):
                          push_status={"outcome": "ok"})
         self.assertFalse(a["sync_ok"])
 
+    def test_corrupt_record_fails_closed(self):
+        """SD wear is the common Pi death. A corrupt record must not degrade
+        into the freshness fallback and report success off a stale-but-recent
+        last_sync — a lying attestation also satisfies the absence alarm, which
+        makes it strictly worse than silence. (Advisor finding.)"""
+        a = self._attest(last_sync=NOW.isoformat(),
+                         sync_status={"unreadable": True},
+                         push_status={"outcome": "ok"})
+        self.assertFalse(a["sync_ok"])
+
     def test_absent_record_falls_back_to_freshness(self):
         """First run after upgrade: degrade to the old weaker signal rather
         than hard-failing and alarming on nothing."""
