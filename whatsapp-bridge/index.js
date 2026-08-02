@@ -55,6 +55,53 @@ const TEST_ALARM = !!opts.test_alarm;
 const log = P({ level: "info" });
 
 // ---------------------------------------------------------------------------
+// Delivery watermark.
+//
+// Live mode used to discard anything timestamped before THIS PROCESS started.
+// That is correct for a restart thirty seconds later and catastrophic for one
+// five days later: on 2026-07-28 the bridge died, and when it came back every
+// message WhatsApp had queued in the meantime was dropped on sight — including
+// a cleaner reassignment for a booking two days out. The gap was unrecoverable
+// and, worse, invisible.
+//
+// The watermark replaces "newer than boot" with "newer than the last message I
+// actually forwarded", persisted across restarts. Re-forwarding is safe because
+// the tracker deduplicates on message id server-side, so the failure mode of
+// being too generous is a no-op write, while the failure mode of being too
+// strict is permanent silent data loss. Bounded by MAX_REPLAY_DAYS so a corrupt
+// or ancient watermark can't trigger a full-history replay.
+const WATERMARK_FILE = IN_HA ? "/data/watermark.json" : (process.env.WATERMARK_FILE || "./watermark.json");
+const MAX_REPLAY_DAYS = parseInt(process.env.MAX_REPLAY_DAYS || "14", 10);
+
+function readWatermark() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(WATERMARK_FILE, "utf8"));
+    const ts = Number(raw.last_ts || 0);
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    return ts;
+  } catch {
+    return null;
+  }
+}
+
+function writeWatermark(ts) {
+  try {
+    fs.writeFileSync(WATERMARK_FILE, JSON.stringify({ last_ts: ts, updated: new Date().toISOString() }));
+  } catch (err) {
+    log.error({ err: err.message }, "watermark write failed");
+  }
+}
+
+const floorSec = STARTED_AT_SEC - MAX_REPLAY_DAYS * 86400;
+const storedWatermark = readWatermark();
+// No watermark yet (fresh install) → fall back to boot time, the old behaviour.
+let watermark = storedWatermark === null ? STARTED_AT_SEC : Math.max(storedWatermark, floorSec);
+if (storedWatermark !== null) {
+  const ageH = ((STARTED_AT_SEC - watermark) / 3600).toFixed(1);
+  log.info({ watermark, age_hours: Number(ageH) }, "resuming from delivery watermark");
+}
+
+// ---------------------------------------------------------------------------
 // Health alarms → HA persistent notifications.
 //
 // This bridge failed silently for 3 months (libsignal MessageCounterError
@@ -212,6 +259,58 @@ async function forward(payload) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reconnect control.
+//
+// The close handler used to call start() directly. Every call built a NEW
+// socket with its OWN close handler while the old socket stayed alive, so a
+// flapping connection multiplied connections instead of retrying one — and each
+// of those re-ran the connect path. On 2026-07-28 that produced four concurrent
+// sockets within ten seconds (four "switching to live mode" lines in the log),
+// after which the process died and stayed dead for five days.
+//
+// Three properties fix it, and all three are needed: only one reconnect may be
+// in flight (single-flight), the dead socket is torn down before a new one is
+// built (no orphan handlers), and attempts back off so a server-side refusal is
+// not hammered.
+const RECONNECT_BASE_MS = 2000;
+const RECONNECT_MAX_MS = 60000;
+let reconnectPending = false;
+let reconnectAttempts = 0;
+let liveSock = null;
+
+function teardown(sock) {
+  if (!sock) return;
+  try { sock.ev.removeAllListeners(); } catch {}
+  try { sock.end(undefined); } catch {}
+}
+
+function scheduleReconnect(deadSock) {
+  // Only the socket that is actually live may trigger a reconnect. A late close
+  // event from a socket we already replaced must not queue a second one.
+  if (deadSock && liveSock && deadSock !== liveSock) {
+    log.info("ignoring close from a superseded socket");
+    return;
+  }
+  teardown(deadSock);
+  if (deadSock === liveSock) liveSock = null;
+  if (reconnectPending) {
+    log.info("reconnect already scheduled — not queueing another");
+    return;
+  }
+  reconnectPending = true;
+  const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+  reconnectAttempts += 1;
+  log.info({ delay_ms: delay, attempt: reconnectAttempts }, "reconnecting");
+  setTimeout(() => {
+    reconnectPending = false;
+    start().catch((err) => {
+      log.error({ err: err.message }, "reconnect failed");
+      scheduleReconnect(null);
+    });
+  }, delay);
+}
+
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -230,6 +329,8 @@ async function start() {
     fireInitQueries: false,
   });
 
+  liveSock = sock;
+
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (u) => {
@@ -239,6 +340,9 @@ async function start() {
       qrcode.generate(qr, { small: true });
     }
     if (connection === "open") {
+      // A clean connection resets the backoff; otherwise one bad night leaves
+      // every later retry stuck at the 60s ceiling.
+      reconnectAttempts = 0;
       log.info("connected");
       if (TEST_ALARM) {
         postAlarm("test", "test alarm", "Bridge health-alarm path works. Turn the test_alarm option back off.");
@@ -260,7 +364,7 @@ async function start() {
       log.warn({ code, shouldReconnect }, "disconnected");
       if (shouldReconnect) {
         countDisconnect();
-        start();
+        scheduleReconnect(sock);
       } else {
         log.error("logged out — delete /data/auth and restart to re-pair");
         await postAlarm(
@@ -339,12 +443,22 @@ async function start() {
       }
 
       if (type !== "notify") continue;
-      if (ts && ts < STARTED_AT_SEC) continue;
+      // Watermark, not boot time — see the WATERMARK_FILE comment above. A
+      // message older than what we last forwarded is a genuine duplicate; a
+      // message newer than it but older than this process is the queue WhatsApp
+      // held while we were down, and it is exactly what we must not drop.
+      if (ts && ts < watermark) continue;
       if (seenIds.has(msg.key.id)) continue;
       seenIds.add(msg.key.id);
 
       const payload = buildPayload(msg);
-      if (payload) await forward(payload);
+      if (payload) {
+        await forward(payload);
+        if (ts && ts > watermark) {
+          watermark = ts;
+          writeWatermark(ts);
+        }
+      }
     }
   });
 }

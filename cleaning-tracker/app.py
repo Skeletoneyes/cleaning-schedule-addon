@@ -20,6 +20,7 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 import requests
 from flask import Flask, render_template_string, request, redirect, jsonify, abort, Response
 
+import bridge_watchdog as watchdog_mod
 import facts as facts_mod
 import gcal as gcal_mod
 import reconcile as reconcile_mod
@@ -102,6 +103,24 @@ DEAD_CHANNEL_ENABLED = bool(OPTIONS.get("dead_channel_enabled", True))
 DEAD_CHANNEL_DAYS = int(OPTIONS.get("dead_channel_days", 14))
 BRIDGE_SILENT_DAYS = int(OPTIONS.get("bridge_silent_days", 7))
 DEAD_CHANNEL_MIN_MSGS = int(OPTIONS.get("dead_channel_min_msgs", 10))
+
+# Bridge liveness watchdog. Complements the silence detectors above rather than
+# replacing them: those infer a dead pipe from *absent traffic*, which is
+# lagging (7/14-day thresholds) and ambiguous (a quiet chat looks identical).
+# This asks Supervisor for the container's state on an hourly timer, which is
+# unambiguous, and restarts it without asking. See bridge_watchdog.py for the
+# 2026-07-28 five-day outage that motivated it.
+BRIDGE_WATCHDOG_ENABLED = bool(OPTIONS.get("bridge_watchdog_enabled", True))
+BRIDGE_WATCHDOG_SLUG = (OPTIONS.get("bridge_watchdog_slug", "") or "").strip()
+BRIDGE_WATCHDOG_INTERVAL_MIN = int(OPTIONS.get("bridge_watchdog_interval_min", 60))
+BRIDGE_WATCHDOG_FILE = DATA_DIR / "bridge_watchdog.json"
+
+# Append-only record of every booking mutation applied from WhatsApp. Exists so
+# the nightly digest can answer "what did you change while I wasn't looking"
+# without anyone opening the app — the thing that, before 2026-08-02, required
+# a human to come and ask.
+CHANGE_LOG_FILE = DATA_DIR / "change_log.json"
+CHANGE_LOG_MAX = 500
 
 # Footer VPS status widget. Host/URL is NEVER hardcoded (this add-on's code is
 # on GitHub) — it's a config option, empty by default, same as ical_url.
@@ -911,11 +930,114 @@ def _find_message(data, msg_id):
     return None
 
 
-def _apply_booking_change(data, booking_uid, cleaner_name, action, msg):
+def _record_change(before, after, booking_uid, action, msg, auto):
+    """Append one applied-change record for the nightly "what I changed" report.
+
+    Deliberately stores *derived fields only* — date, cleaner, time, confirmed —
+    and never the WhatsApp text that caused the change. This record is projected
+    to the VPS Telegram bot, and the payload allowlist there exists precisely to
+    keep message content on the Pi. Storing the quote here would launder it past
+    that boundary through a field nobody thought to check.
+    """
+    watched = ("cleaner", "clean_time", "confirmed", "end")
+    changed = {
+        f: {"from": before.get(f), "to": after.get(f)}
+        for f in watched
+        if before.get(f) != after.get(f)
+    }
+    if not changed:
+        return
+    entry = {
+        "at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "booking_uid": booking_uid,
+        "cleaning_date": after.get("end"),
+        "action": action,
+        "source": "whatsapp-auto" if auto else "whatsapp-review",
+        "message_id": (msg or {}).get("id"),
+        "changed": changed,
+    }
+    try:
+        log = []
+        if CHANGE_LOG_FILE.exists():
+            log = json.loads(CHANGE_LOG_FILE.read_text())
+            if not isinstance(log, list):
+                log = []
+        log.append(entry)
+        CHANGE_LOG_FILE.write_text(json.dumps(log[-CHANGE_LOG_MAX:], indent=2))
+    except (OSError, ValueError) as e:
+        # Never let bookkeeping break the booking write itself.
+        print(f"[changelog] failed to record change: {e}")
+
+
+def _recent_changes(hours=24, now=None):
+    """Applied changes inside the last `hours`. Used by the nightly digest."""
+    now = now or datetime.now()
+    cutoff = now - timedelta(hours=hours)
+    try:
+        if not CHANGE_LOG_FILE.exists():
+            return []
+        log = json.loads(CHANGE_LOG_FILE.read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for e in log if isinstance(log, list) else []:
+        try:
+            if datetime.fromisoformat(e["at"]) >= cutoff:
+                out.append(e)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+_CHANGE_LABELS = {
+    "cleaner": "cleaner",
+    "clean_time": "time",
+    "confirmed": "confirmed",
+    "end": "cleaning date",
+}
+
+
+def _change_findings(today_str, hours=24, now=None):
+    """Turn the last day's applied changes into digest findings.
+
+    Rides the findings channel rather than a parallel one so it inherits the
+    delivery, allowlist and dismissal machinery that already exists — and so a
+    night with no problems but real changes still produces a Telegram message.
+    Severity is informational: these are reports of work done, not alarms.
+    """
+    out = []
+    for e in _recent_changes(hours=hours, now=now):
+        bits = []
+        for field, delta in (e.get("changed") or {}).items():
+            label = _CHANGE_LABELS.get(field, field)
+            before = delta.get("from")
+            after = delta.get("to")
+            bits.append(f"{label} {before if before not in (None, '') else '—'} → "
+                        f"{after if after not in (None, '') else '—'}")
+        if not bits:
+            continue
+        when = (e.get("cleaning_date") or "?")
+        src = "auto-applied" if e.get("source") == "whatsapp-auto" else "applied after review"
+        out.append({
+            "id": f"applied:{e.get('message_id')}:{e.get('at')}",
+            "detector": "change_log",
+            "kind": "applied_change",
+            "severity": "informational",
+            "booking_uid": e.get("booking_uid"),
+            "cleaner": None,
+            "date": today_str,
+            "why": f"{when} cleaning — {'; '.join(bits)} ({src} from WhatsApp).",
+            "evidence": [],
+        })
+    return out
+
+
+def _apply_booking_change(data, booking_uid, cleaner_name, action, msg, auto=True):
     """Apply a confirm/decline to a booking. Caller holds DATA_LOCK."""
     booking = data["bookings"].get(booking_uid)
     if not booking:
         return
+    before = dict(booking)
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     if action == "confirm":
         if cleaner_name and not booking.get("cleaner"):
@@ -934,6 +1056,7 @@ def _apply_booking_change(data, booking_uid, cleaner_name, action, msg):
         booking["confirmed"] = False
     # Record the message id that last mutated this booking.
     booking["last_wa_msg_id"] = msg.get("id")
+    _record_change(before, booking, booking_uid, action, msg, auto)
 
 
 # ── Commitment / review queue ───────────────────────────────────────────────
@@ -2664,6 +2787,53 @@ def _compute_silence_input(data):
     }
 
 
+def _latest_message_ts(data):
+    """Newest stored WhatsApp message timestamp, or None. Used ONLY to describe
+    an outage window after the fact — never to decide whether one is happening."""
+    best = None
+    for m in data.get("messages", []) or []:
+        ts = m.get("timestamp")
+        if ts and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def _watchdog_check_now(heal=True):
+    """One bridge liveness pass. Safe to call from the timer or a route."""
+    if not (BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG):
+        return None
+    with DATA_LOCK:
+        last_msg = _latest_message_ts(load_data())
+    return watchdog_mod.check(
+        BRIDGE_WATCHDOG_FILE,
+        BRIDGE_WATCHDOG_SLUG,
+        SUPERVISOR_TOKEN,
+        last_message_at=last_msg,
+        heal=heal,
+    )
+
+
+def _watchdog_scheduler():
+    """Hourly bridge liveness loop.
+
+    Runs unconditionally when enabled, including a pass at startup — a bridge
+    that died while the tracker was also down should be found on the way back
+    up, not an hour later.
+    """
+    interval = max(5, BRIDGE_WATCHDOG_INTERVAL_MIN) * 60
+    print(f"[watchdog] started — checking '{BRIDGE_WATCHDOG_SLUG}' every {interval // 60} min")
+    while True:
+        try:
+            state = _watchdog_check_now()
+            if state:
+                print(f"[watchdog] state={state.get('last_state')} outage={bool(state.get('outage'))}")
+        except Exception as e:
+            # Never let the loop die — a watchdog thread that exits silently is
+            # indistinguishable from one reporting all-clear.
+            print(f"[watchdog] loop error (continuing): {e}")
+        time.sleep(interval)
+
+
 def _run_full_reconcile():
     with DATA_LOCK:
         data = load_data()
@@ -2702,6 +2872,28 @@ def _run_full_reconcile():
         gcal_status=_read_gcal_status(),
         gcal_read_error=gcal_read_error,
     )
+    # Bridge liveness findings are merged here rather than inside reconcile.run()
+    # because they come from Supervisor, not from `data` — reconcile.py stays a
+    # pure function of the data it is handed, which is what makes it testable.
+    if BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG:
+        try:
+            wd_state = watchdog_mod.load_state(BRIDGE_WATCHDOG_FILE)
+            wd_findings = watchdog_mod.findings(wd_state, date.today().isoformat())
+            if wd_findings:
+                # Both lists, and `findings_raw` FIRST — it is what
+                # filter_and_sort() re-derives from on every dismiss, refilter
+                # and digest run. Merging into `findings` alone would let the
+                # next filter pass silently delete these again.
+                prior_raw = list(result.get("findings_raw") or result.get("findings") or [])
+                result["findings_raw"] = wd_findings + prior_raw
+                result["findings"] = wd_findings + list(result.get("findings") or [])
+                counts = result.setdefault("counts", {})
+                counts["total"] = counts.get("total", 0) + len(wd_findings)
+                for f in wd_findings:
+                    counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+                    counts[f["kind"]] = counts.get(f["kind"], 0) + 1
+        except Exception as e:
+            print(f"[reconcile] watchdog findings failed (non-fatal): {e}")
     try:
         RECONCILER_LAST_FILE.write_text(json.dumps(result, indent=2))
     except OSError as e:
@@ -2936,6 +3128,18 @@ def _digest_compute_and_notify():
         )
         raise
 
+    # Dismissals must reach the digest, not just the web UI. Before 2026-08-02
+    # `_run_full_reconcile()` returned unfiltered findings and only the HTTP
+    # routes filtered, so a dismissed finding kept riding the nightly Telegram
+    # message forever. That was survivable while the digest only reported NEW
+    # findings; it is not survivable now that unresolved ones repeat nightly,
+    # because dismissal is the only "I've dealt with this" switch there is.
+    # The cached file stays unfiltered on purpose — /reconcile/refilter and
+    # undismiss both depend on being able to re-derive from the full set.
+    with DATA_LOCK:
+        dismissed = (load_data().get("dismissed_findings") or {})
+    result = reconcile_mod.filter_and_sort(result, dismissed)
+
     baseline = {}
     if DIGEST_LAST_FILE.exists():
         try:
@@ -2946,6 +3150,13 @@ def _digest_compute_and_notify():
     current_ids = {f["id"] for f in result["findings"]}
     baseline_ids = set(baseline.get("finding_ids", []))
     no_baseline = not baseline_ids and not baseline
+
+    # Defined for both branches — the first-ever run has no baseline to diff
+    # against, so nothing is "still open" yet, but the persisted first_seen map
+    # must still be written or every finding looks brand new again tomorrow.
+    repeated = []
+    today_iso = date.today().isoformat()
+    first_seen = {f["id"]: today_iso for f in result["findings"]}
 
     if no_baseline:
         title = "Cleaning Digest — initial baseline"
@@ -2962,7 +3173,45 @@ def _digest_compute_and_notify():
     else:
         new_findings = [f for f in result["findings"] if f["id"] in current_ids - baseline_ids]
         resolved_count = len(baseline_ids - current_ids)
-        title = f"Cleaning Digest — {len(new_findings)} new, {resolved_count} resolved"
+
+        # Repeat-until-fixed. Reporting only what changed since last night meant
+        # a real problem was announced once and then never again — the bridge
+        # outage of 2026-07-28 got exactly one notification and then five silent
+        # days. Anything still unresolved and still needs-attention rides every
+        # nightly message until it is fixed or explicitly dismissed. Suggestions
+        # and informational findings deliberately do NOT repeat: making
+        # everything recur trains the reader to ignore the whole message.
+        persisting = [
+            f for f in result["findings"]
+            if f["id"] in (current_ids & baseline_ids)
+            and f.get("severity") == "needs-attention"
+        ]
+        first_seen = dict(baseline.get("first_seen") or {})
+        for f in result["findings"]:
+            first_seen.setdefault(f["id"], today_iso)
+        # Drop ids that no longer exist, so a finding that resolves and later
+        # recurs is reported as new rather than as months old.
+        first_seen = {k: v for k, v in first_seen.items() if k in current_ids}
+
+        repeated = []
+        for f in persisting:
+            f = dict(f)
+            try:
+                days = (date.today() - date.fromisoformat(first_seen[f["id"]])).days
+            except (KeyError, ValueError):
+                days = None
+            if days:
+                # The age goes in `why` rather than a new field on purpose: the
+                # VPS bot validates findings against a fixed key set, so an
+                # extra key would be dropped in transit and the reader would
+                # never learn how long this has been broken.
+                f["why"] = f"{f['why']} [unresolved for {days} day(s)]"
+            repeated.append(f)
+
+        title = (
+            f"Cleaning Digest — {len(new_findings)} new, "
+            f"{len(repeated)} still open, {resolved_count} resolved"
+        )
 
         severity_order = ["needs-attention", "suggest", "informational"]
         grouped = {}
@@ -2983,6 +3232,11 @@ def _digest_compute_and_notify():
         if len(new_findings) > 10:
             lines.append(f"…and {len(new_findings) - 10} more")
 
+        for f in repeated[:10]:
+            lines.append(f"• [still open] {f['why']}")
+        if len(repeated) > 10:
+            lines.append(f"…and {len(repeated) - 10} more still open")
+
         if resolved_count:
             lines.append(f"{resolved_count} previously flagged finding(s) resolved.")
 
@@ -2995,12 +3249,22 @@ def _digest_compute_and_notify():
         )
         message = "\n".join(lines) if lines else "No new findings."
 
+    changes = _change_findings(date.today().isoformat())
+    if changes:
+        message = message + "\n" + "\n".join(f"• [changed] {c['why']}" for c in changes[:10])
+        if len(changes) > 10:
+            message += f"\n…and {len(changes) - 10} more changes"
+
     notified = _post_ha_notification(title, message)
-    _push_digest_to_vps(new_findings, resolved_count, result["counts"])
+    _push_digest_to_vps(
+        new_findings, resolved_count, result["counts"],
+        extra_findings=repeated + changes,
+    )
 
     DIGEST_LAST_FILE.write_text(json.dumps({
         "run_at": datetime.now().isoformat(timespec="seconds"),
         "finding_ids": sorted(list(current_ids)),
+        "first_seen": first_seen,
         "counts": result["counts"],
         "last_title": title,
         "last_message": message,
@@ -3168,7 +3432,7 @@ def _probe_bot_health():
         return False, str(e)[:160]
 
 
-def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True):
+def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True, extra_findings=None):
     """POST the nightly digest to the VPS Telegram bot (allowlist-built payload).
 
     Fires every night including clean ones — `heartbeat: true` is the VPS-side
@@ -3208,6 +3472,11 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True)
             counts["needs-attention"] = counts.get("needs-attention", 0) + 1
     except Exception as e:
         print(f"[vps-push] freshness guard error (non-fatal): {e}")
+    # Still-open problems and applied-change reports travel in `findings` but
+    # are NOT counted as new — the bot decides whether to send on
+    # findings.length, so this is what makes a recurring problem keep arriving,
+    # while `new` stays honest about what actually changed tonight.
+    outgoing = list(new_findings) + list(extra_findings or [])
     payload = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "heartbeat": True,
@@ -3234,7 +3503,7 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True)
                 "cleaner": f.get("cleaner"),
                 "why": f.get("why"),
             }
-            for f in new_findings
+            for f in outgoing
         ],
     }
     try:
@@ -3246,7 +3515,8 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True)
         )
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-        print(f"[vps-push] ok — {len(new_findings)} new, heartbeat sent")
+        print(f"[vps-push] ok — {len(new_findings)} new, "
+              f"{len(outgoing) - len(new_findings)} carried, heartbeat sent")
         return True
     except Exception as e:
         print(f"[vps-push] FAILED: {e}")
@@ -3858,7 +4128,7 @@ def review_accept(msg_id):
         action = override_action or res.get("action") or "confirm"
         cleaner = override_cleaner or res.get("cleaner") or lookup_cleaner_by_jid(data, msg.get("sender"))
         if booking_uid and booking_uid in data.get("bookings", {}) and action in ("confirm", "decline"):
-            _apply_booking_change(data, booking_uid, cleaner, action, msg)
+            _apply_booking_change(data, booking_uid, cleaner, action, msg, auto=False)
             msg["review_state"] = "auto"
             msg["applied_uid"] = booking_uid
             save_data(data)
@@ -3980,6 +4250,10 @@ if __name__ == "__main__":
     # Always start — the thread owns the nightly iCal sync (1.24.0) even when
     # the digest itself is disabled.
     threading.Thread(target=_digest_scheduler, daemon=True, name="digest-scheduler").start()
+    if BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG:
+        threading.Thread(target=_watchdog_scheduler, daemon=True, name="bridge-watchdog").start()
+    elif BRIDGE_WATCHDOG_ENABLED:
+        print("[watchdog] DISABLED — bridge_watchdog_slug is empty; set it in the add-on options")
 
     print("\nStarting server at http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)

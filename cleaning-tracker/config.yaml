@@ -1,5 +1,5 @@
 name: Cleaning Schedule Tracker
-version: "1.26.4"
+version: "1.27.0"
 slug: cleaning-tracker
 description: Airbnb cleaning schedule tracker with iCal sync and AI-powered WhatsApp parsing
 init: false
@@ -9,6 +9,11 @@ arch:
 startup: application
 boot: auto
 homeassistant_api: true
+# Needed by the bridge watchdog to read another add-on's container state and
+# start it when it has died. `manager` is the lowest role that permits add-on
+# start/stop; `homeassistant_api` alone cannot see the Supervisor at all.
+hassio_api: true
+hassio_role: manager
 ingress: true
 ingress_port: 5000
 panel_icon: mdi:broom
@@ -38,6 +43,9 @@ options:
   vps_push_url: ""
   vps_push_secret: ""
   phone_notify_service: ""
+  bridge_watchdog_enabled: true
+  bridge_watchdog_slug: ""
+  bridge_watchdog_interval_min: 60
 schema:
   ical_url: url
   anthropic_api_key: password
@@ -60,3 +68,6 @@ schema:
   vps_push_url: str?
   vps_push_secret: password?
   phone_notify_service: str?
+  bridge_watchdog_enabled: bool
+  bridge_watchdog_slug: str?
+  bridge_watchdog_interval_min: int(5,)
