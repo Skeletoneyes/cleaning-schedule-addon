@@ -1,11 +1,22 @@
-"""Close the notify loop from the host's own messages.
+"""Close the notify loop from messages the system has already read.
 
 The gap this fills: when a booking is reassigned, the system raises "tell the
-cleaner". The host then tells her — in a chat the bridge reads, in a message
-the facts layer already extracts as a `schedule_assertion` — and the item stays
-open anyway, because `ack_notified()` was only ever called by a *cleaner's*
-confirmation or by a human pressing "Mark notified". The evidence was arriving
-and nothing consumed it.
+cleaner" and keeps raising it, because `ack_notified()` was only ever called by
+a *cleaner's confirmation* or by a human pressing "Mark notified". Everything
+else that settles the question was arriving in chats the bridge reads, already
+extracted into facts, and consumed by nothing.
+
+There are two ways a cleaner comes to know, and only one of them is the host
+telling her:
+
+1. **The host tells her** — a `schedule_assertion` in her own chat naming the
+   new arrangement, or naming somebody else for her date.
+2. **She said it first.** A cleaner who DECLINED the date is the origin of the
+   change, not someone waiting to hear about it. This is the stronger evidence
+   of the two: she never had to be informed correctly, because she already
+   knows. It is also the case that actually occurred — Itzel wrote "I'm not
+   available before 3pm on Monday", the booking moved to Darya, and the system
+   went on insisting that Itzel be told what Itzel had just said.
 
 Two properties are deliberate:
 
@@ -97,9 +108,29 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
             if not ts or ts <= since:
                 continue
             for f in rec.get("facts") or []:
-                if f.get("kind") != "schedule_assertion":
-                    continue
                 if f.get("target_date") != target_date:
+                    continue
+
+                # A cleaner who DECLINED this date is the origin of the change,
+                # not someone waiting to hear about it. Telling her would be
+                # repeating her own words back to her. This is stronger evidence
+                # than any host message — she did not have to be informed
+                # correctly, she already knows — and it was the actual Aug 3
+                # case: Itzel wrote "I'm not available before 3pm on Monday"
+                # and the system still insisted she be told.
+                if (side == "displaced" and f.get("kind") == "decline"
+                        and f.get("cleaner") == displaced):
+                    cand = {
+                        "cleaner": cleaner, "verdict": "declined-herself",
+                        "message_id": msg_id, "timestamp": ts,
+                        "group": msg.get("group"),
+                        "quote": (f.get("evidence") or msg.get("text") or "")[:300],
+                    }
+                    if best is None or ts > best["timestamp"]:
+                        best = cand
+                    continue
+
+                if f.get("kind") != "schedule_assertion":
                     continue
                 verdict = (
                     _classify(f.get("cleaner"), f.get("target_time"), displaced,
@@ -125,8 +156,10 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
         if best:
             sides[side] = best
         else:
-            missing.append(f"{cleaner}: no host message in her chat about {target_date} "
-                           f"since {since[:16] or 'the commitment was made'}")
+            what = ("no message in her chat about {d} since {t} — neither a note "
+                    "from you nor a decline from her")
+            missing.append(f"{cleaner}: " + what.format(
+                d=target_date, t=since[:16] or "the commitment was made"))
 
     return {"ok": len(sides) == len(needed), "sides": sides, "missing": missing}
 
@@ -142,8 +175,13 @@ def describe(booking_date, evidence, include_quotes=True):
         e = evidence.get("sides", {}).get(side)
         if not e:
             continue
-        what = "told it moved" if e["verdict"] == "told-moved" else "told the current plan"
-        line = f"{e['cleaner']} was {what} on {e['timestamp'][:16].replace('T', ' ')}"
+        what = {
+            "told-moved": "told it moved",
+            "told-current": "told the current plan",
+            "declined-herself": "the one who declined it, so she already knows",
+        }.get(e["verdict"], "informed")
+        verb = "is" if e["verdict"] == "declined-herself" else "was"
+        line = f"{e['cleaner']} {verb} {what} — {e['timestamp'][:16].replace('T', ' ')}"
         if include_quotes and e.get("quote"):
             line += f' — "{e["quote"]}"'
         bits.append(line)

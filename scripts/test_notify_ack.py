@@ -146,5 +146,61 @@ class DescribeTests(unittest.TestCase):
         self.assertIn("2026-07-30 08:53", out, "the timestamp must survive redaction")
 
 
+
+
+class SelfDeclineTests(unittest.TestCase):
+    """A cleaner who declined the date already knows. Telling her would be
+    repeating her own words back to her — and this was the real Aug 3 case."""
+
+    def _decline(self, mid, cleaner="Itzel", date="2026-08-03", ev="I'm not available before 3pm on Monday"):
+        return {mid: {"facts": [{"kind": "decline", "target_date": date,
+                                 "cleaner": cleaner, "evidence": ev}]}}
+
+    def test_her_own_decline_settles_her_side(self):
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-30T08:53:00"),
+                    "b": msg("b", DARYA_CHAT, "2026-07-30T09:57:00")}
+        f = {**self._decline("a"), **facts("b", "Darya")}
+        ev = na.find_ack_evidence(booking(), f, messages, GROUPS)
+        self.assertTrue(ev["ok"])
+        self.assertEqual(ev["sides"]["displaced"]["verdict"], "declined-herself")
+
+    def test_the_incoming_cleaner_still_has_to_be_told(self):
+        """Itzel declining says nothing about whether Darya knows she is on."""
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-30T08:53:00")}
+        ev = na.find_ack_evidence(booking(), self._decline("a"), messages, GROUPS)
+        self.assertFalse(ev["ok"])
+        self.assertTrue(any("Darya" in x for x in ev["missing"]))
+
+    def test_someone_elses_decline_does_not_count(self):
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-30T08:53:00"),
+                    "b": msg("b", DARYA_CHAT, "2026-07-30T09:57:00")}
+        f = {**self._decline("a", cleaner="Darya"), **facts("b", "Darya")}
+        self.assertFalse(na.find_ack_evidence(booking(), f, messages, GROUPS)["ok"])
+
+    def test_a_decline_for_another_date_does_not_count(self):
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-30T08:53:00"),
+                    "b": msg("b", DARYA_CHAT, "2026-07-30T09:57:00")}
+        f = {**self._decline("a", date="2026-08-10"), **facts("b", "Darya")}
+        self.assertFalse(na.find_ack_evidence(booking(), f, messages, GROUPS)["ok"])
+
+    def test_a_decline_predating_the_commitment_does_not_count(self):
+        """She declined, then was re-committed anyway — the later commitment is
+        the live fact."""
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-01T08:00:00"),
+                    "b": msg("b", DARYA_CHAT, "2026-07-30T09:57:00")}
+        f = {**self._decline("a"), **facts("b", "Darya")}
+        self.assertFalse(na.find_ack_evidence(booking(), f, messages, GROUPS)["ok"])
+
+    def test_the_description_says_why_not_just_that(self):
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-30T08:53:00"),
+                    "b": msg("b", DARYA_CHAT, "2026-07-30T09:57:00")}
+        f = {**self._decline("a"), **facts("b", "Darya")}
+        ev = na.find_ack_evidence(booking(), f, messages, GROUPS)
+        out = na.describe("2026-08-03", ev)
+        self.assertIn("declined", out)
+        self.assertIn("already knows", out)
+        self.assertIn("not available before 3pm", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
