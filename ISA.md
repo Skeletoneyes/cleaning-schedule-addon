@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: active
-updated: 2026-08-02T11:30:00-07:00
-progress: 131/138
+updated: 2026-08-02T12:15:00-07:00
+progress: 139/146
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -283,6 +283,14 @@ never silently loses a same-day schedule change again.
 - [x] ISC-135: A bridge restart resumes from a persisted **delivery watermark** rather than discarding everything older than process start, bounded by `MAX_REPLAY_DAYS`.
 - [x] ISC-136: Supervisor's own watchdog is enabled on both add-ons, so a crashed container is restarted even if the tracker is the thing that died.
 - [x] ISC-137: Antecedent: the heal path is exercised by fault injection (`POST /internal/watchdog/check` after stopping the bridge), not asserted from code.
+- [x] ISC-138: Fact extraction receives a digest of what OTHER chats have already established for nearby dates, so a cleaning arranged across both threads is visible to one layer.
+- [x] ISC-139: Anti: the cross-chat context is *extracted facts*, not raw messages — extraction runs on every message, and raw context would double the token cost on the hot path.
+- [x] ISC-140: The cross-chat horizon is measured on the **cleaning date**, never on when it was said — commitments here are routinely made months ahead.
+- [x] ISC-141: Anti: the digest is truncated by proximity to the message's own date, so hitting the cap cannot drop the dates under active negotiation.
+- [x] ISC-142: History windows are "N messages **or** X days, whichever is larger" — a message count alone gave the busiest chat the shortest memory.
+- [x] ISC-143: Anti: both windows keep a hard cap, because unbounded history is what hit the org rate limit during bulk backfill.
+- [x] ISC-144: The facts prompt describes the context it actually receives; it previously claimed "prior messages across all groups" while the code filtered to one.
+- [x] ISC-145: Reprocessing runs oldest-first and re-reads the facts layer per message, so it converges the way live processing does rather than every message seeing the pre-reprocess snapshot.
 
 ## Test Strategy
 
@@ -408,6 +416,11 @@ never silently loses a same-day schedule change again.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog
+
+- 2026-08-02 | conjectured: the facts layer saw enough context to resolve ordinary conversational shorthand, since its prompt instructs it to resolve "yes", "that date" and weekday names against prior messages.
+  refuted by: reading what the prompt is actually handed. It declares "Prior messages across all groups" and `_facts_history` filters to the target's own group — so the model was told its view spanned every chat while it spanned one. The consequence is not a parsing bug but a *reasoning* bug: asked whether a date is contested, it answers from a filtered corpus it believes is complete, and confidently finds no conflict because the other cleaner's commitment is in a thread it cannot see. Two chats, one shared schedule, and each cleaning routinely negotiated across both.
+  learned: **a prompt that misdescribes its own inputs is worse than one that omits them** — omission makes a model hedge, misdescription makes it confident. This is the same failure family as the three measurement errors recorded on 2026-08-01 (cached reconcile read as live, buffered logs read as clean, an endpoint that could not see the thing being asked about): in every case the instrument answered a different question than the one asked, and the answer looked fine. Add: check what a prompt *claims* against what the caller *passes*, because nothing in the type system connects them. The fix also settled a design question worth keeping — the cheap way to widen context is not more raw text but the structured facts already extracted from it.
+  criterion now: ISC-138..145 shipped in 1.28.0/1.28.1, live-verified against the real corpus (41 facts inside the horizon, which is also how the truncation-order bug was found).
 
 - 2026-08-02 | conjectured: the liveness cycle closed on 2026-08-01 covered the system's health — the VPS watches the Pi, the Pi watches the bot, and the remaining gap was a shared upstream (LAN, ISP, mains) deliberately left undefended.
   refuted by: a five-day WhatsApp outage that every one of those watchers slept through. The bridge died 2026-07-28 15:00 and the tracker stayed *genuinely healthy* — iCal sync ok, calendar push ok, reconcile ok, nightly heartbeat delivered on time. The mutual-watch cycle was built around **the Pi dying**, and the Pi did not die; its *input* did. Meanwhile the two detectors that could have seen it are threshold-based on absent traffic (7 days whole-bridge, 14 per-channel) and would not have fired until Aug 4 and Aug 5 — after the Aug 3 cleaning they were supposed to protect. A cleaner reassignment agreed on Jul 30 never arrived, and tomorrow's calendar entry still names the wrong person at the wrong time.
