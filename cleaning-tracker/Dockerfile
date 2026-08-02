@@ -12,6 +12,9 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py gcal.py facts.py reconcile.py ./
+# Explicit file list, so a new module MUST be added here or the add-on boots
+# into ModuleNotFoundError (bridge_watchdog.py, 2026-08-02). Keep in sync with
+# every top-level `import <local module>` in app.py.
+COPY app.py gcal.py facts.py reconcile.py bridge_watchdog.py ./
 
 CMD ["python", "app.py"]
