@@ -819,29 +819,146 @@ def _flag_credit_exhausted(msg_id):
 # tokens, TPM ceilings, 429 backoff storms). Window to the 30 most recent
 # same-group messages strictly preceding the target.
 FACTS_HISTORY_WINDOW = 30
+FACTS_HISTORY_DAYS = 45
+FACTS_HISTORY_MAX = 120
 
 # Parse history is cross-group (host-chat context helps resolve ambiguous
 # replies) so a separate, slightly larger window. Still needs a cap —
 # unbounded archive hits the 50k tokens/min org rate limit.
 PARSE_HISTORY_WINDOW = 50
+PARSE_HISTORY_DAYS = 30
+PARSE_HISTORY_MAX = 150
+
+# Cross-chat facts digest handed to fact extraction. Bounded in both
+# directions: a little history (a date agreed last week may still be being
+# renegotiated) and a long forward horizon (schedules are agreed months out —
+# the Aug 3 commitment was made on Mar 30).
+CROSS_FACTS_BACK_DAYS = 7
+CROSS_FACTS_FWD_DAYS = 150
+CROSS_FACTS_MAX_LINES = 40
+
+
+def _msg_day(m):
+    """Day-granularity date from a message timestamp, or None.
+
+    Deliberately string-sliced rather than parsed: stored timestamps mix
+    `2026-07-28T21:08:38.000Z` (live) with `2026-07-28T14:08:00` (backfill),
+    and day precision is all the history windows need.
+    """
+    ts = m.get("timestamp") if isinstance(m, dict) else m
+    if not ts or len(ts) < 10:
+        return None
+    try:
+        return date.fromisoformat(ts[:10])
+    except ValueError:
+        return None
+
+
+def _window_by_count_or_days(prior, count, days, hard_max, target):
+    """Most recent `count` messages OR everything within `days` — whichever is
+    larger — capped at `hard_max`.
+
+    A pure message count is the wrong unit and was backwards in practice: 30
+    messages of Daria's chat (96 total since March) reaches back months, while
+    50 of Itzel's (513 total) covers about a fortnight. So the busiest thread —
+    the one most likely to hold a superseding decision — had the SHORTEST
+    memory. Taking the larger of the two windows fixes the quiet case without
+    shrinking the busy one; hard_max keeps the token cost bounded, which is why
+    the original caps existed (bulk backfill hit the org rate limit).
+    """
+    prior = sorted(prior, key=lambda m: m.get("timestamp") or "")
+    by_count = prior[-count:]
+    tgt_day = _msg_day(target)
+    if tgt_day is None:
+        return by_count[-hard_max:]
+    cutoff = tgt_day - timedelta(days=days)
+    by_days = [m for m in prior if (_msg_day(m) or date.min) >= cutoff]
+    chosen = by_days if len(by_days) > len(by_count) else by_count
+    return chosen[-hard_max:]
 
 
 def _facts_history(messages, target):
+    """Same-chat context for fact extraction.
+
+    Stays same-chat on purpose: fact extraction runs on every message, so
+    doubling its raw context doubles the token bill on the hot path. Cross-chat
+    awareness is supplied instead by _cross_chat_facts() — already-extracted,
+    structured, and a fraction of the size.
+    """
     tgt_group = target.get("group")
     tgt_ts = target.get("timestamp") or ""
     same = [
         m for m in messages
         if m.get("group") == tgt_group and (m.get("timestamp") or "") < tgt_ts
     ]
-    same.sort(key=lambda m: m.get("timestamp") or "")
-    return same[-FACTS_HISTORY_WINDOW:]
+    return _window_by_count_or_days(
+        same, FACTS_HISTORY_WINDOW, FACTS_HISTORY_DAYS, FACTS_HISTORY_MAX, target,
+    )
+
+
+def _cross_chat_facts(data, target, now=None):
+    """Compact digest of what OTHER chats have already established.
+
+    The problem this solves: scheduling a single cleaning routinely spans both
+    threads — one cleaner is released in her chat while another is asked in
+    hers — and fact extraction could only ever see one side. It therefore
+    recorded "Daria confirmed Aug 3" with no idea Itzel was ever involved.
+
+    Feeding the other chat's raw messages in would be the obvious fix and the
+    wrong one: it doubles tokens on every message, and both history windows
+    were capped precisely because unbounded context hit the rate limit during
+    backfill. Facts that have ALREADY been extracted are structured, tiny, and
+    are exactly the thing needed to notice two cleaners claiming one date.
+    """
+    now = now or datetime.now()
+    tgt_group = target.get("group")
+    tgt_day = _msg_day(target) or now.date()
+    lo = (tgt_day - timedelta(days=CROSS_FACTS_BACK_DAYS)).isoformat()
+    hi = (tgt_day + timedelta(days=CROSS_FACTS_FWD_DAYS)).isoformat()
+
+    group_of = {}
+    for m in data.get("messages", []) or []:
+        if m.get("id"):
+            group_of[m["id"]] = m.get("group")
+    labels = data.get("group_labels", {}) or {}
+
+    # Keyed on (date, cleaner, kind) keeping the most recently stated — an old
+    # confirm that was later superseded must not outrank the newer one.
+    best = {}
+    for msg_id, rec in (data.get("message_facts", {}) or {}).items():
+        grp = group_of.get(msg_id)
+        if not grp or grp == tgt_group:
+            continue
+        stated = rec.get("extracted_at") or ""
+        for f in rec.get("facts", []) or []:
+            tgt_date = f.get("target_date")
+            kind = f.get("kind")
+            cleaner = f.get("cleaner")
+            if not tgt_date or not kind or kind == "unclear":
+                continue
+            if not (lo <= tgt_date <= hi):
+                continue
+            key = (tgt_date, cleaner, kind)
+            if key not in best or stated > best[key][0]:
+                best[key] = (stated, {
+                    "date": tgt_date,
+                    "cleaner": cleaner,
+                    "kind": kind,
+                    "time": f.get("target_time"),
+                    "chat": labels.get(grp) or grp,
+                    "stated": stated[:10],
+                })
+
+    rows = sorted((v[1] for v in best.values()), key=lambda r: (r["date"], r["cleaner"] or ""))
+    return rows[:CROSS_FACTS_MAX_LINES]
 
 
 def _parse_history(messages, target):
     tgt_ts = target.get("timestamp") or ""
     prior = [m for m in messages if (m.get("timestamp") or "") < tgt_ts]
-    prior.sort(key=lambda m: m.get("timestamp") or "")
-    return prior[-PARSE_HISTORY_WINDOW:]
+    return _window_by_count_or_days(
+        prior, PARSE_HISTORY_WINDOW, PARSE_HISTORY_DAYS, PARSE_HISTORY_MAX, target,
+    )
 
 
 def process_message(msg_id):
@@ -860,12 +977,14 @@ def process_message(msg_id):
         known = cleaner_names()
         sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
         labels = dict(data.get("group_labels", {}))
+        cross_facts = _cross_chat_facts(data, msg)
 
     result, error = parse_whatsapp_message(msg, _parse_history(all_messages, msg), bookings, known, sender_cleaner, labels)
     # Facts extraction runs independently of parse routing. An empty facts list
     # is a valid result (chitchat) — only facts_err means retry via reprocess.
     facts_list, facts_err = facts_mod.extract_facts(
         ANTHROPIC_API_KEY, msg, _facts_history(all_messages, msg), known, labels,
+        cross_facts=cross_facts,
     )
 
     # Out-of-credit (HTTP 400 "balance too low") is not a per-message failure —
@@ -2626,14 +2745,26 @@ def admin_reprocess_facts():
         if rec is None or rec.get("prompt_version") != facts_mod.FACTS_PROMPT_VERSION:
             stale.append(m)
 
+    # Oldest first, so the cross-chat digest each message sees is built from
+    # facts that were established BEFORE it — the same order live processing
+    # sees. Stored order is append order, which backfill inserts can violate.
+    stale.sort(key=lambda m: m.get("timestamp") or "")
+
     extracted = 0
     errors = 0
     for m in stale:
         history = _facts_history(
             [h for h in all_messages if h.get("id") != m.get("id")], m,
         )
+        # Re-read inside the loop: each message's facts are saved as we go, so
+        # a later message in this pass can see what an earlier one established
+        # in the other chat. Reprocessing oldest-first therefore converges the
+        # same way live processing does, instead of every message seeing the
+        # pre-reprocess snapshot.
+        with DATA_LOCK:
+            cross_facts = _cross_chat_facts(load_data(), m)
         facts_list, err = facts_mod.extract_facts(
-            ANTHROPIC_API_KEY, m, history, known, labels,
+            ANTHROPIC_API_KEY, m, history, known, labels, cross_facts=cross_facts,
         )
         if err or facts_list is None:
             errors += 1
@@ -3839,9 +3970,10 @@ def _ingest_facts_only(msg_id):
         )
         known = cleaner_names()
         labels = dict(data.get("group_labels", {}))
+        cross_facts = _cross_chat_facts(data, msg)
 
     facts_list, facts_err = facts_mod.extract_facts(
-        ANTHROPIC_API_KEY, msg, history, known, labels,
+        ANTHROPIC_API_KEY, msg, history, known, labels, cross_facts=cross_facts,
     )
 
     with DATA_LOCK:

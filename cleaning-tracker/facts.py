@@ -9,8 +9,14 @@ becomes 30 schedule_assertion facts.
 
 Extraction is versioned. Bump FACTS_PROMPT_VERSION when the prompt or schema
 changes, then POST /admin/reprocess-facts to bring older messages forward.
-The reconciler reads only current-version facts, so half-reprocessed state
-is safe.
+
+The version gates ONLY which messages `/admin/reprocess-facts` considers
+stale. `reconcile.run()` reads every stored fact regardless of version — so a
+half-reprocessed corpus is safe in the sense that nothing goes blind, but old
+and new facts do coexist and are weighted equally. (This paragraph previously
+claimed the reconciler filtered by version. It does not, and never did; the
+claim mattered because it made a version bump look far more dangerous than it
+is — corrected 2026-08-02.)
 """
 
 import json
@@ -21,7 +27,7 @@ from datetime import datetime
 import requests
 
 FACTS_MODEL = "claude-sonnet-5"
-FACTS_PROMPT_VERSION = "facts-v2"
+FACTS_PROMPT_VERSION = "facts-v3"
 
 # Anthropic free/standard tiers rate-limit by tokens-per-minute and
 # requests-per-minute. For bulk backfill we pace conservatively and retry
@@ -55,7 +61,22 @@ def _sender_role(sender_label, known_cleaners):
     return "host"
 
 
-def _build_prompt(msg, history, known_cleaners, labels):
+def _format_cross_facts(rows):
+    """Render the other chats' established facts as a compact block."""
+    if not rows:
+        return "(no established facts from other chats for nearby dates)"
+    out = []
+    for r in rows:
+        t = f" at {r['time']}" if r.get("time") else ""
+        who = r.get("cleaner") or "unspecified cleaner"
+        out.append(
+            f"- {r['date']}: {who} — {r['kind']}{t} "
+            f"(from the \"{r['chat']}\" chat, stated {r.get('stated') or 'unknown'})"
+        )
+    return "\n".join(out)
+
+
+def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None):
     history_lines = []
     for h in history:
         grp = labels.get(h.get("group")) or h.get("group") or "unknown-group"
@@ -65,6 +86,7 @@ def _build_prompt(msg, history, known_cleaners, labels):
             f"[{h.get('timestamp','')}] ({grp}) {sender_label} <{role}>: {h.get('text','')}"
         )
     history_text = "\n".join(history_lines) if history_lines else "(no prior messages)"
+    cross_text = _format_cross_facts(cross_facts)
     this_group = labels.get(msg.get("group")) or msg.get("group") or "unknown-group"
     target_sender = msg.get("sender_name_raw") or msg.get("sender", "unknown")
     target_role = _sender_role(target_sender, known_cleaners)
@@ -75,9 +97,14 @@ Roles:
 - HOST: the property owner / schedule maker. Asserts "I would like X on date D" or posts a planned schedule.
 - CLEANER: one of the known cleaners {json.dumps(known_cleaners)}. Replies to the host with confirms / declines / counter-proposals.
 
-Prior messages across all groups (oldest first). Each line is tagged `<cleaner:Name>` or `<host>` — use this to decide fact kind. Use the full archive to resolve "yes", "that date", "I can do it", and to recognize when a message quotes or re-posts an earlier list:
+Prior messages from THIS chat only (oldest first). Each line is tagged `<cleaner:Name>` or `<host>` — use this to decide fact kind. Use it to resolve "yes", "that date", "I can do it", "Monday", and to recognize when a message quotes or re-posts an earlier list:
 ---
 {history_text}
+---
+
+Already-established facts from the OTHER chats, for dates near this message. These come from messages you cannot see — each cleaner has her own chat, and a single cleaning is often arranged across both (one released here, another asked there). Use them to resolve references and to notice when this message contradicts an existing commitment. Do NOT re-emit them; only emit facts that THIS message asserts:
+---
+{cross_text}
 ---
 
 Target message (from {target_sender} <{target_role}> in group "{this_group}" at {msg.get('timestamp','')}):
@@ -111,8 +138,13 @@ Return ONLY valid JSON, no prose, no code fences:
 {{"facts":[{{"kind":"...","target_date":"YYYY-MM-DD or null","target_time":"HH:MM or null","cleaner":"canonical name or null","confidence":0.0,"tentative":false,"evidence":"short quote from the message"}}]}}"""
 
 
-def extract_facts(api_key, msg, history, known_cleaners, labels):
-    """Call Haiku to extract scheduling facts from one message.
+def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=None):
+    """Call the model to extract scheduling facts from one message.
+
+    `history` is same-chat only. `cross_facts` is a compact digest of what the
+    OTHER chats have already established for nearby dates — see the caller's
+    _cross_chat_facts() for why the other chat arrives as extracted facts
+    rather than as raw messages.
 
     Returns (facts_list, error). facts_list may be empty (chitchat); that's a
     successful extraction. Only `error is not None` indicates the caller
@@ -121,7 +153,7 @@ def extract_facts(api_key, msg, history, known_cleaners, labels):
     if not api_key:
         return None, "No Anthropic API key configured."
 
-    prompt = _build_prompt(msg, history, known_cleaners, labels)
+    prompt = _build_prompt(msg, history, known_cleaners, labels, cross_facts)
     last_err = None
     delay = _RETRY_INITIAL_DELAY
     for attempt in range(_MAX_RETRIES):
