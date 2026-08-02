@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: active
-updated: 2026-08-02T12:15:00-07:00
-progress: 139/146
+updated: 2026-08-02T12:45:00-07:00
+progress: 149/156
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -291,6 +291,16 @@ never silently loses a same-day schedule change again.
 - [x] ISC-143: Anti: both windows keep a hard cap, because unbounded history is what hit the org rate limit during bulk backfill.
 - [x] ISC-144: The facts prompt describes the context it actually receives; it previously claimed "prior messages across all groups" while the code filtered to one.
 - [x] ISC-145: Reprocessing runs oldest-first and re-reads the facts layer per message, so it converges the way live processing does rather than every message seeing the pre-reprocess snapshot.
+- [x] ISC-146: Speaker role is resolved from the stored cleaner/host JID map, not by testing whether a cleaner's name appears in the sender label.
+- [x] ISC-147: Anti: substring matching survives as the fallback for pasted senders present in neither list.
+- [x] ISC-148: A cleaner can be renamed across every join key at once (bookings, commitments, JID map, group labels, facts); a partial rename is treated as the failure mode.
+- [x] ISC-149: Anti: historical free-text notes are NOT rewritten by a rename — they record what was said, not current truth.
+- [x] ISC-150: Pending review items whose subject date is more than `review_expiry_days` in the past are retired nightly.
+- [x] ISC-151: Staleness is judged on what an item is ABOUT (the matched booking's cleaning date), falling back to the send date only when no booking matched.
+- [x] ISC-152: Anti: expiry marks `expired` and never deletes — facts from retired messages stay readable to the reconciler, so attention is withdrawn but evidence is not.
+- [x] ISC-153: Every model prompt in the pipeline opens with a dating header stating TODAY and, when different, the message's SEND date.
+- [x] ISC-154: Anti: relative terms resolve against the SEND date, so reprocessing a January message in August cannot re-date it.
+- [x] ISC-155: The nightly job reads the clock exactly once and dates every downstream stage from that value.
 
 ## Test Strategy
 
@@ -416,6 +426,16 @@ never silently loses a same-day schedule change again.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog
+
+- 2026-08-02 | conjectured: the review queue was working, since every item in it had been correctly parsed and correctly routed to a human.
+  refuted by: sixteen items pending, fourteen of them about dates already past — one from June. Each was individually correct and the set was useless. Conflicts had self-suppressed after five stale days for months; the queue had no equivalent, because nothing ever asked what a queue with no exit does over time.
+  learned: **a work queue needs an expiry rule as much as it needs an entry rule, and the absence of one is invisible at every single insertion.** Every item looked reasonable on the day it arrived; only the accumulation was wrong, and accumulation is not visible from any one decision. Second, subtler half: staleness had to be judged on what an item is ABOUT, not when it arrived — aging on the send date would retire a June message confirming an August cleaning, which is the normal shape of this business. Third: retire, never delete. The reconciler reads facts from expired messages, so removing the row would have removed evidence in order to remove a demand for attention.
+  criterion now: ISC-150..152 shipped in 1.30.0; fourteen items retired on the first run, two genuinely-recent ones left standing.
+
+- 2026-08-02 | conjectured: role attribution in the facts prompt was sound, since Itzel's confirmations were being classified correctly at scale (34 of them).
+  refuted by: ingesting Darya's chat and reading the output — every message came back as `schedule_assertion`, a kind the prompt reserves for the host, including a textbook cleaner confirm. The role was computed by asking whether a cleaner's NAME appeared in the sender label, and no sender shape the system stores contains a name: live senders are JIDs, pasted ones are phone numbers. Both cleaners were labelled <host> in their own chats. The correct mapping sat unused in `cleaner_jids` the whole time.
+  learned: **a heuristic that the model can paper over is the hardest kind to find** — Itzel's 34 correct confirms were the model overriding a wrong hint on unambiguous wording, which is exactly the wording that needs no hint. The bug was therefore invisible precisely where the system was easy, and active precisely where it was hard. Generalisation worth keeping: when authoritative data exists for a question, a heuristic answering the same question is not a fallback, it is a second source of truth that will diverge. Check for the authoritative store before writing the guess.
+  criterion now: ISC-146/147 shipped in 1.29.0.
 
 - 2026-08-02 | conjectured: the facts layer saw enough context to resolve ordinary conversational shorthand, since its prompt instructs it to resolve "yes", "that date" and weekday names against prior messages.
   refuted by: reading what the prompt is actually handed. It declares "Prior messages across all groups" and `_facts_history` filters to the target's own group — so the model was told its view spanned every chat while it spanned one. The consequence is not a parsing bug but a *reasoning* bug: asked whether a date is contested, it answers from a filtered corpus it believes is complete, and confidently finds no conflict because the other cleaner's commitment is in a thread it cannot see. Two chats, one shared schedule, and each cleaning routinely negotiated across both.
