@@ -835,7 +835,7 @@ PARSE_HISTORY_MAX = 150
 # the Aug 3 commitment was made on Mar 30).
 CROSS_FACTS_BACK_DAYS = 7
 CROSS_FACTS_FWD_DAYS = 150
-CROSS_FACTS_MAX_LINES = 40
+CROSS_FACTS_MAX_LINES = 80
 
 
 def _msg_day(m):
@@ -949,8 +949,18 @@ def _cross_chat_facts(data, target, now=None):
                     "stated": stated[:10],
                 })
 
-    rows = sorted((v[1] for v in best.values()), key=lambda r: (r["date"], r["cleaner"] or ""))
-    return rows[:CROSS_FACTS_MAX_LINES]
+    # Truncate by PROXIMITY to the message's own date, then present
+    # chronologically. Sorting by date and slicing would have dropped the
+    # nearest commitments first — the live corpus produced 41 rows against a
+    # cap of 40 on the day this shipped, so the boundary is real, not
+    # theoretical, and getting it backwards would have silently discarded
+    # exactly the dates being negotiated.
+    rows = [v[1] for v in best.values()]
+    rows.sort(key=lambda r: (abs((date.fromisoformat(r["date"]) - tgt_day).days),
+                             r["date"], r["cleaner"] or ""))
+    kept = rows[:CROSS_FACTS_MAX_LINES]
+    kept.sort(key=lambda r: (r["date"], r["cleaner"] or ""))
+    return kept
 
 
 def _parse_history(messages, target):

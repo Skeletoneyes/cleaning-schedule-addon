@@ -43,7 +43,7 @@ NS = {
     "date": date, "datetime": datetime, "timedelta": timedelta,
     "FACTS_HISTORY_WINDOW": 30, "FACTS_HISTORY_DAYS": 45, "FACTS_HISTORY_MAX": 120,
     "PARSE_HISTORY_WINDOW": 50, "PARSE_HISTORY_DAYS": 30, "PARSE_HISTORY_MAX": 150,
-    "CROSS_FACTS_BACK_DAYS": 7, "CROSS_FACTS_FWD_DAYS": 150, "CROSS_FACTS_MAX_LINES": 40,
+    "CROSS_FACTS_BACK_DAYS": 7, "CROSS_FACTS_FWD_DAYS": 150, "CROSS_FACTS_MAX_LINES": 80,
 }
 _extract(["_msg_day", "_window_by_count_or_days", "_facts_history",
           "_cross_chat_facts", "_parse_history"], NS)
@@ -214,7 +214,7 @@ class CrossChatFactsTests(unittest.TestCase):
                            "target_time": "10:00", "cleaner": f"C{i}", "confidence": 0.9}],
             }
         rows = cross_chat_facts(data, m("2026-08-02", group=DARIA))
-        self.assertLessEqual(len(rows), 40)
+        self.assertLessEqual(len(rows), 80)
 
 
 class PromptTests(unittest.TestCase):
