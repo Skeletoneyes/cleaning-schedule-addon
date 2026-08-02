@@ -80,6 +80,12 @@ DIGEST_LAST_FILE = DATA_DIR / "digest_last.json"
 DIGEST_ENABLED = bool(OPTIONS.get("digest_enabled", False))
 DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 
+# How near a dated finding must be before it repeats in the nightly digest.
+# Three weeks is roughly the window in which a cleaner can still be found and
+# a calendar entry still matters; beyond it, repeating is noise. See the
+# comment at the `persisting` filter for why this exists.
+REPEAT_HORIZON_DAYS = int(OPTIONS.get("repeat_horizon_days", 21))
+
 # Nightly digest push to the VPS Telegram bot. The Pi initiates (the VPS is
 # egress-locked and cannot pull). Payload is built by ALLOWLIST — finding ids,
 # dates, severities, cleaner first names and the generated `why` line only.
@@ -3207,10 +3213,21 @@ def _digest_compute_and_notify():
         # nightly message until it is fixed or explicitly dismissed. Suggestions
         # and informational findings deliberately do NOT repeat: making
         # everything recur trains the reader to ignore the whole message.
+        # …but only for things that are actually actionable soon. The first cut
+        # of this repeated every open needs-attention finding, which on the
+        # very first run meant fourteen unassigned bookings in Sep 2026 – Jul
+        # 2027 arriving nightly forever. That is how a digest trains its reader
+        # to skim past it, and a digest nobody reads fails exactly like the
+        # silence it replaced. A booking with no cleaner nine months out is
+        # true, unimportant today, and will start repeating on its own once it
+        # comes inside the horizon. Findings with no date (bridge down, blind
+        # window, watchdog broken) always repeat — they are about *now*.
+        horizon = (date.today() + timedelta(days=REPEAT_HORIZON_DAYS)).isoformat()
         persisting = [
             f for f in result["findings"]
             if f["id"] in (current_ids & baseline_ids)
             and f.get("severity") == "needs-attention"
+            and (not f.get("date") or f["date"] <= horizon)
         ]
         first_seen = dict(baseline.get("first_seen") or {})
         for f in result["findings"]:
