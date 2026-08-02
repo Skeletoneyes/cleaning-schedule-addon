@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: complete
-updated: 2026-08-01T12:30:00-07:00
-progress: 115/122
+phase: active
+updated: 2026-08-02T11:30:00-07:00
+progress: 131/138
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -267,6 +267,22 @@ never silently loses a same-day schedule change again.
 - [x] ISC-113: Anti: an unconfigured or failing phone-notify path must not break the notification it was meant to escalate.
 - [x] ISC-115: The add-on's own log lines are readable in real time — `PYTHONUNBUFFERED=1`, without which every fail-loudly `print()` sat in a block buffer until it filled.
 - [x] ISC-114: Antecedent: a real push to the configured phone service is observed arriving, not merely accepted by the API.
+- [x] ISC-122: Bridge liveness is determined from the add-on's **container state** via Supervisor on an hourly timer, never inferred from message traffic.
+- [x] ISC-123: A bridge that is not running is restarted automatically, without waiting for a human.
+- [x] ISC-124: Anti: a watchdog that cannot perform its check (no token, no permission, Supervisor unreachable) emits a finding rather than silently doing nothing.
+- [x] ISC-125: Anti: a transient state (`startup`) does not trigger a restart.
+- [x] ISC-126: Every outage records a **blind window** naming the period no messages were received; recovery is silent, loss is not.
+- [x] ISC-127: The blind-window finding has a stable id across nights, so it can be dismissed rather than reappearing as a new finding forever.
+- [x] ISC-128: Unresolved needs-attention findings repeat in every nightly digest until fixed or dismissed, carrying an age marker.
+- [x] ISC-129: Anti: repetition is bounded by a 21-day horizon for dated findings, so far-future items cannot turn the digest into noise. Dateless findings (bridge down, blind window) always repeat.
+- [x] ISC-130: The digest applies dismissals — previously only the web routes did, so a dismissed finding rode the nightly Telegram message forever.
+- [x] ISC-131: Every booking change applied from WhatsApp is recorded and reported in the nightly digest, so what the system did arrives without anyone opening the app.
+- [x] ISC-132: Anti: the change record carries derived fields only (date, cleaner, time, confirmed) — never WhatsApp text, which must not reach the VPS through an unexamined field.
+- [x] ISC-133: The applied-changes section bypasses the VPS summarizer and renders verbatim — a summarized audit trail is not an audit trail.
+- [x] ISC-134: The bridge reconnects single-flight, with teardown of the dead socket and exponential backoff; overlapping sockets are impossible.
+- [x] ISC-135: A bridge restart resumes from a persisted **delivery watermark** rather than discarding everything older than process start, bounded by `MAX_REPLAY_DAYS`.
+- [x] ISC-136: Supervisor's own watchdog is enabled on both add-ons, so a crashed container is restarted even if the tracker is the thing that died.
+- [x] ISC-137: Antecedent: the heal path is exercised by fault injection (`POST /internal/watchdog/check` after stopping the bridge), not asserted from code.
 
 ## Test Strategy
 
@@ -392,6 +408,16 @@ never silently loses a same-day schedule change again.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
 ## Changelog
+
+- 2026-08-02 | conjectured: the liveness cycle closed on 2026-08-01 covered the system's health — the VPS watches the Pi, the Pi watches the bot, and the remaining gap was a shared upstream (LAN, ISP, mains) deliberately left undefended.
+  refuted by: a five-day WhatsApp outage that every one of those watchers slept through. The bridge died 2026-07-28 15:00 and the tracker stayed *genuinely healthy* — iCal sync ok, calendar push ok, reconcile ok, nightly heartbeat delivered on time. The mutual-watch cycle was built around **the Pi dying**, and the Pi did not die; its *input* did. Meanwhile the two detectors that could have seen it are threshold-based on absent traffic (7 days whole-bridge, 14 per-channel) and would not have fired until Aug 4 and Aug 5 — after the Aug 3 cleaning they were supposed to protect. A cleaner reassignment agreed on Jul 30 never arrived, and tomorrow's calendar entry still names the wrong person at the wrong time.
+  learned: **a liveness cycle proves the nodes are alive, not that the system is doing its job.** Every watcher here answered "is the process running", and the answer was truthfully yes for the process being asked about. Nobody was watching the *edge* — the pipe between two healthy nodes. The generalisation that hurts: this ISA had already recorded "a finding is not delivered until it reaches the human", and the same gap existed one layer down — a message is not received until it reaches the store, and nothing measured that. Two further corollaries earned the same day: (a) **absence of traffic is a lagging, ambiguous signal** and cannot be made prompt by shortening thresholds, because a quiet chat and a dead pipe are indistinguishable — so ask the container, not the message stream; (b) the bridge's own alarm *did* fire correctly at 15:00 that day and posted successfully to the Home Assistant panel, which this ISA's own Principles already say the host does not visit. That is the **second** time the exact same delivery mistake has appeared in this changelog, one entry apart.
+  criterion now: ISC-122..137 shipped across bridge 1.3.0 and tracker 1.27.0 → 1.27.3, fault-injection verified.
+
+- 2026-08-02 | conjectured: repeating every unresolved needs-attention finding nightly is what "keep telling me until it's fixed" requires.
+  refuted by: the first real run, which produced fourteen unassigned bookings dated Sep 2026 – Jul 2027 in a single Telegram message, and would have produced them again every night indefinitely.
+  learned: **"never go quiet" and "never become noise" are the same requirement, not opposing ones** — a digest that repeats everything gets skimmed, and a skimmed digest fails identically to the silence it replaced. The fix is a relevance horizon, not a volume cap: dated findings repeat only inside 21 days and resume on their own as the date approaches, while findings about *now* (bridge down, blind window) always repeat. Worth recording how this was caught — by deploying and reading the message that actually arrived, not by reasoning about the code. The rule that keeps earning its place: **read the artifact the human receives.**
+  criterion now: ISC-128/129 revised and shipped in 1.27.3.
 
 - 2026-08-01 | conjectured: the liveness chain terminated at a single unmonitored process (the VPS bot), so closing it required something outside the system — a third-party uptime pinger or a dead-man service.
   refuted by: that framing assumes a CHAIN. The Pi was already independently watched by the VPS's 25h dead-man, so having the Pi also watch the bot makes it a CYCLE, and a cycle has no unmonitored terminus. Better still, the dead-bot detector already existed — `_push_digest_to_vps` has always posted "Telegram alerts will not fire until this is fixed" — it was just delivered to the Home Assistant notification panel, the one surface this ISA's own Principles say the host does not visit. So the fix was a delivery change, not a new mechanism, and it needed no third party.
