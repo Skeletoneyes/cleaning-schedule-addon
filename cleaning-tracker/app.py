@@ -86,6 +86,11 @@ DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 # comment at the `persisting` filter for why this exists.
 REPEAT_HORIZON_DAYS = int(OPTIONS.get("repeat_horizon_days", 21))
 
+# How far past a review item's subject date it stays in the queue awaiting a
+# human decision. Conflicts already self-suppress after RECONCILER STALE_DAYS
+# (5); the review queue had no equivalent and simply accumulated.
+REVIEW_EXPIRY_DAYS = int(OPTIONS.get("review_expiry_days", 7))
+
 # Nightly digest push to the VPS Telegram bot. The Pi initiates (the VPS is
 # egress-locked and cannot pull). Payload is built by ALLOWLIST — finding ids,
 # dates, severities, cleaner first names and the generated `why` line only.
@@ -573,6 +578,38 @@ def upcoming_booking_list(bookings):
     return out
 
 
+def _date_header(msg, today=None):
+    """The dating preamble every model prompt in this pipeline opens with.
+
+    Two dates, and keeping them distinct is the whole point. TODAY tells the
+    model what is past and what is upcoming — without it, "Monday" and a bare
+    "the 3rd" are anchored to nothing and the year has to be guessed. The
+    MESSAGE timestamp is what relative terms actually resolve against, and it
+    is NOT today whenever a pasted transcript is being ingested: a January
+    message reprocessed in August must still read "tomorrow" as January.
+    Stating only today would silently re-date the entire backfill.
+    """
+    today = today or date.today()
+    ts = (msg or {}).get("timestamp") or ""
+    sent_day = None
+    if len(ts) >= 10:
+        try:
+            sent_day = date.fromisoformat(ts[:10])
+        except ValueError:
+            sent_day = None
+    lines = [f"TODAY IS {today.isoformat()} ({today.strftime('%A')})."]
+    if sent_day and sent_day != today:
+        lines.append(
+            f"This message was SENT ON {sent_day.isoformat()} ({sent_day.strftime('%A')}) — "
+            f"it is being processed later than it was sent. Resolve every relative term "
+            f"(\"today\", \"tomorrow\", \"Monday\", \"the 3rd\") against the SEND date, not "
+            f"against today. Today is given only so you can tell which dates have already passed."
+        )
+    else:
+        lines.append("Resolve relative terms (\"tomorrow\", \"Monday\", \"the 3rd\") against today.")
+    return "\n".join(lines)
+
+
 def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleaner, labels):
     """Ask Haiku to interpret a single inbound WhatsApp message in context.
 
@@ -601,6 +638,8 @@ def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleane
     this_group = labels.get(msg.get("group")) or msg.get("group") or "unknown-group"
 
     prompt = f"""You interpret a single incoming WhatsApp message from a house-cleaning group chat.
+
+{_date_header(msg)}
 
 Known cleaners: {json.dumps(known_cleaners)}
 {sender_hint}
@@ -1016,7 +1055,7 @@ def process_message(msg_id):
     # is a valid result (chitchat) — only facts_err means retry via reprocess.
     facts_list, facts_err = facts_mod.extract_facts(
         ANTHROPIC_API_KEY, msg, _facts_history(all_messages, msg), known, labels,
-        cross_facts=cross_facts, roles=roles,
+        cross_facts=cross_facts, roles=roles, date_header=_date_header(msg),
     )
 
     # Out-of-credit (HTTP 400 "balance too low") is not a per-message failure —
@@ -2799,7 +2838,7 @@ def admin_reprocess_facts():
             roles = _sender_roles(_snap)
         facts_list, err = facts_mod.extract_facts(
             ANTHROPIC_API_KEY, m, history, known, labels,
-            cross_facts=cross_facts, roles=roles,
+            cross_facts=cross_facts, roles=roles, date_header=_date_header(m),
         )
         if err or facts_list is None:
             errors += 1
@@ -3004,6 +3043,61 @@ def _watchdog_scheduler():
             # indistinguishable from one reporting all-clear.
             print(f"[watchdog] loop error (continuing): {e}")
         time.sleep(interval)
+
+
+def _review_subject_date(msg, bookings):
+    """The date a pending review item is ABOUT, as an ISO string.
+
+    Prefers the cleaning date of the booking the parser matched, because that
+    is what "refers to a past date" means for a scheduling decision — a
+    message sent in June about an August booking is not stale. Falls back to
+    the message's own date for items that resolved to no booking ("Be there in
+    5"), where the send date is the only thing it can be about.
+    """
+    uid = (msg.get("haiku_result") or {}).get("booking_uid")
+    b = (bookings or {}).get(uid) if uid else None
+    if b:
+        d = cleaning_date_for(b) or b.get("end")
+        if d:
+            return str(d)[:10]
+    ts = msg.get("timestamp") or ""
+    return ts[:10] if len(ts) >= 10 else None
+
+
+def expire_stale_reviews(today=None, days=REVIEW_EXPIRY_DAYS):
+    """Retire pending review items whose subject date is well in the past.
+
+    The review queue never aged anything out, so it accumulated: 16 items
+    pending on 2026-08-02, 14 of them about dates already gone. A queue that
+    only grows stops being a queue and becomes a wall, and the items that
+    actually need a decision are the ones lost in it.
+
+    Marks `review_state: "expired"` rather than deleting. The message, its
+    parse result and its extracted facts all stay — the reconciler still reads
+    facts from expired messages, so retiring an item removes a demand for
+    attention without removing evidence.
+    """
+    today = today or date.today()
+    cutoff = (today - timedelta(days=days)).isoformat()
+    expired = []
+    with DATA_LOCK:
+        data = load_data()
+        bookings = data.get("bookings") or {}
+        for m in data.get("messages", []) or []:
+            if m.get("review_state") != "pending":
+                continue
+            subj = _review_subject_date(m, bookings)
+            if subj and subj < cutoff:
+                m["review_state"] = "expired"
+                m["expired_at"] = today.isoformat()
+                m["expired_reason"] = f"subject date {subj} is older than {days} days"
+                expired.append({"id": m.get("id"), "subject_date": subj})
+        if expired:
+            save_data(data)
+    if expired:
+        print(f"[review] expired {len(expired)} stale review item(s) older than {cutoff}")
+    return {"today": today.isoformat(), "cutoff": cutoff, "expired": len(expired),
+            "items": expired}
 
 
 def _run_full_reconcile():
@@ -3305,7 +3399,22 @@ def _digest_compute_and_notify():
 
     Returns a dict with new/resolved/total/notified/message. Safe to call from
     both the HTTP route and the background scheduler.
+
+    Opens by establishing TODAY, once, and everything downstream is dated
+    against that single value — the queue expiry, the reconciler's staleness
+    cutoff, the repeat horizon, and the date header handed to every model
+    prompt. Reading the clock separately in each stage is how a job that
+    straddles midnight ends up reasoning about two different days.
     """
+    today = date.today()
+    try:
+        expiry = expire_stale_reviews(today=today)
+        if expiry["expired"]:
+            print(f"[digest] retired {expiry['expired']} stale review item(s)")
+    except Exception as e:
+        # Housekeeping must never take the digest down with it.
+        print(f"[digest] review expiry failed (non-fatal): {e}")
+
     try:
         result = _run_full_reconcile()
     except Exception as e:
@@ -3353,7 +3462,7 @@ def _digest_compute_and_notify():
     # against, so nothing is "still open" yet, but the persisted first_seen map
     # must still be written or every finding looks brand new again tomorrow.
     repeated = []
-    today_iso = date.today().isoformat()
+    today_iso = today.isoformat()
     first_seen = {f["id"]: today_iso for f in result["findings"]}
 
     if no_baseline:
@@ -3388,7 +3497,7 @@ def _digest_compute_and_notify():
         # true, unimportant today, and will start repeating on its own once it
         # comes inside the horizon. Findings with no date (bridge down, blind
         # window, watchdog broken) always repeat — they are about *now*.
-        horizon = (date.today() + timedelta(days=REPEAT_HORIZON_DAYS)).isoformat()
+        horizon = (today + timedelta(days=REPEAT_HORIZON_DAYS)).isoformat()
         persisting = [
             f for f in result["findings"]
             if f["id"] in (current_ids & baseline_ids)
@@ -3406,7 +3515,7 @@ def _digest_compute_and_notify():
         for f in persisting:
             f = dict(f)
             try:
-                days = (date.today() - date.fromisoformat(first_seen[f["id"]])).days
+                days = (today - date.fromisoformat(first_seen[f["id"]])).days
             except (KeyError, ValueError):
                 days = None
             if days:
@@ -3458,7 +3567,7 @@ def _digest_compute_and_notify():
         )
         message = "\n".join(lines) if lines else "No new findings."
 
-    changes = _change_findings(date.today().isoformat())
+    changes = _change_findings(today.isoformat())
     if changes:
         message = message + "\n" + "\n".join(f"• [changed] {c['why']}" for c in changes[:10])
         if len(changes) > 10:
@@ -3892,6 +4001,22 @@ def _rename_cleaner_in_data(data, old, new):
     return counts
 
 
+@app.route("/admin/expire-reviews", methods=["POST"])
+def admin_expire_reviews():
+    """Retire stale pending review items now. `?days=N` overrides the default.
+
+    The nightly digest calls the same function; this exists so the backlog can
+    be cleared without waiting for 08:00, and so the rule can be exercised
+    against a chosen horizon before trusting it on a schedule.
+    """
+    _require_local_or_secret()
+    try:
+        days = int(request.args.get("days", REVIEW_EXPIRY_DAYS))
+    except (TypeError, ValueError):
+        return jsonify({"error": "days must be an integer"}), 400
+    return jsonify(expire_stale_reviews(days=days))
+
+
 @app.route("/admin/rename-cleaner", methods=["POST"])
 def admin_rename_cleaner():
     """Rename a cleaner everywhere at once. Body: {"old": "...", "new": "..."}
@@ -4091,7 +4216,7 @@ def _ingest_facts_only(msg_id):
 
     facts_list, facts_err = facts_mod.extract_facts(
         ANTHROPIC_API_KEY, msg, history, known, labels,
-        cross_facts=cross_facts, roles=roles,
+        cross_facts=cross_facts, roles=roles, date_header=_date_header(msg),
     )
 
     with DATA_LOCK:

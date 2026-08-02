@@ -93,7 +93,7 @@ def _format_cross_facts(rows):
     return "\n".join(out)
 
 
-def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None, roles=None):
+def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None, roles=None, date_header=""):
     history_lines = []
     for h in history:
         grp = labels.get(h.get("group")) or h.get("group") or "unknown-group"
@@ -109,6 +109,8 @@ def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None, roles=
     target_role = _sender_role(target_sender, known_cleaners, msg.get("sender"), roles)
 
     return f"""You extract structured scheduling facts from a single WhatsApp message in a house-cleaning group chat.
+
+{date_header}
 
 Roles:
 - HOST: the property owner / schedule maker. Asserts "I would like X on date D" or posts a planned schedule.
@@ -155,7 +157,7 @@ Return ONLY valid JSON, no prose, no code fences:
 {{"facts":[{{"kind":"...","target_date":"YYYY-MM-DD or null","target_time":"HH:MM or null","cleaner":"canonical name or null","confidence":0.0,"tentative":false,"evidence":"short quote from the message"}}]}}"""
 
 
-def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=None, roles=None):
+def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=None, roles=None, date_header=""):
     """Call the model to extract scheduling facts from one message.
 
     `history` is same-chat only. `cross_facts` is a compact digest of what the
@@ -170,7 +172,7 @@ def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=Non
     if not api_key:
         return None, "No Anthropic API key configured."
 
-    prompt = _build_prompt(msg, history, known_cleaners, labels, cross_facts, roles)
+    prompt = _build_prompt(msg, history, known_cleaners, labels, cross_facts, roles, date_header)
     last_err = None
     delay = _RETRY_INITIAL_DELAY
     for attempt in range(_MAX_RETRIES):
