@@ -3843,8 +3843,89 @@ def digest_run():
     return jsonify(r)
 
 
+def _rename_cleaner_in_data(data, old, new):
+    """Rewrite every stored occurrence of a cleaner's name. Caller holds lock.
+
+    A cleaner's name is a join key in five separate places, and a partial
+    rename is worse than none: the detectors compare `booking.cleaner` against
+    `fact.cleaner` by string equality, so leaving one side as "Daria" while the
+    other becomes "Darya" manufactures a contested-cleaner conflict on every
+    booking she has ever touched. Returns per-field counts so a caller can see
+    that all five moved together.
+
+    Deliberately does NOT touch free-text `notes`: those are a human record of
+    what was said at the time, not a join key, and rewriting history to match a
+    later correction is how a record stops being evidence.
+    """
+    counts = {"bookings": 0, "commitments": 0, "cleaner_jids": 0,
+              "group_labels": 0, "facts": 0}
+
+    for b in (data.get("bookings") or {}).values():
+        if b.get("cleaner") == old:
+            b["cleaner"] = new
+            counts["bookings"] += 1
+        c = b.get("cleaner_commitment")
+        if isinstance(c, dict) and c.get("cleaner") == old:
+            c["cleaner"] = new
+            counts["commitments"] += 1
+
+    cj = data.get("cleaner_jids") or {}
+    if old in cj:
+        # Merge rather than overwrite: the new key may already exist if a
+        # rename was half-applied before.
+        cj[new] = list(dict.fromkeys((cj.get(new) or []) + (cj.pop(old) or [])))
+        data["cleaner_jids"] = cj
+        counts["cleaner_jids"] = 1
+
+    gl = data.get("group_labels") or {}
+    for jid, label in list(gl.items()):
+        if label == old:
+            gl[jid] = new
+            counts["group_labels"] += 1
+
+    for rec in (data.get("message_facts") or {}).values():
+        for f in rec.get("facts") or []:
+            if f.get("cleaner") == old:
+                f["cleaner"] = new
+                counts["facts"] += 1
+
+    return counts
+
+
+@app.route("/admin/rename-cleaner", methods=["POST"])
+def admin_rename_cleaner():
+    """Rename a cleaner everywhere at once. Body: {"old": "...", "new": "..."}
+
+    The add-on's `cleaners` option must be updated separately (it lives in
+    Supervisor config, not data.json) — the response says so rather than
+    letting a half-rename look complete.
+    """
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or request.form or {}
+    old = (payload.get("old") or "").strip()
+    new = (payload.get("new") or "").strip()
+    if not old or not new:
+        return jsonify({"error": "both 'old' and 'new' are required"}), 400
+    if old == new:
+        return jsonify({"error": "old and new are identical"}), 400
+
+    with DATA_LOCK:
+        data = load_data()
+        counts = _rename_cleaner_in_data(data, old, new)
+        save_data(data)
+
+    return jsonify({
+        "renamed": {"from": old, "to": new},
+        "updated": counts,
+        "reminder": ("Also update the add-on's `cleaners` option — it is "
+                     "Supervisor config, not data.json, and this endpoint "
+                     "cannot reach it."),
+        "cleaners_option_now": cleaner_names(),
+    })
+
+
 @app.route("/admin/remap-group", methods=["POST"])
-def admin_remap_group():
+def admin_remap_group_route():
     """Bulk-rewrite `group` on messages and update `group_labels`.
 
     Body: {"mapping": {"old_jid": "new_jid", ...},
