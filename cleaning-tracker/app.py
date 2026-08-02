@@ -896,6 +896,27 @@ def _facts_history(messages, target):
     )
 
 
+def _sender_roles(data):
+    """Exact {jid: "cleaner:Name" | "host"} map for fact extraction.
+
+    Built from `cleaner_jids` and `host_jids`, which the system has maintained
+    all along and which the facts prompt was not consulting — it guessed the
+    speaker's role by looking for a cleaner's name inside the sender label
+    instead. That guess fails for every sender shape actually stored (JIDs
+    live, phone numbers from pasted exports), so it silently mislabelled
+    cleaners as the host.
+    """
+    roles = {}
+    for jid in data.get("host_jids") or []:
+        if jid:
+            roles[jid] = "host"
+    for name, jids in (data.get("cleaner_jids") or {}).items():
+        for jid in jids or []:
+            if jid:
+                roles[jid] = f"cleaner:{name}"
+    return roles
+
+
 def _cross_chat_facts(data, target, now=None):
     """Compact digest of what OTHER chats have already established.
 
@@ -988,13 +1009,14 @@ def process_message(msg_id):
         sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
         labels = dict(data.get("group_labels", {}))
         cross_facts = _cross_chat_facts(data, msg)
+        roles = _sender_roles(data)
 
     result, error = parse_whatsapp_message(msg, _parse_history(all_messages, msg), bookings, known, sender_cleaner, labels)
     # Facts extraction runs independently of parse routing. An empty facts list
     # is a valid result (chitchat) — only facts_err means retry via reprocess.
     facts_list, facts_err = facts_mod.extract_facts(
         ANTHROPIC_API_KEY, msg, _facts_history(all_messages, msg), known, labels,
-        cross_facts=cross_facts,
+        cross_facts=cross_facts, roles=roles,
     )
 
     # Out-of-credit (HTTP 400 "balance too low") is not a per-message failure —
@@ -2772,9 +2794,12 @@ def admin_reprocess_facts():
         # same way live processing does, instead of every message seeing the
         # pre-reprocess snapshot.
         with DATA_LOCK:
-            cross_facts = _cross_chat_facts(load_data(), m)
+            _snap = load_data()
+            cross_facts = _cross_chat_facts(_snap, m)
+            roles = _sender_roles(_snap)
         facts_list, err = facts_mod.extract_facts(
-            ANTHROPIC_API_KEY, m, history, known, labels, cross_facts=cross_facts,
+            ANTHROPIC_API_KEY, m, history, known, labels,
+            cross_facts=cross_facts, roles=roles,
         )
         if err or facts_list is None:
             errors += 1
@@ -3981,9 +4006,11 @@ def _ingest_facts_only(msg_id):
         known = cleaner_names()
         labels = dict(data.get("group_labels", {}))
         cross_facts = _cross_chat_facts(data, msg)
+        roles = _sender_roles(data)
 
     facts_list, facts_err = facts_mod.extract_facts(
-        ANTHROPIC_API_KEY, msg, history, known, labels, cross_facts=cross_facts,
+        ANTHROPIC_API_KEY, msg, history, known, labels,
+        cross_facts=cross_facts, roles=roles,
     )
 
     with DATA_LOCK:

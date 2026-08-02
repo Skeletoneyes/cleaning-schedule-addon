@@ -48,6 +48,8 @@ NS = {
 _extract(["_msg_day", "_window_by_count_or_days", "_facts_history",
           "_cross_chat_facts", "_parse_history"], NS)
 
+NS2 = _extract(["_sender_roles"], dict(NS))
+
 msg_day = NS["_msg_day"]
 window = NS["_window_by_count_or_days"]
 facts_history = NS["_facts_history"]
@@ -247,6 +249,81 @@ class PromptTests(unittest.TestCase):
     def test_prompt_version_was_bumped(self):
         self.assertNotEqual(facts_mod.FACTS_PROMPT_VERSION, "facts-v2",
                             "prompt changed — version must move or reprocess is a no-op")
+
+
+
+
+class SenderRoleTests(unittest.TestCase):
+    """The role tag drives fact KIND: schedule_assertion is host-only, confirm
+    is cleaner-only. Mislabel the speaker and a cleaner's acceptance is filed
+    as a host assertion, which `contested_cleaner` never looks at."""
+
+    ROLES = {
+        "135712527638545@lid": "cleaner:Daria",
+        "192466460373222@lid": "cleaner:Itzel",
+        "16472343440@s.whatsapp.net": "host",
+    }
+
+    def test_jid_map_wins_over_the_substring_guess(self):
+        self.assertEqual(
+            facts_mod._sender_role("135712527638545@lid", ["Daria", "Itzel"],
+                                   "135712527638545@lid", self.ROLES),
+            "cleaner:Daria",
+        )
+
+    def test_the_daria_regression(self):
+        """Her exported sender name is a bare phone number, so the substring
+        test called her the host in her own chat."""
+        label, jid = "+380 97 550 6538", "135712527638545@lid"
+        self.assertEqual(
+            facts_mod._sender_role(label, ["Daria", "Itzel"], jid, None), "host",
+            "documents the old behaviour",
+        )
+        self.assertEqual(
+            facts_mod._sender_role(label, ["Daria", "Itzel"], jid, self.ROLES),
+            "cleaner:Daria",
+        )
+
+    def test_live_jids_also_failed_the_substring_test(self):
+        """Not just backfill — no live JID contains a cleaner's name either."""
+        self.assertEqual(
+            facts_mod._sender_role("192466460373222@lid", ["Itzel"], None, None), "host")
+        self.assertEqual(
+            facts_mod._sender_role("192466460373222@lid", ["Itzel"],
+                                   "192466460373222@lid", self.ROLES), "cleaner:Itzel")
+
+    def test_host_jid_resolves_to_host(self):
+        self.assertEqual(
+            facts_mod._sender_role("Josh Mohan", ["Daria"],
+                                   "16472343440@s.whatsapp.net", self.ROLES), "host")
+
+    def test_falls_back_to_substring_for_unknown_senders(self):
+        """Pasted transcripts whose sender is in neither list must still work."""
+        self.assertEqual(
+            facts_mod._sender_role("Itzel Cleaner", ["Itzel"], "backfill:itzel", self.ROLES),
+            "cleaner:Itzel")
+
+    def test_unknown_with_no_label_is_unknown_not_host(self):
+        self.assertEqual(facts_mod._sender_role("", ["Daria"], "nope@lid", self.ROLES), "unknown")
+
+
+class SenderRolesMapTests(unittest.TestCase):
+    def test_builds_from_stored_jid_data(self):
+        build = NS2["_sender_roles"]
+        roles = build({
+            "host_jids": ["16472343440@s.whatsapp.net"],
+            "cleaner_jids": {"Daria": ["135712527638545@lid"],
+                             "Itzel": ["backfill:itzel-cleaner", "192466460373222@lid"]},
+        })
+        self.assertEqual(roles["16472343440@s.whatsapp.net"], "host")
+        self.assertEqual(roles["135712527638545@lid"], "cleaner:Daria")
+        self.assertEqual(roles["192466460373222@lid"], "cleaner:Itzel")
+        self.assertEqual(roles["backfill:itzel-cleaner"], "cleaner:Itzel")
+
+    def test_missing_keys_are_not_an_error(self):
+        build = NS2["_sender_roles"]
+        for data in ({}, {"host_jids": None}, {"cleaner_jids": {"X": None}}):
+            self.assertIsInstance(build(data), dict)
 
 
 if __name__ == "__main__":

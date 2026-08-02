@@ -27,7 +27,7 @@ from datetime import datetime
 import requests
 
 FACTS_MODEL = "claude-sonnet-5"
-FACTS_PROMPT_VERSION = "facts-v3"
+FACTS_PROMPT_VERSION = "facts-v4"
 
 # Anthropic free/standard tiers rate-limit by tokens-per-minute and
 # requests-per-minute. For bulk backfill we pace conservatively and retry
@@ -46,12 +46,29 @@ VALID_KINDS = {
 }
 
 
-def _sender_role(sender_label, known_cleaners):
-    """Heuristic: is this sender one of the known cleaners, or the host?
+def _sender_role(sender_label, known_cleaners, sender_jid=None, roles=None):
+    """Who is speaking: a known cleaner, the host, or unknown?
 
-    JID-style senders are matched against lowercased cleaner names in the
-    label. For free-form names (paste ingest), match on substring.
+    Resolution order matters, and the old order was the bug. This used to be a
+    substring test alone — does a cleaner's name appear in the sender label —
+    which silently fails for every real sender the system actually stores.
+    Live senders are JIDs (`192466460373222@lid`); pasted exports use whatever
+    the phone had, which for a contact saved without a name is a bare phone
+    number (`+380 97 550 6538`). Neither contains "Daria", so Daria was tagged
+    <host> in her own chat, and the model — correctly following the prompt's
+    "schedule_assertion is HOST ONLY" rule — filed her acceptances as host
+    assertions rather than cleaner confirms. `contested_cleaner` only ever
+    fires on `confirm`, so her side of a contested date could not surface
+    through that detector at all.
+
+    `roles` is an exact {jid: "cleaner:Name" | "host"} map built from the
+    cleaner_jids / host_jids the system already maintains — authoritative data
+    that was sitting unused while a substring heuristic guessed at the same
+    question. Substring matching stays as the last resort, for pasted
+    transcripts whose sender never appears in either list.
     """
+    if roles and sender_jid and sender_jid in roles:
+        return roles[sender_jid]
     if not sender_label:
         return "unknown"
     s = sender_label.lower()
@@ -76,12 +93,12 @@ def _format_cross_facts(rows):
     return "\n".join(out)
 
 
-def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None):
+def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None, roles=None):
     history_lines = []
     for h in history:
         grp = labels.get(h.get("group")) or h.get("group") or "unknown-group"
         sender_label = h.get("sender_name_raw") or h.get("sender") or "unknown"
-        role = _sender_role(sender_label, known_cleaners)
+        role = _sender_role(sender_label, known_cleaners, h.get("sender"), roles)
         history_lines.append(
             f"[{h.get('timestamp','')}] ({grp}) {sender_label} <{role}>: {h.get('text','')}"
         )
@@ -89,7 +106,7 @@ def _build_prompt(msg, history, known_cleaners, labels, cross_facts=None):
     cross_text = _format_cross_facts(cross_facts)
     this_group = labels.get(msg.get("group")) or msg.get("group") or "unknown-group"
     target_sender = msg.get("sender_name_raw") or msg.get("sender", "unknown")
-    target_role = _sender_role(target_sender, known_cleaners)
+    target_role = _sender_role(target_sender, known_cleaners, msg.get("sender"), roles)
 
     return f"""You extract structured scheduling facts from a single WhatsApp message in a house-cleaning group chat.
 
@@ -138,7 +155,7 @@ Return ONLY valid JSON, no prose, no code fences:
 {{"facts":[{{"kind":"...","target_date":"YYYY-MM-DD or null","target_time":"HH:MM or null","cleaner":"canonical name or null","confidence":0.0,"tentative":false,"evidence":"short quote from the message"}}]}}"""
 
 
-def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=None):
+def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=None, roles=None):
     """Call the model to extract scheduling facts from one message.
 
     `history` is same-chat only. `cross_facts` is a compact digest of what the
@@ -153,7 +170,7 @@ def extract_facts(api_key, msg, history, known_cleaners, labels, cross_facts=Non
     if not api_key:
         return None, "No Anthropic API key configured."
 
-    prompt = _build_prompt(msg, history, known_cleaners, labels, cross_facts)
+    prompt = _build_prompt(msg, history, known_cleaners, labels, cross_facts, roles)
     last_err = None
     delay = _RETRY_INITIAL_DELAY
     for attempt in range(_MAX_RETRIES):
