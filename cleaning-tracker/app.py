@@ -22,6 +22,7 @@ from flask import Flask, render_template_string, request, redirect, jsonify, abo
 
 import bridge_watchdog as watchdog_mod
 import facts as facts_mod
+import notify_ack as notify_ack_mod
 import gcal as gcal_mod
 import reconcile as reconcile_mod
 
@@ -90,6 +91,12 @@ REPEAT_HORIZON_DAYS = int(OPTIONS.get("repeat_horizon_days", 21))
 # human decision. Conflicts already self-suppress after RECONCILER STALE_DAYS
 # (5); the review queue had no equivalent and simply accumulated.
 REVIEW_EXPIRY_DAYS = int(OPTIONS.get("review_expiry_days", 7))
+
+# Whether verbatim WhatsApp text may cross to the VPS Telegram bot. Off by
+# default — the payload allowlist has always excluded quotes, and a reporting
+# feature should not quietly dissolve a privacy boundary. Turn on to get the
+# quoted message in Telegram instead of only in the app.
+DIGEST_INCLUDE_QUOTES = bool(OPTIONS.get("digest_include_quotes", False))
 
 # Nightly digest push to the VPS Telegram bot. The Pi initiates (the VPS is
 # egress-locked and cannot pull). Payload is built by ALLOWLIST — finding ids,
@@ -3100,6 +3107,102 @@ def expire_stale_reviews(today=None, days=REVIEW_EXPIRY_DAYS):
             "items": expired}
 
 
+def _group_of_cleaner(data):
+    """{cleaner name: her group jid}, derived from which chat her JIDs post in."""
+    out = {}
+    jid_to_cleaner = {}
+    for name, jids in (data.get("cleaner_jids") or {}).items():
+        for j in jids or []:
+            jid_to_cleaner[j] = name
+    for m in data.get("messages", []) or []:
+        name = jid_to_cleaner.get(m.get("sender"))
+        if name and m.get("group") and name not in out:
+            out[name] = m.get("group")
+    # Fall back to the group label matching her name, for a cleaner who has
+    # never sent a message the bridge saw.
+    for jid, label in (data.get("group_labels") or {}).items():
+        out.setdefault(label, jid)
+    return out
+
+
+def auto_ack_notifications(today=None, apply=True, include_quotes=True):
+    """Clear notify items the host has already handled in WhatsApp.
+
+    Runs before the nightly reconcile so the digest reflects the world after
+    the acknowledgement, not a conflict that was resolved hours earlier.
+
+    Returns the list of acknowledgements with their justifying message, and the
+    list of near-misses with the reason each was NOT acted on — a rule that
+    only reports its successes is impossible to trust or debug.
+    """
+    today = today or date.today()
+    acked, skipped = [], []
+    with DATA_LOCK:
+        data = load_data()
+        facts = data.get("message_facts") or {}
+        messages_by_id = {m["id"]: m for m in data.get("messages", []) if m.get("id")}
+        groups = _group_of_cleaner(data)
+        changed = False
+
+        for uid, b in (data.get("bookings") or {}).items():
+            if not needs_notify(b):
+                continue
+            if b.get("status") == "cancelled":
+                # A cancellation still needs a human: "she was told it moved"
+                # and "she was told it is off entirely" are different messages,
+                # and guessing between them is exactly the risk not worth taking.
+                continue
+            ev = notify_ack_mod.find_ack_evidence(b, facts, messages_by_id, groups)
+            if ev["ok"]:
+                reason = notify_ack_mod.describe(b.get("end"), ev, include_quotes=True)
+                rec = {
+                    "booking_uid": uid, "date": b.get("end"),
+                    "cleaner": b.get("cleaner"),
+                    "was": (b.get("cleaner_commitment") or {}).get("cleaner"),
+                    "reason": reason,
+                    "evidence": ev["sides"],
+                }
+                acked.append(rec)
+                if apply:
+                    ack_notified(b, via="whatsapp-host")
+                    changed = True
+                    print(f"[auto-ack] {b.get('end')} cleared — {reason}")
+            elif ev["sides"] or ev["missing"]:
+                skipped.append({"booking_uid": uid, "date": b.get("end"),
+                                "missing": ev["missing"][:3]})
+
+        if changed:
+            save_data(data)
+
+    if acked:
+        _record_auto_acks(acked, today)
+    return {"today": today.isoformat(), "acknowledged": acked, "not_acknowledged": skipped}
+
+
+def _record_auto_acks(acked, today):
+    """Log every automatic acknowledgement into the same change log the nightly
+    'changes applied' section reads, so it is reported rather than merely done."""
+    try:
+        log = []
+        if CHANGE_LOG_FILE.exists():
+            log = json.loads(CHANGE_LOG_FILE.read_text())
+            if not isinstance(log, list):
+                log = []
+        for a in acked:
+            log.append({
+                "at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "booking_uid": a["booking_uid"],
+                "cleaning_date": a["date"],
+                "action": "auto-ack",
+                "source": "whatsapp-host",
+                "reason": a["reason"],
+                "changed": {"notify": {"from": "pending", "to": "cleared"}},
+            })
+        CHANGE_LOG_FILE.write_text(json.dumps(log[-CHANGE_LOG_MAX:], indent=2))
+    except (OSError, ValueError) as e:
+        print(f"[auto-ack] failed to record: {e}")
+
+
 def _run_full_reconcile():
     with DATA_LOCK:
         data = load_data()
@@ -3394,6 +3497,33 @@ def _post_ha_notification(title, message, notification_id="cleaning_digest", to_
         return False
 
 
+_QUOTE_RE = re.compile(r' — ".*?"(?=(;|$))')
+
+
+def _redact_quotes_for_vps(findings):
+    """Strip verbatim WhatsApp text before a finding crosses to the VPS.
+
+    The payload allowlist has always excluded `quote` and `evidence`; this
+    keeps that true for the `why` line as well, which is the one field that
+    crosses and is now capable of carrying a quotation. The timestamp, the
+    cleaner and the date all still cross — enough to know exactly which
+    message was used, without the message.
+
+    `digest_include_quotes` opts back in for a host who would rather have the
+    text in Telegram than keep it on the Pi. Off by default: the wall was a
+    deliberate decision and should not be dissolved by a formatting change.
+    """
+    if DIGEST_INCLUDE_QUOTES:
+        return list(findings)
+    out = []
+    for f in findings:
+        g = dict(f)
+        why = _QUOTE_RE.sub("", g.get("why") or "")
+        g["why"] = why + (" (open the app to read the message)" if why != g.get("why") else "")
+        out.append(g)
+    return out
+
+
 def _digest_compute_and_notify():
     """Run reconcile, diff against baseline, post HA notification, save baseline.
 
@@ -3407,6 +3537,17 @@ def _digest_compute_and_notify():
     straddles midnight ends up reasoning about two different days.
     """
     today = date.today()
+    try:
+        # Before anything else reads the world: close notify items the host has
+        # already handled in WhatsApp, so the digest reports the state after
+        # those acknowledgements rather than conflicts resolved hours ago.
+        acks = auto_ack_notifications(today=today)
+        for a in acks["acknowledged"]:
+            print(f"[digest] auto-cleared notify for {a['date']}: {a['reason']}")
+    except Exception as e:
+        print(f"[digest] auto-ack failed (non-fatal): {e}")
+        acks = {"acknowledged": [], "not_acknowledged": []}
+
     try:
         expiry = expire_stale_reviews(today=today)
         if expiry["expired"]:
@@ -3567,7 +3708,27 @@ def _digest_compute_and_notify():
         )
         message = "\n".join(lines) if lines else "No new findings."
 
+    # Automatic acknowledgements are reported as findings so they ride the same
+    # delivery path as everything else — an automatic change that only appears
+    # in a log file has not been reported, it has been filed.
+    ack_findings = []
+    for a in acks.get("acknowledged", []):
+        ack_findings.append({
+            "id": f"auto_ack:{a['booking_uid']}:{today.isoformat()}",
+            "detector": "notify_ack",
+            "kind": "notify_auto_cleared",
+            "severity": "informational",
+            "booking_uid": a["booking_uid"],
+            "cleaner": a.get("cleaner"),
+            "date": a.get("date"),
+            "why": (f"{a['date']} cleaning — I cleared the 'tell the cleaner' item "
+                    f"by myself, because you already did: {a['reason']}"),
+            "evidence": [],
+        })
+
     changes = _change_findings(today.isoformat())
+    if ack_findings:
+        message = message + "\n" + "\n".join(f"• [auto-cleared] {a['why']}" for a in ack_findings[:10])
     if changes:
         message = message + "\n" + "\n".join(f"• [changed] {c['why']}" for c in changes[:10])
         if len(changes) > 10:
@@ -3576,7 +3737,7 @@ def _digest_compute_and_notify():
     notified = _post_ha_notification(title, message)
     _push_digest_to_vps(
         new_findings, resolved_count, result["counts"],
-        extra_findings=repeated + changes,
+        extra_findings=repeated + changes + _redact_quotes_for_vps(ack_findings),
     )
 
     DIGEST_LAST_FILE.write_text(json.dumps({
@@ -3999,6 +4160,20 @@ def _rename_cleaner_in_data(data, old, new):
                 counts["facts"] += 1
 
     return counts
+
+
+@app.route("/admin/auto-ack", methods=["POST"])
+def admin_auto_ack():
+    """Run the notify auto-acknowledgement now. `?apply=false` to preview.
+
+    The preview mode matters more than the trigger: this is the one rule in the
+    system that can tell you a human has been informed when she has not, so
+    being able to see what it *would* clear, and why, before it clears anything
+    is part of the feature.
+    """
+    _require_local_or_secret()
+    apply = request.args.get("apply", "true").lower() != "false"
+    return jsonify(auto_ack_notifications(apply=apply))
 
 
 @app.route("/admin/expire-reviews", methods=["POST"])
