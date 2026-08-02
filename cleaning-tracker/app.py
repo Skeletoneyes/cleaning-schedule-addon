@@ -2971,6 +2971,32 @@ def reconcile_run():
     return jsonify(result)
 
 
+@app.route("/internal/watchdog/check", methods=["POST"])
+def watchdog_check():
+    """Run one bridge liveness pass now instead of waiting for the hourly tick.
+
+    Exists so the healing path can be *fault-injected* rather than reasoned
+    about: stop the bridge, call this, confirm it comes back and that a blind
+    window was recorded. Every serious bug in this add-on's history was found
+    by doing that and none were found by reading the code, so the ability to
+    trigger a check on demand is part of the feature, not a test hook.
+
+    `heal=false` observes without restarting, for checking state safely.
+    """
+    _require_local_or_secret()
+    heal = (request.args.get("heal", "true").lower() != "false")
+    state = _watchdog_check_now(heal=heal)
+    if state is None:
+        return jsonify({"error": "watchdog disabled or slug not configured"}), 400
+    return jsonify({
+        "state": state.get("last_state"),
+        "outage": state.get("outage"),
+        "blind_windows": state.get("blind_windows"),
+        "probe_error": state.get("probe_error"),
+        "findings": watchdog_mod.findings(state, date.today().isoformat()),
+    })
+
+
 @app.route("/reconcile/last", methods=["GET"])
 def reconcile_last():
     _require_local_or_secret()
