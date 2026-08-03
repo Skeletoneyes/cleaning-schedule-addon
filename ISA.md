@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-03T10:30:00-07:00
-progress: 156/168
+progress: 161/170
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -318,11 +318,13 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-160: Anti: a malformed stored timestamp must not crash `summary()` — it is skipped, not raised on.
 - [x] ISC-161: Anti: a persistent probe error logs one event on the transition into failure, not one per poll.
 - [x] ISC-162: The restart figure travels with an explicit statement that it **undercounts** — a crash Supervisor's own add-on watchdog repairs between two polls is unobservable to a poll, and a reassuring number that hides that is worse than no number.
-- [ ] ISC-163: The bridge liveness poll runs at 5-minute resolution, cutting worst-case detection lag from 60 minutes to 5.
+- [x] ISC-163: The bridge liveness poll runs at 5-minute resolution, cutting worst-case detection lag from 60 minutes to 5.
 - [ ] ISC-164: Operator actions on the live system (transcript ingest, finding dismissal) are recorded **as actions** in an append-only ops log, not left to be inferred from their side effects.
 - [ ] ISC-165: Anti: a failure to write the ops log must never fail the operation it was logging.
-- [ ] ISC-166: The watchdog summary and the ops log are readable off-host via `/internal/snapshot`, so a later session can read what was done to the system instead of reconstructing it from `source:` tags on data rows.
-- [ ] ISC-167: Anti: the reporting helpers must not be able to raise inside `/internal/snapshot` — it is the off-host reconciliation lifeline and must never 500.
+- [x] ISC-166: The watchdog summary and the ops log are readable off-host via `/internal/snapshot`, so a later session can read what was done to the system instead of reconstructing it from `source:` tags on data rows.
+- [x] ISC-167: Anti: the reporting helpers must not be able to raise inside `/internal/snapshot` — it is the off-host reconciliation lifeline and must never 500.
+- [x] ISC-168: Anti: the watchdog's load-mutate-save is one critical section — the scheduler thread and the on-demand `/internal/watchdog/check` route must not be able to overwrite each other's events.
+- [x] ISC-169: Anti: watchdog state is persisted atomically (temp + `os.replace`), so a restart mid-write cannot truncate the file and silently reset the whole incident history to defaults.
 
 ## Test Strategy
 
@@ -447,7 +449,24 @@ and `transcript ingest` returned zero hits across the whole file.*
 - ISC-114: `[DEFERRED-VERIFY]` — live fault injection — push URL pointed at a 404, digest run, log shows `[vps-push] FAILED: HTTP 404` then `[notify] phone escalation sent`. Config restored; `[vps-push] ok` confirmed. **CONFIRMED by Josh 2026-08-01: the Home Assistant app notifications arrived on his phone.** Worth recording how nearly this was mis-closed: he first replied "yes I got the telegram message", which would have read as confirmation — but the VPS journal shows zero Telegram sends after 17:57 UTC, while the phone test ran at ~19:06 and by design sends nothing through Telegram (the whole point was that the VPS path was broken). The message he had was the earlier Google Calendar alarm on a different channel. Two alarms, two channels, one ambiguous word; taking it at face value would have closed the criterion on the wrong evidence.
 - ISC-115: live — `ha addons logs` now shows `[gcal]`, `[vps-push]` and `[notify]` lines in real time; before `PYTHONUNBUFFERED=1` only werkzeug access lines reached journald.
 
+- 2026-08-03 10:35: ⚠️ **NEW DEPLOY GOTCHA — a Supervisor options POST REPLACES the whole options dict; it does not merge.** Sending `{"options":{"bridge_watchdog_interval_min":5}}` returned `app_configuration_invalid_error — Missing option 'digest_enabled' in root`. It failed **closed**, so nothing was lost, but the existing note in `CLAUDE.md` (new keys are silently dropped if sent before the update lands) describes a different hazard and reads as if partial POSTs are otherwise fine. They are not. Correct form, which also avoids ever printing the secrets in that dict: `curl .../info | jq -c '{options: (.data.options + {KEY: VALUE})}' | curl -X POST -d @- .../options`. Verified after: `digest_enabled` and `gcal_enabled` both still true.
+- 2026-08-03 10:20: `refined:` scope call — the operator-action log was folded into this change rather than deferred, because the two things asked for an hour apart (restart frequency; why a prior session's backfill was invisible) are one missing mechanism, and building only the restart counter would have left the question that prompted it unanswered. Ops-log call sites were held to `/reconcile/dismiss` and `/admin/ingest-transcript` — the two highest-value operator actions — deliberately not the booking-write paths, to keep the diff small on a live turnover day.
+- 2026-08-03 10:15: Deployed mid-morning rather than after the turnover, on Josh's call, because the bridge's `forward()` has no retry: a message landing during the tracker restart is dropped permanently. Pre-11am was the widest quiet gap available before Darya's 11:00–15:00 window.
+
 ## Changelog
+- 2026-08-03 | conjectured: the read-modify-write hazard in this change was the ops log, so a lock there made the feature concurrency-safe.
+  refuted by: a cross-vendor review pass, verified independently — `_log_op` only ever runs from Flask request handlers (`/reconcile/dismiss`, `/admin/ingest-transcript`), which are human-triggered and never concurrent in practice, while `bridge_watchdog.check()` has **two real callers in one process** (`app.py:3113` scheduler thread, `app.py:3425` on-demand route) and no lock at all. The lock was written onto the file that didn't need it. Worse, the same commit cut the poll interval 60 → 5 min, widening the unguarded collision window twelvefold.
+  learned: **identifying a hazard class correctly is not the same as locating it.** The reasoning in `_log_op`'s docstring — "the watchdog timer thread and a Flask request thread can both reach it" — was accurate about the system and wrong about the file it was attached to; being right about the mechanism made the misplacement harder to see, not easier. Enumerate the actual call sites of the function you are protecting, from the code, before deciding where the lock goes.
+  criterion now: ISC-168, ISC-169.
+
+- 2026-08-03 | conjectured: the bridge watchdog's existing state (`heals`, `blind_windows`) was enough to answer how reliable the bridge is, since it already counted restarts and recorded every outage.
+  refuted by: `heals` is a lifetime integer with no time axis — it cannot distinguish one bad week from three bad years — and a `blind_window` only exists for outages long enough to also lose messages, so short flaps leave no trace at all. Neither answers "how often". Worse, both are blind to the restart observed at 08:27 on 2026-08-03, which the watchdog never recorded because Supervisor's own add-on watchdog repaired it between two hourly polls.
+  learned: **a counter and a log are not the same instrument, and polling bounds what either can see.** A lifetime counter answers "has this ever happened"; only timestamped events answer "how often, lately". And any poll-based observer systematically undercounts events shorter than its interval — shortening the interval (60 → 5 min) narrows that blind spot but cannot close it, because the repair is performed by a faster agent than the observer. Closing it requires the observed process to report its own start.
+  criterion now: ISC-156, ISC-159, ISC-162, ISC-163.
+- 2026-08-03 | conjectured: this ISA was the system of record for the cleaning app, so a later session could reconstruct what had happened to it.
+  refuted by: a probe of the whole 88K file for `operator`, `operational event`, `restart count` and `transcript ingest` returned **zero hits** across 156 criteria. Josh's 2026-08-02 transcript ingest — a deliberate repair of a five-day blind window, and the only reason today's cleaning assignment was knowable — appears nowhere. Its sole trace is a `source: "backfill"` tag on 25 message rows: a side effect, not a record. A session reading this ISA cold would repeat the finding's stock advice to go check the phone, unaware the check had already been done.
+  learned: **an ISA records what was built and why; without deliberate effort it records nothing about what was done to the running system.** The two are different classes of fact and the first does not imply the second. Structural completeness is not coverage — this file passes the E5 gate on all twelve sections while being silent on an entire category. Machine-written operational logs beat a discipline of remembering to write them down, because the discipline fails exactly when things are busy, which is when the events happen.
+  criterion now: ISC-164, ISC-166.
 
 - 2026-08-02 | conjectured: the review queue was working, since every item in it had been correctly parsed and correctly routed to a human.
   refuted by: sixteen items pending, fourteen of them about dates already past — one from June. Each was individually correct and the set was useless. Conflicts had self-suppressed after five stale days for months; the queue had no equivalent, because nothing ever asked what a queue with no exit does over time.
@@ -556,6 +575,15 @@ and `transcript ingest` returned zero hits across the whole file.*
   criterion now: no new ISC — reaffirms the existing transcript-ingest design; bridge backfill window reverted to the known-good 15s.
 
 ## Verification
+
+### Operational history (2026-08-03, 1.32.0)
+
+- ISC-156..162: unit — `python3 scripts/test_bridge_watchdog.py` → **26 tests, OK**. New `EventLogTests` cover sparse steady state, restart counting, the cap dropping oldest-first, malformed-timestamp tolerance, and probe-error de-duplication.
+- ISC-163: live — `ha addons logs` tail reads `[watchdog] started — checking '27cbea7f_whatsapp-bridge' every 5 min`, and Supervisor `info` reports `{"version":"1.32.0","state":"started","interval":5}`.
+- ISC-166: live — `GET /internal/snapshot` **HTTP 200** with `bridge_watchdog` and `ops_log` present at top level alongside the existing `gcal_push_status` / `sync_status`. Reports `restarts_lifetime: 1` (the Aug 2 heal, preserved from the pre-existing counter), `restarts_logged: 0` (event log starts empty by construction), `unacknowledged_blind_windows: 1`.
+- ISC-167: happy-path live probe (snapshot returned 200 with both new keys) plus structural — both `_watchdog_summary()` and `_read_ops_log()` swallow their own exceptions and degrade to `{"enabled": True, "error": ...}` / `[]`.
+- ISC-168, ISC-169: unit — `ConcurrencyTests` (8 threads through a `Barrier` into `check()`): `heals` equals the count of `restart` events and `checks == 8`, i.e. no thread's write was lost. Suite now **38 tests, OK**.
+- ISC-164, ISC-165: `[ ]` — deliberately unverified. Proving them needs a real operator action (an ingest or a dismissal) to flow through `_log_op`; `ops_log` is legitimately `[]` until one does. No synthetic write was made, because a fake entry in an audit log is worse than an empty one.
 
 - ISC-43: code — `AuthorizedHttp(creds, httplib2.Http(timeout=HTTP_TIMEOUT_S))` passed as `http=` (not `credentials=`, which googleapiclient rejects together).
 - ISC-44: code — `HTTP_TIMEOUT_S = 30` module constant in `gcal.py`.

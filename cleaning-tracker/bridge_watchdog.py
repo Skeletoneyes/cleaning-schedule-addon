@@ -34,8 +34,19 @@ Two things follow, and both are deliberate:
 from datetime import datetime, timedelta
 from pathlib import Path
 import json
+import os
+import threading
 
 import requests
+
+# `check()` is load-mutate-save on a whole file, and it has two callers in one
+# process: the scheduler thread and `POST /internal/watchdog/check` on a Flask
+# request thread. That route exists precisely to be hit by a human *while* the
+# timer keeps ticking, and the timer now ticks every 5 minutes instead of 60.
+# Unguarded, the loser of an interleave silently overwrites the winner's events
+# — erasing entries from the incident record this module exists to make
+# trustworthy. Counters could survive that; an audit trail cannot.
+_STATE_LOCK = threading.RLock()
 
 SUPERVISOR_BASE = "http://supervisor"
 
@@ -86,10 +97,27 @@ def load_state(path):
 
 
 def save_state(path, state):
+    """Persist atomically — temp file then `os.replace`.
+
+    A plain `write_text` truncates before it writes, so a container restart
+    landing mid-write leaves a half-file; `load_state` then swallows the
+    `ValueError` and silently resets to defaults, discarding the whole incident
+    history. Add-on restarts are routine here (`ha addons update`, host reboot,
+    the watchdog's own healing), which makes that a likely loss, not a
+    theoretical one. Same temp+replace pattern the GCal and sync status
+    sidecars in `app.py` already use.
+    """
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
     try:
-        Path(path).write_text(json.dumps(state, indent=2))
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, p)
     except OSError as e:
         print(f"[watchdog] failed to persist state: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _append_event(state, at, kind, **fields):
@@ -144,7 +172,15 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
     `last_message_at` is the timestamp of the newest WhatsApp message the
     tracker has stored. It is used only to describe the blind window — the
     check itself never consults message traffic.
+
+    Serialized on `_STATE_LOCK`: the whole load-mutate-save must be one
+    critical section, not just the write.
     """
+    with _STATE_LOCK:
+        return _check_locked(state_path, slug, token, last_message_at, now, heal)
+
+
+def _check_locked(state_path, slug, token, last_message_at, now, heal):
     now = now or datetime.now()
     now_s = now.strftime("%Y-%m-%dT%H:%M:%S")
     state = load_state(state_path)

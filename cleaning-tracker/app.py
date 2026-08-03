@@ -230,8 +230,13 @@ def _log_op(action, **detail):
             })
             if len(entries) > OPS_LOG_CAP:
                 del entries[:len(entries) - OPS_LOG_CAP]
-            with open(OPS_LOG_FILE, "w") as f:
+            # Atomic, same as the gcal/sync sidecars: a kill mid-write would
+            # otherwise truncate the file and _read_ops_log would degrade it
+            # to [] on the next read, losing the history silently.
+            tmp = OPS_LOG_FILE.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
                 json.dump(entries, f, indent=2)
+            os.replace(tmp, OPS_LOG_FILE)
         print(f"[ops] {action} {detail}")
     except Exception as e:
         print(f"[ops] failed to log '{action}': {e}")

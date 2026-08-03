@@ -220,5 +220,42 @@ class EventLogTests(WatchdogTests):
         self.assertEqual(s["restarts_logged"], 3)
 
 
+class ConcurrencyTests(WatchdogTests):
+    """`check()` has two callers in one process — the scheduler thread and the
+    on-demand route — and the route exists to be hit *while* the timer ticks.
+    Unguarded, the loser of an interleave overwrites the winner's events."""
+
+    def test_concurrent_checks_do_not_lose_events(self):
+        import threading as _t
+        sup = FakeSupervisor("stopped")
+        self._wire(sup)
+        # Restart attempts accumulate on the open outage; every one must land.
+        barrier = _t.Barrier(8)
+
+        def worker():
+            barrier.wait()
+            wd.check(self.path, "slug", "token")
+
+        threads = [_t.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        state = wd.load_state(self.path)
+        restarts = [e for e in state["events"] if e["kind"] == "restart"]
+        self.assertEqual(state["heals"], len(restarts))
+        self.assertEqual(state["checks"], 8)
+        self.assertEqual(wd.summary(state)["restarts_24h"], len(restarts))
+
+    def test_save_state_is_atomic(self):
+        # A truncated file resets the entire history, so the write must never
+        # be observable half-done. Proxy: no .tmp residue, file always parses.
+        wd.save_state(self.path, {**wd._default_state(), "checks": 7})
+        self.assertEqual(wd.load_state(self.path)["checks"], 7)
+        leftovers = list(self.path.parent.glob("*.tmp"))
+        self.assertEqual(leftovers, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
