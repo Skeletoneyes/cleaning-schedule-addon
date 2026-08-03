@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-03T10:30:00-07:00
-progress: 167/177
+progress: 168/177
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -331,7 +331,7 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-173: Anti: appending a check must not rewrite the whole log — a 30-day window at 5-minute polling is ~8,600 records (~530 KB), and a full rewrite every pass would be ~530 KB of SSD writes every five minutes.
 - [x] ISC-174: Anti: a write torn before its newline must cost at most the record it was writing — it must not concatenate the next append onto itself and destroy that one too.
 - [x] ISC-175: `summary()` reports the share of checks that found the bridge healthy, so a watchdog that silently stopped running reads as missing checks rather than as apparent perfect health.
-- [ ] ISC-176: The full check history is served from its own endpoint, not from `/internal/snapshot` — an ~8,600-record log must not ride a payload that already carries every booking.
+- [x] ISC-176: The full check history is served from its own endpoint, not from `/internal/snapshot` — an ~8,600-record log must not ride a payload that already carries every booking.
 
 ## Test Strategy
 
@@ -462,6 +462,8 @@ and `transcript ingest` returned zero hits across the whole file.*
 
 - 2026-08-03 11:10: 🔴 **OPEN — the last hop drops findings silently, and it is the one hop with an LLM in it.** Verified from two sides: the Pi logged `[vps-push] ok — 1 new, 2 carried`, and the message that arrived contained one bullet plus `Unresolved conflicts — none`. The SDK triage prompt (`~/dev/pai-telegram-bot/src/cleaning.ts`) instructs "keep the ENTIRE message to about 15 lines maximum" and to group findings, with no requirement that every finding id appear in the output — so a formatter under a line budget can drop a `needs-attention` finding and still look well-formed. This defeats the Principle "fail loudly, never silently" at the very last step, after five separate mechanisms upstream have worked correctly to get the finding that far. Note the deterministic `formatFallbackDigest` does NOT have this flaw — it renders every finding — so the failure is exclusive to the healthy path. Suggested fix: assert set-equality between pushed finding ids and ids cited in the rendered message; on mismatch, fall back to the deterministic formatter and say so. Not fixed today — it lives in the VPS bot, not this add-on.
 - 2026-08-03 10:35: `refined:` this morning's claim that the digest "didn't tell you about the 14 unassigned bookings" was **wrong, and the ISA already said so** — the 21-day relevance horizon shipped 2026-08-02 (ISC-128/129, 1.27.3) suppresses dated findings beyond the horizon by design, and they resume on their own as the date approaches. All 14 are Sep 2026 – Jul 2027. Reading the Changelog before diagnosing would have caught this; the genuine omission was never the drift findings, it was the two that WERE pushed and never rendered.
+
+- 2026-08-03 12:26: Shipped 1.32.1 + 1.33.0 as a **single** add-on update on Josh's explicit instruction, mid-turnover rather than after it. One restart, not two — 1.33.0's tree already contains the 1.32.1 lock fix, so updating once carried both and halved the exposure. The stated risk was accepted knowingly: the bridge's `forward()` has no retry, so an inbound WhatsApp message landing during the restart is dropped permanently, and a cleaner was on site. Recorded because the reasoning matters more than the outcome — the message watermark was unchanged across the deploy (636 messages, newest 2026-07-30T12:35), which shows nothing WAS lost but could never have shown that nothing COULD be.
 
 ## Changelog
 - 2026-08-03 | conjectured: logging only transitions was right, because a 5-minute poll writing 288 rows a day would bury the handful of rows that matter.
@@ -602,7 +604,7 @@ and `transcript ingest` returned zero hits across the whole file.*
 - ISC-167: happy-path live probe (snapshot returned 200 with both new keys) plus structural — both `_watchdog_summary()` and `_read_ops_log()` swallow their own exceptions and degrade to `{"enabled": True, "error": ...}` / `[]`.
 - ISC-168, ISC-169: unit — `ConcurrencyTests` (8 threads through a `Barrier` into `check()`): `heals` equals the count of `restart` events and `checks == 8`, i.e. no thread's write was lost. Suite now **38 tests, OK**.
 - ISC-171..175: unit — `CheckLogTests` (10 tests) covers uneventful passes still being logged, action + `from_state` capture, `healthy_pct` from observations, per-pass probe-failure logging, trailing-window prune, and torn-line recovery. Suite **41 tests, OK**. Volume simulated at full scale: 8,640 records = 532 KB, 63 bytes/record, prune drops a 45-day-old row and keeps 8,640.
-- ISC-176: `[ ]` — code shipped (`GET /internal/watchdog/history?days=&actions_only=`), live probe deferred to the 1.33.0 deploy tonight.
+- ISC-176: live — 1.33.0 deployed 2026-08-03 12:26 (Supervisor: `{"version":"1.33.0","state":"started","interval":5}`). `GET /internal/watchdog/history?days=1` → **HTTP 200**, `count: 1`, first record `{"at":"2026-08-03T12:26:26","state":"started","action":"none"}` — the startup pass, logged although nothing happened, which is the criterion. `/internal/snapshot` carries `summary` + `recent_checks` (1) and no longer carries `events`. Boot prune fired clean: `[watchdog] check log pruned to 30d — 0 record(s)`. Ops log survived the restart with both dismissals intact.
 - ISC-164: live — two real dismissals (the stale blind-window and the Itzel false alarm) at 2026-08-03 10:35, authorised by Josh. `/internal/snapshot` → `ops_log` holds both entries with `action: finding_dismissed`, the finding id, and the reason; `/reconcile/last` drops 16 → 14 findings with only genuine `drift` remaining. No synthetic write was ever made — a fake entry in an audit log is worse than an empty one.
 - ISC-165: `[DEFERRED-VERIFY]` — structural only (`_log_op` wraps its whole body in `try/except` and is called after `save_data()` has committed). Proving it needs fault injection: make `OPS_LOG_FILE` unwritable, dismiss a finding, confirm the dismissal still lands. Follow-up: bundle with the 1.32.1 deploy tonight.
 - ISC-170: `[ ]` — OPEN DEFECT, found 2026-08-03. Add-on log reads `[vps-push] ok — 1 new, 2 carried, heartbeat sent`, so three findings crossed to the bot; the Telegram message Josh received rendered exactly one and printed "❓ Unresolved conflicts — none". Two `needs-attention` findings were silently dropped between the push and the message.
