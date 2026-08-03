@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-03T10:30:00-07:00
-progress: 161/170
+progress: 163/171
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -319,12 +319,13 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-161: Anti: a persistent probe error logs one event on the transition into failure, not one per poll.
 - [x] ISC-162: The restart figure travels with an explicit statement that it **undercounts** — a crash Supervisor's own add-on watchdog repairs between two polls is unobservable to a poll, and a reassuring number that hides that is worse than no number.
 - [x] ISC-163: The bridge liveness poll runs at 5-minute resolution, cutting worst-case detection lag from 60 minutes to 5.
-- [ ] ISC-164: Operator actions on the live system (transcript ingest, finding dismissal) are recorded **as actions** in an append-only ops log, not left to be inferred from their side effects.
-- [ ] ISC-165: Anti: a failure to write the ops log must never fail the operation it was logging.
+- [x] ISC-164: Operator actions on the live system (transcript ingest, finding dismissal) are recorded **as actions** in an append-only ops log, not left to be inferred from their side effects.
+- [DEFERRED-VERIFY] ISC-165: Anti: a failure to write the ops log must never fail the operation it was logging.
 - [x] ISC-166: The watchdog summary and the ops log are readable off-host via `/internal/snapshot`, so a later session can read what was done to the system instead of reconstructing it from `source:` tags on data rows.
 - [x] ISC-167: Anti: the reporting helpers must not be able to raise inside `/internal/snapshot` — it is the off-host reconciliation lifeline and must never 500.
 - [x] ISC-168: Anti: the watchdog's load-mutate-save is one critical section — the scheduler thread and the on-demand `/internal/watchdog/check` route must not be able to overwrite each other's events.
 - [x] ISC-169: Anti: watchdog state is persisted atomically (temp + `os.replace`), so a restart mid-write cannot truncate the file and silently reset the whole incident history to defaults.
+- [ ] ISC-170: Anti: the Telegram digest must render EVERY finding the Pi pushed — the SDK triage formatter must not be able to drop a `needs-attention` finding to satisfy its line budget, and a section reading "none" must mean zero findings, not zero findings that fit.
 
 ## Test Strategy
 
@@ -452,6 +453,9 @@ and `transcript ingest` returned zero hits across the whole file.*
 - 2026-08-03 10:35: ⚠️ **NEW DEPLOY GOTCHA — a Supervisor options POST REPLACES the whole options dict; it does not merge.** Sending `{"options":{"bridge_watchdog_interval_min":5}}` returned `app_configuration_invalid_error — Missing option 'digest_enabled' in root`. It failed **closed**, so nothing was lost, but the existing note in `CLAUDE.md` (new keys are silently dropped if sent before the update lands) describes a different hazard and reads as if partial POSTs are otherwise fine. They are not. Correct form, which also avoids ever printing the secrets in that dict: `curl .../info | jq -c '{options: (.data.options + {KEY: VALUE})}' | curl -X POST -d @- .../options`. Verified after: `digest_enabled` and `gcal_enabled` both still true.
 - 2026-08-03 10:20: `refined:` scope call — the operator-action log was folded into this change rather than deferred, because the two things asked for an hour apart (restart frequency; why a prior session's backfill was invisible) are one missing mechanism, and building only the restart counter would have left the question that prompted it unanswered. Ops-log call sites were held to `/reconcile/dismiss` and `/admin/ingest-transcript` — the two highest-value operator actions — deliberately not the booking-write paths, to keep the diff small on a live turnover day.
 - 2026-08-03 10:15: Deployed mid-morning rather than after the turnover, on Josh's call, because the bridge's `forward()` has no retry: a message landing during the tracker restart is dropped permanently. Pre-11am was the widest quiet gap available before Darya's 11:00–15:00 window.
+
+- 2026-08-03 11:10: 🔴 **OPEN — the last hop drops findings silently, and it is the one hop with an LLM in it.** Verified from two sides: the Pi logged `[vps-push] ok — 1 new, 2 carried`, and the message that arrived contained one bullet plus `Unresolved conflicts — none`. The SDK triage prompt (`~/dev/pai-telegram-bot/src/cleaning.ts`) instructs "keep the ENTIRE message to about 15 lines maximum" and to group findings, with no requirement that every finding id appear in the output — so a formatter under a line budget can drop a `needs-attention` finding and still look well-formed. This defeats the Principle "fail loudly, never silently" at the very last step, after five separate mechanisms upstream have worked correctly to get the finding that far. Note the deterministic `formatFallbackDigest` does NOT have this flaw — it renders every finding — so the failure is exclusive to the healthy path. Suggested fix: assert set-equality between pushed finding ids and ids cited in the rendered message; on mismatch, fall back to the deterministic formatter and say so. Not fixed today — it lives in the VPS bot, not this add-on.
+- 2026-08-03 10:35: `refined:` this morning's claim that the digest "didn't tell you about the 14 unassigned bookings" was **wrong, and the ISA already said so** — the 21-day relevance horizon shipped 2026-08-02 (ISC-128/129, 1.27.3) suppresses dated findings beyond the horizon by design, and they resume on their own as the date approaches. All 14 are Sep 2026 – Jul 2027. Reading the Changelog before diagnosing would have caught this; the genuine omission was never the drift findings, it was the two that WERE pushed and never rendered.
 
 ## Changelog
 - 2026-08-03 | conjectured: the read-modify-write hazard in this change was the ops log, so a lock there made the feature concurrency-safe.
@@ -583,7 +587,9 @@ and `transcript ingest` returned zero hits across the whole file.*
 - ISC-166: live — `GET /internal/snapshot` **HTTP 200** with `bridge_watchdog` and `ops_log` present at top level alongside the existing `gcal_push_status` / `sync_status`. Reports `restarts_lifetime: 1` (the Aug 2 heal, preserved from the pre-existing counter), `restarts_logged: 0` (event log starts empty by construction), `unacknowledged_blind_windows: 1`.
 - ISC-167: happy-path live probe (snapshot returned 200 with both new keys) plus structural — both `_watchdog_summary()` and `_read_ops_log()` swallow their own exceptions and degrade to `{"enabled": True, "error": ...}` / `[]`.
 - ISC-168, ISC-169: unit — `ConcurrencyTests` (8 threads through a `Barrier` into `check()`): `heals` equals the count of `restart` events and `checks == 8`, i.e. no thread's write was lost. Suite now **38 tests, OK**.
-- ISC-164, ISC-165: `[ ]` — deliberately unverified. Proving them needs a real operator action (an ingest or a dismissal) to flow through `_log_op`; `ops_log` is legitimately `[]` until one does. No synthetic write was made, because a fake entry in an audit log is worse than an empty one.
+- ISC-164: live — two real dismissals (the stale blind-window and the Itzel false alarm) at 2026-08-03 10:35, authorised by Josh. `/internal/snapshot` → `ops_log` holds both entries with `action: finding_dismissed`, the finding id, and the reason; `/reconcile/last` drops 16 → 14 findings with only genuine `drift` remaining. No synthetic write was ever made — a fake entry in an audit log is worse than an empty one.
+- ISC-165: `[DEFERRED-VERIFY]` — structural only (`_log_op` wraps its whole body in `try/except` and is called after `save_data()` has committed). Proving it needs fault injection: make `OPS_LOG_FILE` unwritable, dismiss a finding, confirm the dismissal still lands. Follow-up: bundle with the 1.32.1 deploy tonight.
+- ISC-170: `[ ]` — OPEN DEFECT, found 2026-08-03. Add-on log reads `[vps-push] ok — 1 new, 2 carried, heartbeat sent`, so three findings crossed to the bot; the Telegram message Josh received rendered exactly one and printed "❓ Unresolved conflicts — none". Two `needs-attention` findings were silently dropped between the push and the message.
 
 - ISC-43: code — `AuthorizedHttp(creds, httplib2.Http(timeout=HTTP_TIMEOUT_S))` passed as `http=` (not `credentials=`, which googleapiclient rejects together).
 - ISC-44: code — `HTTP_TIMEOUT_S = 30` module constant in `gcal.py`.
