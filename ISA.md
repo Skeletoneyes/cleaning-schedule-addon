@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: active
-updated: 2026-08-03T10:30:00-07:00
-progress: 175/184
+updated: 2026-08-03T13:05:00-07:00
+progress: 175/185
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -339,6 +339,7 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-181: The 30-day strip renders a day with NO recorded checks as GREY, never green — "we never looked" and "it was fine" must never render alike.
 - [x] ISC-182: Anti: today's cell must be judged against the fraction of the day elapsed, not a full day — otherwise the most-viewed cell is permanently degraded and the strip cries wolf daily.
 - [x] ISC-183: Anti: the bridge panel must not be able to break the home page — its context builder returns a rendered error state rather than raising.
+- [ ] ISC-184: Anti: every ISC carries a `## Test Strategy` row — a wrap-up audit joins Criteria against Test Strategy per-ISC, because a stale table scores identically to a current one under a section-presence check.
 
 ## Test Strategy
 
@@ -385,6 +386,35 @@ and `transcript ingest` returned zero hits across the whole file.*
 | ISC-81/82 | fault-injection | bad calendar id → reconcile → digest → Telegram | finding + message | curl + ssh |
 | ISC-83/84 | recovery | restore config → push → reconcile → GCal event count | clean, no residue | curl |
 | ISC-85 | render | read the actual Telegram message text produced by the fault | names push failure | ssh journal |
+| ISC-156 | unit | `check()` on a stopped bridge → the pass is recorded with its action | `restarted` present | python3 scripts/test_bridge_watchdog.py |
+| ISC-157 | unit | 10 healthy passes → every record's action | all `none`, none omitted | test_bridge_watchdog.py |
+| ISC-158 | unit | append > cap, then read back | length == cap, newest kept | test_bridge_watchdog.py |
+| ISC-159 | unit | `summary()` restart counts vs seeded windows | 24h/7d/30d match | test_bridge_watchdog.py |
+| ISC-160 | fault-injection | `summary()` over a record with a garbage `at` | returns, does not raise | test_bridge_watchdog.py |
+| ISC-161 | unit | 5 consecutive probe failures under the sparse design | exactly 1 event | test_bridge_watchdog.py (superseded by ISC-171) |
+| ISC-162 | render | `summary()["caveat"]` text | contains `>=` | test_bridge_watchdog.py |
+| ISC-163 | boot-log | add-on log after deploy | `checking … every 5 min` | ssh ha addons logs |
+| ISC-164 | live-probe | dismiss a finding → `/internal/snapshot` → `ops_log` | entry with id + reason | curl + jq |
+| ISC-165 | fault-injection | make `ops_log.json` unwritable, dismiss a finding | dismissal still lands | **NOT RUN — deferred** |
+| ISC-166 | live-probe | `GET /internal/snapshot` top-level keys | `bridge_watchdog` + `ops_log` | curl + jq |
+| ISC-167 | live-probe | `/internal/snapshot` status with watchdog state present | 200, never 500 | curl -i |
+| ISC-168 | concurrency | 8 threads through a `Barrier` into `check()` | `checks == 8`, no lost write | test_bridge_watchdog.py |
+| ISC-169 | invariant | `save_state()` then glob the directory | no `*.tmp` residue, file parses | test_bridge_watchdog.py |
+| ISC-170 | render | read the Telegram message the human receives vs `[vps-push]` counts | every pushed finding cited | ssh journal + phone — **due 2026-08-04 08:00** |
+| ISC-171 | unit | 10 healthy passes → lines in the check log | 10, all `action: none` | test_bridge_watchdog.py |
+| ISC-172 | unit | seed a 45-day-old row, prune at 30d | stale row dropped, recent kept | test_bridge_watchdog.py |
+| ISC-173 | perf | 8,640 appends, measure file + per-record cost | ~532 KB, ~63 B/record, O(1) append | offline simulation |
+| ISC-174 | fault-injection | append a line with no newline, then append again | both records readable | test_bridge_watchdog.py |
+| ISC-175 | unit | 3 healthy + 1 down → `healthy_pct` | 75.0 | test_bridge_watchdog.py |
+| ISC-176 | live-probe | `GET /internal/watchdog/history?days=1` | 200 + record count | curl + jq |
+| ISC-177 | unit | triage JSON citing every id → rendered message | model's wording survives | bun test test/cleaning.test.ts |
+| ISC-178 | unit | triage JSON dropping / inventing / double-citing an id | throws each time | bun test |
+| ISC-179 | render | service-level: model drops a finding | message says fallback + names the finding | bun test |
+| ISC-180 | live-probe | `GET /` on the add-on | contains `id="bridge-tab"` | curl + grep |
+| ISC-181 | render | day with zero records in the 30-day strip | cell class `nodata`, never `ok` | offline render of FOCUS_TEMPLATE |
+| ISC-182 | render | today's cell with a part-day of checks | class `ok`, not `partial` | offline render + live `GET /` |
+| ISC-183 | fault-injection | force `_build_bridge_context()` to raise | home page still 200, error state shown | code inspection + live `GET /` |
+| ISC-184 | invariant | set-difference of ISC ids in Criteria vs Test Strategy | empty | python3 audit in wrap-up |
 
 ## Features
 
@@ -472,7 +502,13 @@ and `transcript ingest` returned zero hits across the whole file.*
 
 - 2026-08-03 12:26: Shipped 1.32.1 + 1.33.0 as a **single** add-on update on Josh's explicit instruction, mid-turnover rather than after it. One restart, not two — 1.33.0's tree already contains the 1.32.1 lock fix, so updating once carried both and halved the exposure. The stated risk was accepted knowingly: the bridge's `forward()` has no retry, so an inbound WhatsApp message landing during the restart is dropped permanently, and a cleaner was on site. Recorded because the reasoning matters more than the outcome — the message watermark was unchanged across the deploy (636 messages, newest 2026-07-30T12:35), which shows nothing WAS lost but could never have shown that nothing COULD be.
 
+- 2026-08-03 13:10: Left ISC-184 **failing on purpose** rather than backfilling 110 Test Strategy rows at wrap-up. Writing a `check | threshold | tool` line for ISC-86..155 today would mean inventing probes for work verified in earlier sessions whose actual evidence I did not observe — a table full of plausible retroactive entries is strictly worse than a gap that is visible and counted, because it converts a known unknown into a confident wrong. The honest remediation is per-increment: when a run touches an old ISC, give it a row then, from real evidence. The counter is the backlog. Rejected alternative: mark ISC-184 `[x]` on the grounds that the *gate* now exists and today's rows are complete — that is completion-by-format bias, the failure GPT-5.5 named on the financial ISA, and the criterion says every ISC has a row, not that a checker exists.
+
 ## Changelog
+- 2026-08-03 | conjectured: a session that adds criteria, verifies them, and records Decisions and Changelog entries has kept the ISA whole.
+  refuted by: the wrap-up audit. First pass: 0 of 28 new criteria (ISC-156..183) had a `## Test Strategy` row. Writing the gate to prove that fixed then revealed the real number — **110 of 185 criteria have no row**, in runs at ISC-11..14, 25..31, 46..53, 62..71, 74..77 and above all **ISC-86..155**, an unbroken 70-criterion gap covering the entire GCal-repair, attestation, liveness and facts-layer era. The table has been decorative since roughly ISC-85. Structure passed the E5 gate throughout, because `## Test Strategy` was `present` on the strength of 41 rows written months earlier.
+  learned: **section-level completeness cannot see per-row rot, and the first measurement of a gap usually understates it.** A stale table scores identically to a current one under a presence check, so "all twelve sections present" was true and uninformative for months. Two compounding causes: Test Strategy is written at OBSERVE/PLAN, and *reactive* work — a user correction, a review finding, a defect surfaced mid-deploy — jumps straight to EXECUTE and never comes back for it; and nothing ever joined the two sections, so the omission was unobservable by construction. Note also the second-order error: the entry originally written here claimed the gap was 28, because it measured only the ISCs in front of it. Widen the probe before writing the lesson.
+  criterion now: ISC-184 (open — the invariant is asserted, not yet met).
 - 2026-08-03 | conjectured: shipping the check log behind `GET /internal/watchdog/history` delivered the stability record that was asked for.
   refuted by: Josh — *"I'm never going to do curl commands to read something like this."* True and predictable: the operator's interface to this system is the add-on's web UI, and everything else in it lives there. An API-only health signal is one nobody looks at.
   learned: **a monitoring feature is not delivered until it is delivered to where the human already is.** This project already had the lesson in a different costume — a finding that landed in HA persistent notifications rather than Telegram was "indistinguishable from no detection" — and I re-made it one layer down, in the instrument built to fix the first version. The reach question ("who sees this, where, without being told to look") belongs in the design, not in a follow-up.
@@ -615,6 +651,7 @@ and `transcript ingest` returned zero hits across the whole file.*
 - ISC-167: happy-path live probe (snapshot returned 200 with both new keys) plus structural — both `_watchdog_summary()` and `_read_ops_log()` swallow their own exceptions and degrade to `{"enabled": True, "error": ...}` / `[]`.
 - ISC-168, ISC-169: unit — `ConcurrencyTests` (8 threads through a `Barrier` into `check()`): `heals` equals the count of `restart` events and `checks == 8`, i.e. no thread's write was lost. Suite now **38 tests, OK**.
 - ISC-171..175: unit — `CheckLogTests` (10 tests) covers uneventful passes still being logged, action + `from_state` capture, `healthy_pct` from observations, per-pass probe-failure logging, trailing-window prune, and torn-line recovery. Suite **41 tests, OK**. Volume simulated at full scale: 8,640 records = 532 KB, 63 bytes/record, prune drops a 45-day-old row and keeps 8,640.
+- ISC-184: `[ ]` — **FAILS, deliberately left failing.** The join now runs (expanding the table's `ISC-81/82` and `ISC-156..162` shorthand) and reports **110 of 185 criteria with no Test Strategy row**. This session's 28 were backfilled; the pre-existing 110 were not — see Decisions 2026-08-03 13:10 for why fabricating them would be worse than the visible gap.
 - ISC-180..183: live — cleaning-tracker **1.34.0** deployed 2026-08-03 13:0x; `GET /` returns **HTTP 200**, 52,163 bytes, containing `id="bridge-tab"`, `bridge-tab-btn`, the 30-day strip and the plain-language caveat. Day cells render `29 nodata + 1 partial` — correct and honest on day one, because the check log only began at 12:26 today, so 29 days genuinely have no observations and today has far fewer than a full day's. Self-corrects as the window fills.
 - ISC-177..179: deployed — `src/` synced to `/opt/pai-telegram-bot/`, `systemctl is-active` → `active`, `cleaning digest listener started {port: 8899}`, `Bot started: @josh_vela_claude_bot`.
 - ISC-177..179: unit — `renderTriageResult()` coverage suite in `~/dev/pai-telegram-bot/test/cleaning.test.ts` (8 cases: full coverage renders the model's wording; a dropped finding throws `dropped N finding(s)`; invented id throws; double-cite throws; prose throws; fenced JSON tolerated; empty section renders `none`; malformed bullet rejected) plus 3 service-level cases proving the dropped finding still reaches Telegram via the fallback and the message says so. **Bot suite 122 pass / 0 fail, `tsc --noEmit` clean.** The pre-existing "SDK succeeds -> sends verbatim" test was rewritten: it fed prose, which now falls back, so it had started passing through the fallback path while claiming to test the happy path.
