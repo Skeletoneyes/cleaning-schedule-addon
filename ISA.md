@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-03T10:30:00-07:00
-progress: 162/171
+progress: 167/177
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -326,6 +326,12 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-168: Anti: the watchdog's load-mutate-save is one critical section — the scheduler thread and the on-demand `/internal/watchdog/check` route must not be able to overwrite each other's events.
 - [x] ISC-169: Anti: watchdog state is persisted atomically (temp + `os.replace`), so a restart mid-write cannot truncate the file and silently reset the whole incident history to defaults.
 - [ ] ISC-170: Anti: the Telegram digest must render EVERY finding the Pi pushed — the SDK triage formatter must not be able to drop a `needs-attention` finding to satisfy its line budget, and a section reading "none" must mean zero findings, not zero findings that fit.
+- [x] ISC-171: EVERY liveness check is recorded, including the passes where nothing happened — a stable stretch must be evidenced by observations, not inferred from an absence of incidents.
+- [x] ISC-172: The check log is retained on a trailing 30-day window rather than a row cap — "how stable has it been lately" is a question about time, so the retention must be too.
+- [x] ISC-173: Anti: appending a check must not rewrite the whole log — a 30-day window at 5-minute polling is ~8,600 records (~530 KB), and a full rewrite every pass would be ~530 KB of SSD writes every five minutes.
+- [x] ISC-174: Anti: a write torn before its newline must cost at most the record it was writing — it must not concatenate the next append onto itself and destroy that one too.
+- [x] ISC-175: `summary()` reports the share of checks that found the bridge healthy, so a watchdog that silently stopped running reads as missing checks rather than as apparent perfect health.
+- [ ] ISC-176: The full check history is served from its own endpoint, not from `/internal/snapshot` — an ~8,600-record log must not ride a payload that already carries every booking.
 
 ## Test Strategy
 
@@ -458,6 +464,14 @@ and `transcript ingest` returned zero hits across the whole file.*
 - 2026-08-03 10:35: `refined:` this morning's claim that the digest "didn't tell you about the 14 unassigned bookings" was **wrong, and the ISA already said so** — the 21-day relevance horizon shipped 2026-08-02 (ISC-128/129, 1.27.3) suppresses dated findings beyond the horizon by design, and they resume on their own as the date approaches. All 14 are Sep 2026 – Jul 2027. Reading the Changelog before diagnosing would have caught this; the genuine omission was never the drift findings, it was the two that WERE pushed and never rendered.
 
 ## Changelog
+- 2026-08-03 | conjectured: logging only transitions was right, because a 5-minute poll writing 288 rows a day would bury the handful of rows that matter.
+  refuted by: Josh, asking for the opposite — every check, with its action, on a trailing 30 days. The sparse design has a defect the volume argument hid: **an empty log is ambiguous.** Zero incidents and a watchdog that never ran render identically, which is the same "silence is indistinguishable from death" failure this project already has a Principle about, reappearing one level up in the instrument built to detect it.
+  learned: **for an availability record, the uneventful observations ARE the signal.** 8,640 consecutive `started / none` rows is a claim with evidence behind it; an empty file is only a claim. Optimising a log for readability at the cost of its evidentiary value is the wrong trade — read the incidents through a filter (`?actions_only=1`), don't refuse to write the evidence. Corollary on volume: the objection was really about write cost, and that is solved by an append-only JSONL (O(1) per pass) rather than by recording less.
+  criterion now: ISC-171, ISC-172, ISC-173, ISC-175.
+- 2026-08-03 | conjectured: appending one line per check is trivially safe, so the only failure worth handling was an unparseable line on read.
+  refuted by: `test_a_torn_line_does_not_break_the_history` — a write killed before its newline leaves an unterminated line, and the *next* append concatenates onto it, so one interrupted write destroys two records and the casualty is the newer one. The test was written expecting to pass and failed.
+  learned: **append-only is not the same as append-safe.** The record you are about to write depends on the integrity of the one before it whenever the delimiter is part of the payload. Repair the terminator before appending. Also worth keeping: this was found by a test written to document intent, not by review of the code — the third time in this project that deploying-and-probing beat reasoning.
+  criterion now: ISC-174.
 - 2026-08-03 | conjectured: the read-modify-write hazard in this change was the ops log, so a lock there made the feature concurrency-safe.
   refuted by: a cross-vendor review pass, verified independently — `_log_op` only ever runs from Flask request handlers (`/reconcile/dismiss`, `/admin/ingest-transcript`), which are human-triggered and never concurrent in practice, while `bridge_watchdog.check()` has **two real callers in one process** (`app.py:3113` scheduler thread, `app.py:3425` on-demand route) and no lock at all. The lock was written onto the file that didn't need it. Worse, the same commit cut the poll interval 60 → 5 min, widening the unguarded collision window twelvefold.
   learned: **identifying a hazard class correctly is not the same as locating it.** The reasoning in `_log_op`'s docstring — "the watchdog timer thread and a Flask request thread can both reach it" — was accurate about the system and wrong about the file it was attached to; being right about the mechanism made the misplacement harder to see, not easier. Enumerate the actual call sites of the function you are protecting, from the code, before deciding where the lock goes.
@@ -587,6 +601,8 @@ and `transcript ingest` returned zero hits across the whole file.*
 - ISC-166: live — `GET /internal/snapshot` **HTTP 200** with `bridge_watchdog` and `ops_log` present at top level alongside the existing `gcal_push_status` / `sync_status`. Reports `restarts_lifetime: 1` (the Aug 2 heal, preserved from the pre-existing counter), `restarts_logged: 0` (event log starts empty by construction), `unacknowledged_blind_windows: 1`.
 - ISC-167: happy-path live probe (snapshot returned 200 with both new keys) plus structural — both `_watchdog_summary()` and `_read_ops_log()` swallow their own exceptions and degrade to `{"enabled": True, "error": ...}` / `[]`.
 - ISC-168, ISC-169: unit — `ConcurrencyTests` (8 threads through a `Barrier` into `check()`): `heals` equals the count of `restart` events and `checks == 8`, i.e. no thread's write was lost. Suite now **38 tests, OK**.
+- ISC-171..175: unit — `CheckLogTests` (10 tests) covers uneventful passes still being logged, action + `from_state` capture, `healthy_pct` from observations, per-pass probe-failure logging, trailing-window prune, and torn-line recovery. Suite **41 tests, OK**. Volume simulated at full scale: 8,640 records = 532 KB, 63 bytes/record, prune drops a 45-day-old row and keeps 8,640.
+- ISC-176: `[ ]` — code shipped (`GET /internal/watchdog/history?days=&actions_only=`), live probe deferred to the 1.33.0 deploy tonight.
 - ISC-164: live — two real dismissals (the stale blind-window and the Itzel false alarm) at 2026-08-03 10:35, authorised by Josh. `/internal/snapshot` → `ops_log` holds both entries with `action: finding_dismissed`, the finding id, and the reason; `/reconcile/last` drops 16 → 14 findings with only genuine `drift` remaining. No synthetic write was ever made — a fake entry in an audit log is worse than an empty one.
 - ISC-165: `[DEFERRED-VERIFY]` — structural only (`_log_op` wraps its whole body in `try/except` and is called after `save_data()` has committed). Proving it needs fault injection: make `OPS_LOG_FILE` unwritable, dismiss a finding, confirm the dismissal still lands. Follow-up: bundle with the 1.32.1 deploy tonight.
 - ISC-170: `[ ]` — OPEN DEFECT, found 2026-08-03. Add-on log reads `[vps-push] ok — 1 new, 2 carried, heartbeat sent`, so three findings crossed to the bot; the Telegram message Josh received rendered exactly one and printed "❓ Unresolved conflicts — none". Two `needs-attention` findings were silently dropped between the push and the message.

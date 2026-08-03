@@ -56,13 +56,23 @@ SUPERVISOR_BASE = "http://supervisor"
 HEALTHY_STATES = {"started"}
 TRANSIENT_STATES = {"startup", "starting", "unknown"}
 
-# The event log answers "how often does this thing actually need restarting",
-# which neither the running counters nor the blind windows can: `heals` is a
-# lifetime total with no time axis, and a blind window only exists for outages
-# long enough to also lose messages. Capped because this file is rewritten in
-# full on every pass and an unbounded list would grow without limit; 500 events
-# is years of a healthy bridge and still months of a sick one.
-EVENT_CAP = 500
+# Every check is recorded, not only the ones where something changed.
+#
+# The first cut of this logged transitions only, reasoning that a 5-minute poll
+# would otherwise write 288 rows a day and bury the handful that matter. That
+# was the wrong trade: a sparse log that is empty reads *identically* whether
+# the bridge was rock solid or the watchdog never ran at all. Absence of
+# incidents is not evidence of stability — it is the same ambiguity this module
+# was built to end, one level up. Logging every pass makes uptime positively
+# verifiable: 8,640 consecutive `started / none` rows is a claim with evidence
+# behind it, where an empty file is only a claim.
+#
+# Retention is a trailing window rather than a row cap, because the question is
+# "how stable has it been *recently*", which is a question about time.
+CHECK_LOG_RETENTION_DAYS = 30
+# Pruning rewrites the whole file, so it must not run on every pass. Once per
+# ~day at a 5-minute interval.
+PRUNE_EVERY_N_CHECKS = 288
 
 
 # ── State persistence ───────────────────────────────────────────────────────
@@ -76,7 +86,6 @@ def _default_state():
         "probe_error": None,
         "checks": 0,
         "heals": 0,
-        "events": [],
     }
 
 
@@ -120,21 +129,86 @@ def save_state(path, state):
             pass
 
 
-def _append_event(state, at, kind, **fields):
-    """Record one thing that happened, append-only.
+# ── The check log (one line per pass, JSONL) ────────────────────────────────
 
-    Only *transitions* are logged, never the steady state — a healthy bridge
-    polled every five minutes would otherwise write 288 identical rows a day and
-    bury the six that matter. So a run of `started` observations produces no
-    events at all, and the log reads as a list of incidents.
+def _log_check(log_path, record):
+    """Append one line. JSONL and append-mode on purpose: at 5-minute polling a
+    30-day window is ~8,640 records, and rewriting that whole file every pass
+    would be ~700 KB of writes every 5 minutes on a Pi's SSD. An append is O(1)
+    and costs one line regardless of how much history is behind it.
+
+    Never raises — failing to record a check must not fail the check.
+
+    Repairs a missing trailing newline before appending. Without that, a write
+    torn by a container kill leaves a line with no terminator, and the *next*
+    append concatenates onto it — so one interrupted write would destroy two
+    records instead of one, and the casualty would be the newer one. Found by
+    `test_a_torn_line_does_not_break_the_history`, not by reasoning.
     """
-    event = {"at": at, "kind": kind}
-    event.update({k: v for k, v in fields.items() if v is not None})
-    events = state.setdefault("events", [])
-    events.append(event)
-    if len(events) > EVENT_CAP:
-        del events[:len(events) - EVENT_CAP]
-    return event
+    try:
+        with open(log_path, "a+") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            if end:
+                f.seek(end - 1)
+                if f.read(1) != "\n":
+                    f.write("\n")
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError as e:
+        print(f"[watchdog] failed to append check log: {e}")
+
+
+def read_checks(log_path, days=None, now=None):
+    """Return check records (oldest first), optionally limited to a window.
+
+    A malformed line is skipped rather than fatal — a torn final line from a
+    kill mid-append must not make the whole history unreadable.
+    """
+    p = Path(log_path)
+    if not p.exists():
+        return []
+    cutoff = None
+    if days is not None:
+        cutoff = ((now or datetime.now()) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    out = []
+    try:
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if cutoff and (rec.get("at") or "") < cutoff:
+                    continue
+                out.append(rec)
+    except OSError as e:
+        print(f"[watchdog] failed to read check log: {e}")
+    return out
+
+
+def prune_checks(log_path, days=CHECK_LOG_RETENTION_DAYS, now=None):
+    """Drop records older than the retention window. Rewrites via temp+replace
+    so an interrupted prune cannot truncate the history it is preserving."""
+    p = Path(log_path)
+    if not p.exists():
+        return 0
+    kept = read_checks(p, days=days, now=now)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            for rec in kept:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        os.replace(tmp, p)
+    except OSError as e:
+        print(f"[watchdog] failed to prune check log: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return len(kept)
 
 
 # ── Supervisor calls ────────────────────────────────────────────────────────
@@ -166,28 +240,49 @@ def _supervisor_start(slug, token, timeout=90):
 
 # ── The check ───────────────────────────────────────────────────────────────
 
-def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
+def check(state_path, slug, token, last_message_at=None, now=None, heal=True,
+          log_path=None):
     """One watchdog pass. Returns the updated state dict.
 
     `last_message_at` is the timestamp of the newest WhatsApp message the
     tracker has stored. It is used only to describe the blind window — the
     check itself never consults message traffic.
 
+    `log_path`, when given, receives exactly ONE record per pass — including
+    the passes where nothing happened, which are the ones that evidence
+    stability. Written after the state save so a logged check is always a check
+    that actually completed.
+
     Serialized on `_STATE_LOCK`: the whole load-mutate-save must be one
     critical section, not just the write.
     """
     with _STATE_LOCK:
-        return _check_locked(state_path, slug, token, last_message_at, now, heal)
+        now = now or datetime.now()
+        state, record = _check_locked(state_path, slug, token, last_message_at, now, heal)
+        if log_path:
+            _log_check(log_path, record)
+            if int(state.get("checks") or 0) % PRUNE_EVERY_N_CHECKS == 0:
+                prune_checks(log_path, now=now)
+        return state
 
 
 def _check_locked(state_path, slug, token, last_message_at, now, heal):
-    now = now or datetime.now()
+    """Returns `(state, record)`. Every exit path produces a record, so the log
+    can never silently omit a pass — an omitted pass is indistinguishable from
+    a watchdog that stopped running."""
     now_s = now.strftime("%Y-%m-%dT%H:%M:%S")
     state = load_state(state_path)
     state["last_check"] = now_s
     state["checks"] = int(state.get("checks") or 0) + 1
     previous = state.get("last_state")
-    was_erroring = bool(state.get("probe_error"))
+
+    def _done(observed, action, **extra):
+        save_state(state_path, state)
+        record = {"at": now_s, "state": observed, "action": action}
+        if previous is not None and observed != previous:
+            record["from_state"] = previous
+        record.update({k: v for k, v in extra.items() if v is not None})
+        return state, record
 
     if not token:
         # Fail loud. A watchdog that silently never ran is precisely the
@@ -197,27 +292,15 @@ def _check_locked(state_path, slug, token, last_message_at, now, heal):
             "no SUPERVISOR_TOKEN — the add-on cannot ask Supervisor for the "
             "bridge's state. Check hassio_api/hassio_role in config.yaml."
         )
-        if not was_erroring:
-            _append_event(state, now_s, "probe_error", detail=state["probe_error"])
-        save_state(state_path, state)
-        return state
+        return _done(None, "no_token", detail=state["probe_error"])
 
     try:
         current = _supervisor_get_state(slug, token)
-        if was_erroring:
-            _append_event(state, now_s, "probe_recovered")
         state["probe_error"] = None
     except Exception as e:
         state["probe_error"] = f"could not read bridge state: {e}"
-        # Only the transition into the error is an event. A Supervisor that
-        # stays unreachable for a day must not write 288 rows.
-        if not was_erroring:
-            _append_event(state, now_s, "probe_error", detail=str(e))
-        save_state(state_path, state)
-        return state
+        return _done(None, "probe_failed", detail=str(e))
 
-    if current != previous and previous is not None:
-        _append_event(state, now_s, "state_change", from_state=previous, to_state=current)
     state["last_state"] = current
 
     if current in HEALTHY_STATES:
@@ -237,19 +320,15 @@ def _check_locked(state_path, slug, token, last_message_at, now, heal):
             }
             state.setdefault("blind_windows", []).append(window)
             state["outage"] = None
-            _append_event(
-                state, now_s, "recovered",
-                detail=f"blind window {window['from']} → {window['to']}",
-                restarts=window["restarts"],
-            )
             print(f"[watchdog] bridge recovered — blind window {window['from']} → {window['to']}")
-        save_state(state_path, state)
-        return state
+            return _done(current, "recovered",
+                         detail=f"blind window {window['from']} → {window['to']}",
+                         restarts=window["restarts"])
+        return _done(current, "none")
 
     if current in TRANSIENT_STATES:
         # Mid-transition. Record but do not act; the next pass decides.
-        save_state(state_path, state)
-        return state
+        return _done(current, "waited")
 
     # Not running.
     outage = state.get("outage")
@@ -261,76 +340,98 @@ def _check_locked(state_path, slug, token, last_message_at, now, heal):
             "observed_state": current,
         }
         state["outage"] = outage
-        _append_event(state, now_s, "outage_opened", to_state=current,
-                      last_message_at=last_message_at)
         print(f"[watchdog] bridge is '{current}' — outage opened")
 
-    if heal:
-        try:
-            _supervisor_start(slug, token)
-            outage["restart_attempts"] = int(outage.get("restart_attempts") or 0) + 1
-            outage["last_restart_at"] = now_s
-            state["heals"] = int(state.get("heals") or 0) + 1
-            _append_event(state, now_s, "restart",
-                          attempt=outage["restart_attempts"], observed_state=current)
-            print(f"[watchdog] started bridge (attempt {outage['restart_attempts']})")
-        except Exception as e:
-            outage["last_restart_error"] = str(e)
-            _append_event(state, now_s, "restart_failed", detail=str(e))
-            print(f"[watchdog] start FAILED: {e}")
+    if not heal:
+        return _done(current, "observed_down")
 
-    save_state(state_path, state)
-    return state
+    try:
+        _supervisor_start(slug, token)
+        outage["restart_attempts"] = int(outage.get("restart_attempts") or 0) + 1
+        outage["last_restart_at"] = now_s
+        state["heals"] = int(state.get("heals") or 0) + 1
+        print(f"[watchdog] started bridge (attempt {outage['restart_attempts']})")
+        return _done(current, "restarted", attempt=outage["restart_attempts"])
+    except Exception as e:
+        outage["last_restart_error"] = str(e)
+        print(f"[watchdog] start FAILED: {e}")
+        return _done(current, "restart_failed", detail=str(e))
 
 
 # ── Reporting ───────────────────────────────────────────────────────────────
 
-def summary(state, now=None):
-    """Restart frequency over rolling windows — 'how bad is this actually'.
+def summary(state, log_path=None, now=None, days=CHECK_LOG_RETENTION_DAYS):
+    """"How stable has the bridge been lately" — derived from the check log.
 
-    ⚠️ This undercounts, and the `caveat` field says so out loud rather than
+    Every figure here is a count of *observations*, not an inference from their
+    absence: `checks` is how many times we actually looked, and `healthy_pct` is
+    the share of those looks that found it running. That distinction is the
+    whole point of logging every pass — a watchdog that stopped running shows up
+    as missing checks rather than as apparent perfect health.
+
+    ⚠️ `restarts_*` still undercounts, and `caveat` says so out loud rather than
     letting a reassuring number stand unqualified. The check is a poll, so a
     crash that Supervisor's own add-on watchdog repairs between two polls is
-    never observed: the bridge reads `started` before and `started` after. What
-    is counted here is restarts *this watchdog performed*. Closing that gap
+    never observed — the bridge reads `started` before and `started` after.
+    What is counted is restarts *this watchdog performed*. Closing that gap
     needs the bridge to report its own process start, which is a change to the
     bridge add-on, not to this one.
     """
     now = now or datetime.now()
-    events = state.get("events") or []
+    records = read_checks(log_path, days=days, now=now) if log_path else []
 
-    def _within(kinds, days):
-        cutoff = now - timedelta(days=days)
+    def _at(rec):
+        try:
+            return datetime.fromisoformat(rec["at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _count(pred, within_days=None):
+        cutoff = now - timedelta(days=within_days) if within_days else None
         n = 0
-        for e in events:
-            if e.get("kind") not in kinds:
+        for r in records:
+            if not pred(r):
                 continue
-            try:
-                if datetime.fromisoformat(e["at"]) >= cutoff:
-                    n += 1
-            except (KeyError, TypeError, ValueError):
-                continue
+            if cutoff is not None:
+                ts = _at(r)
+                if ts is None or ts < cutoff:
+                    continue
+            n += 1
         return n
 
-    restarts = [e for e in events if e.get("kind") == "restart"]
-    outages = [e for e in events if e.get("kind") == "outage_opened"]
-    first_at = events[0]["at"] if events else None
+    is_restart = lambda r: r.get("action") == "restarted"
+    # An episode starts on the transition INTO a non-healthy state, which is the
+    # only record that carries a healthy `from_state`.
+    is_episode = lambda r: (r.get("from_state") in HEALTHY_STATES
+                            and r.get("state") not in HEALTHY_STATES)
+
+    observed = [r for r in records if r.get("state")]
+    healthy = [r for r in observed if r.get("state") in HEALTHY_STATES]
+    restarts = [r for r in records if is_restart(r)]
+    actions = {}
+    for r in records:
+        a = r.get("action") or "unknown"
+        actions[a] = actions.get(a, 0) + 1
 
     return {
-        "observed_since": first_at,
+        "window_days": days,
+        "checks_logged": len(records),
+        "first_check": records[0].get("at") if records else None,
         "last_check": state.get("last_check"),
         "last_state": state.get("last_state"),
         "healthy": state.get("last_state") in HEALTHY_STATES and not state.get("outage"),
-        "checks": int(state.get("checks") or 0),
-        "restarts_24h": _within({"restart"}, 1),
-        "restarts_7d": _within({"restart"}, 7),
-        "restarts_30d": _within({"restart"}, 30),
-        "restarts_logged": len(restarts),
+        "healthy_checks": len(healthy),
+        "healthy_pct": round(100.0 * len(healthy) / len(observed), 2) if observed else None,
+        "actions": actions,
+        "restarts_24h": _count(is_restart, 1),
+        "restarts_7d": _count(is_restart, 7),
+        "restarts_30d": _count(is_restart, 30),
+        "last_restart_at": restarts[-1].get("at") if restarts else None,
+        "down_episodes_7d": _count(is_episode, 7),
+        "down_episodes_30d": _count(is_episode, 30),
+        "probe_failures_7d": _count(lambda r: r.get("action") in ("probe_failed", "no_token"), 7),
+        "checks_lifetime": int(state.get("checks") or 0),
         "restarts_lifetime": int(state.get("heals") or 0),
-        "outages_7d": _within({"outage_opened"}, 7),
-        "outages_30d": _within({"outage_opened"}, 30),
-        "outages_logged": len(outages),
-        "last_restart_at": restarts[-1]["at"] if restarts else None,
         "open_outage": bool(state.get("outage")),
         "unacknowledged_blind_windows": len(
             [w for w in state.get("blind_windows", []) if not w.get("acknowledged")]

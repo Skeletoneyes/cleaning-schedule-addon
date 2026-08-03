@@ -141,6 +141,10 @@ BRIDGE_WATCHDOG_ENABLED = bool(OPTIONS.get("bridge_watchdog_enabled", True))
 BRIDGE_WATCHDOG_SLUG = (OPTIONS.get("bridge_watchdog_slug", "") or "").strip()
 BRIDGE_WATCHDOG_INTERVAL_MIN = int(OPTIONS.get("bridge_watchdog_interval_min", 60))
 BRIDGE_WATCHDOG_FILE = DATA_DIR / "bridge_watchdog.json"
+# One JSONL line per liveness check, including the uneventful ones — that is
+# what makes a stable stretch evidence rather than an absence. Trailing 30-day
+# window; see bridge_watchdog.CHECK_LOG_RETENTION_DAYS.
+BRIDGE_CHECK_LOG = DATA_DIR / "bridge_checks.jsonl"
 
 # Append-only record of every booking mutation applied from WhatsApp. Exists so
 # the nightly digest can answer "what did you change while I wasn't looking"
@@ -3084,6 +3088,7 @@ def _watchdog_check_now(heal=True):
         SUPERVISOR_TOKEN,
         last_message_at=last_msg,
         heal=heal,
+        log_path=BRIDGE_CHECK_LOG,
     )
 
 
@@ -3094,10 +3099,12 @@ def _watchdog_summary():
         return {"enabled": False}
     try:
         state = watchdog_mod.load_state(BRIDGE_WATCHDOG_FILE)
-        out = watchdog_mod.summary(state)
+        out = watchdog_mod.summary(state, log_path=BRIDGE_CHECK_LOG)
         out["enabled"] = True
         out["interval_min"] = BRIDGE_WATCHDOG_INTERVAL_MIN
-        out["events"] = (state.get("events") or [])[-50:]
+        # Only a tail here — a 30-day log is ~8,600 records and the snapshot is
+        # already half a megabyte. The full log is at /internal/watchdog/history.
+        out["recent_checks"] = watchdog_mod.read_checks(BRIDGE_CHECK_LOG)[-20:]
         return out
     except Exception as e:
         print(f"[watchdog] summary failed: {e}")
@@ -3436,6 +3443,32 @@ def watchdog_check():
         "blind_windows": state.get("blind_windows"),
         "probe_error": state.get("probe_error"),
         "findings": watchdog_mod.findings(state, date.today().isoformat()),
+    })
+
+
+@app.route("/internal/watchdog/history", methods=["GET"])
+def watchdog_history():
+    """Every liveness check in the retention window, newest last.
+
+    Separate from the snapshot on purpose: at 5-minute polling a 30-day window
+    is ~8,600 records, which has no business riding a payload that already
+    carries the whole booking set. `?days=N` narrows it; `?actions_only=1` drops
+    the uneventful passes when you want the incidents rather than the evidence
+    of stability.
+    """
+    _require_local_or_secret()
+    try:
+        days = int(request.args.get("days", watchdog_mod.CHECK_LOG_RETENTION_DAYS))
+    except ValueError:
+        return jsonify({"error": "days must be an integer"}), 400
+    records = watchdog_mod.read_checks(BRIDGE_CHECK_LOG, days=days)
+    if _truthy(request.args.get("actions_only")):
+        records = [r for r in records if r.get("action") != "none"]
+    state = watchdog_mod.load_state(BRIDGE_WATCHDOG_FILE)
+    return jsonify({
+        "summary": watchdog_mod.summary(state, log_path=BRIDGE_CHECK_LOG, days=days),
+        "count": len(records),
+        "checks": records,
     })
 
 
@@ -4932,6 +4965,11 @@ if __name__ == "__main__":
     # the digest itself is disabled.
     threading.Thread(target=_digest_scheduler, daemon=True, name="digest-scheduler").start()
     if BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG:
+        # Prune once at boot as well as every ~288 checks: a container that
+        # restarts more often than once a day would otherwise never reach the
+        # in-loop counter and the log would grow past its window unnoticed.
+        kept = watchdog_mod.prune_checks(BRIDGE_CHECK_LOG)
+        print(f"[watchdog] check log pruned to {watchdog_mod.CHECK_LOG_RETENTION_DAYS}d — {kept} record(s)")
         threading.Thread(target=_watchdog_scheduler, daemon=True, name="bridge-watchdog").start()
     elif BRIDGE_WATCHDOG_ENABLED:
         print("[watchdog] DISABLED — bridge_watchdog_slug is empty; set it in the add-on options")

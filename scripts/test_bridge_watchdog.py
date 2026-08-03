@@ -8,6 +8,7 @@ the process comes back.
 Run: python3 scripts/test_bridge_watchdog.py
 """
 
+import json
 import sys
 import tempfile
 import unittest
@@ -151,90 +152,126 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("down for 3 day(s)", why)
 
 
-class EventLogTests(WatchdogTests):
-    """The event log answers 'how often does this actually need restarting'.
+class CheckLogTests(WatchdogTests):
+    """Every pass is recorded, not only the eventful ones.
 
-    Its whole value is that it stays sparse: only transitions are recorded, so
-    the log reads as a list of incidents rather than a poll transcript. At a
-    five-minute interval a chatty log would be 288 rows a day.
+    The first design logged transitions only. It was wrong for one reason: an
+    empty sparse log reads identically whether the bridge was solid or the
+    watchdog never ran. Stability has to be evidenced by observations, not
+    inferred from the absence of incidents.
     """
 
-    def test_steady_state_writes_no_events(self):
+    def setUp(self):
+        super().setUp()
+        self.log = Path(self.tmp.name) / "bridge_checks.jsonl"
+
+    def _check(self, **kw):
+        return wd.check(self.path, "slug", "token", log_path=self.log, **kw)
+
+    def test_uneventful_checks_are_still_recorded(self):
         self._wire(FakeSupervisor("started"))
         for _ in range(10):
-            state = wd.check(self.path, "slug", "token")
-        self.assertEqual(state["events"], [])
-        self.assertEqual(wd.summary(state)["restarts_24h"], 0)
+            self._check()
+        recs = wd.read_checks(self.log)
+        self.assertEqual(len(recs), 10)
+        self.assertTrue(all(r["action"] == "none" for r in recs))
+        self.assertTrue(all(r["state"] == "started" for r in recs))
 
-    def test_a_restart_is_recorded_and_counted(self):
-        sup = FakeSupervisor("stopped")
+    def test_a_restart_is_recorded_with_its_action(self):
+        self._wire(FakeSupervisor("stopped"))
+        self._check()
+        rec = wd.read_checks(self.log)[-1]
+        self.assertEqual(rec["action"], "restarted")
+        self.assertEqual(rec["state"], "stopped")
+        self.assertEqual(rec["attempt"], 1)
+
+    def test_transition_records_where_it_came_from(self):
+        sup = FakeSupervisor("started")
         self._wire(sup)
-        state = wd.check(self.path, "slug", "token")
-        kinds = [e["kind"] for e in state["events"]]
-        self.assertIn("outage_opened", kinds)
-        self.assertIn("restart", kinds)
-        s = wd.summary(state)
-        self.assertEqual(s["restarts_24h"], 1)
-        self.assertEqual(s["restarts_7d"], 1)
-        self.assertEqual(s["outages_logged"], 1)
-        self.assertIsNotNone(s["last_restart_at"])
+        self._check()
+        sup.state = "stopped"
+        self._check()
+        rec = wd.read_checks(self.log)[-1]
+        self.assertEqual(rec["from_state"], "started")
+        self.assertEqual(rec["state"], "stopped")
 
-    def test_summary_states_the_undercount_out_loud(self):
-        # A restart Supervisor's own watchdog performs between two polls is
-        # invisible here. A number that quietly undercounts is worse than one
-        # that admits it, so the caveat travels with the figure.
-        self._wire(FakeSupervisor("started"))
-        state = wd.check(self.path, "slug", "token")
-        self.assertIn(">=", wd.summary(state)["caveat"])
+    def test_summary_reports_share_of_healthy_observations(self):
+        sup = FakeSupervisor("started")
+        self._wire(sup)
+        for _ in range(3):
+            self._check()
+        sup.state = "stopped"
+        sup.fail_start = True          # stay down so the state sticks
+        self._check()
+        s = wd.summary(wd.load_state(self.path), log_path=self.log)
+        self.assertEqual(s["checks_logged"], 4)
+        self.assertEqual(s["healthy_checks"], 3)
+        self.assertEqual(s["healthy_pct"], 75.0)
+        self.assertEqual(s["down_episodes_30d"], 1)
 
-    def test_a_persistent_probe_error_logs_once_not_every_poll(self):
+    def test_a_probe_failure_is_logged_on_every_pass(self):
+        # Deliberate change from the sparse design: if Supervisor is unreachable
+        # for six hours, every one of those checks is evidence, and collapsing
+        # them to one line hides the duration.
         sup = FakeSupervisor("started")
         sup.fail_info = True
         self._wire(sup)
-        for _ in range(6):
-            state = wd.check(self.path, "slug", "token")
-        errs = [e for e in state["events"] if e["kind"] == "probe_error"]
-        self.assertEqual(len(errs), 1)
-        # ...and recovery closes it, so the next failure is a fresh event.
-        sup.fail_info = False
-        state = wd.check(self.path, "slug", "token")
-        self.assertEqual([e["kind"] for e in state["events"]][-1], "probe_recovered")
+        for _ in range(5):
+            self._check()
+        recs = wd.read_checks(self.log)
+        self.assertEqual(len(recs), 5)
+        self.assertTrue(all(r["action"] == "probe_failed" for r in recs))
+        s = wd.summary(wd.load_state(self.path), log_path=self.log)
+        self.assertEqual(s["probe_failures_7d"], 5)
 
-    def test_event_log_is_capped(self):
-        state = wd._default_state()
-        for i in range(wd.EVENT_CAP + 50):
-            wd._append_event(state, f"2026-01-01T00:00:{i % 60:02d}", "restart", attempt=i)
-        self.assertEqual(len(state["events"]), wd.EVENT_CAP)
-        # The cap must drop the OLDEST, never the newest.
-        self.assertEqual(state["events"][-1]["attempt"], wd.EVENT_CAP + 49)
+    def test_prune_drops_records_outside_the_trailing_window(self):
+        old = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%S")
+        recent = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+        self.log.write_text(
+            json.dumps({"at": old, "state": "started", "action": "none"}) + "\n"
+            + json.dumps({"at": recent, "state": "started", "action": "none"}) + "\n"
+        )
+        kept = wd.prune_checks(self.log, days=30)
+        self.assertEqual(kept, 1)
+        self.assertEqual([r["at"] for r in wd.read_checks(self.log)], [recent])
+        self.assertEqual(list(self.log.parent.glob("*.tmp")), [])
 
-    def test_summary_survives_a_malformed_timestamp(self):
-        state = wd._default_state()
-        state["events"] = [
-            {"at": "not-a-timestamp", "kind": "restart"},
-            {"kind": "restart"},
-            {"at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "kind": "restart"},
-        ]
-        s = wd.summary(state)          # must not raise
-        self.assertEqual(s["restarts_24h"], 1)
-        self.assertEqual(s["restarts_logged"], 3)
+    def test_a_torn_line_does_not_break_the_history(self):
+        self._wire(FakeSupervisor("started"))
+        self._check()
+        with open(self.log, "a") as f:
+            f.write('{"at": "2026-08-03T10:00:00", "sta')   # killed mid-append
+        self._check()
+        recs = wd.read_checks(self.log)
+        self.assertEqual(len(recs), 2)
+
+    def test_summary_states_the_undercount_out_loud(self):
+        self._wire(FakeSupervisor("started"))
+        self._check()
+        self.assertIn(">=", wd.summary(wd.load_state(self.path), log_path=self.log)["caveat"])
+
+    def test_no_log_path_means_no_log(self):
+        # The log is opt-in at the call site; the state machine must not depend
+        # on it (every existing test calls check() without one).
+        self._wire(FakeSupervisor("started"))
+        wd.check(self.path, "slug", "token")
+        self.assertFalse(self.log.exists())
 
 
 class ConcurrencyTests(WatchdogTests):
     """`check()` has two callers in one process — the scheduler thread and the
     on-demand route — and the route exists to be hit *while* the timer ticks.
-    Unguarded, the loser of an interleave overwrites the winner's events."""
+    Unguarded, the loser of an interleave overwrites the winner's state."""
 
-    def test_concurrent_checks_do_not_lose_events(self):
+    def test_concurrent_checks_do_not_lose_writes(self):
         import threading as _t
-        sup = FakeSupervisor("stopped")
-        self._wire(sup)
-        # Restart attempts accumulate on the open outage; every one must land.
+        log = Path(self.tmp.name) / "bridge_checks.jsonl"
+        self._wire(FakeSupervisor("stopped"))
         barrier = _t.Barrier(8)
 
         def worker():
             barrier.wait()
-            wd.check(self.path, "slug", "token")
+            wd.check(self.path, "slug", "token", log_path=log)
 
         threads = [_t.Thread(target=worker) for _ in range(8)]
         for t in threads:
@@ -243,18 +280,15 @@ class ConcurrencyTests(WatchdogTests):
             t.join()
 
         state = wd.load_state(self.path)
-        restarts = [e for e in state["events"] if e["kind"] == "restart"]
-        self.assertEqual(state["heals"], len(restarts))
+        recs = wd.read_checks(log)
         self.assertEqual(state["checks"], 8)
-        self.assertEqual(wd.summary(state)["restarts_24h"], len(restarts))
+        self.assertEqual(len(recs), 8, "a check was logged but its state write was lost")
+        self.assertEqual(state["heals"], len([r for r in recs if r["action"] == "restarted"]))
 
     def test_save_state_is_atomic(self):
-        # A truncated file resets the entire history, so the write must never
-        # be observable half-done. Proxy: no .tmp residue, file always parses.
         wd.save_state(self.path, {**wd._default_state(), "checks": 7})
         self.assertEqual(wd.load_state(self.path)["checks"], 7)
-        leftovers = list(self.path.parent.glob("*.tmp"))
-        self.assertEqual(leftovers, [])
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

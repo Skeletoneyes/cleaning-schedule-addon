@@ -583,6 +583,38 @@ line sits in a buffer until it fills — they were effectively invisible in
 journald for the whole 1.24–1.25 era. Any past reasoning of the form "the logs
 showed nothing, so that stage was fine" from before 1.26.1 is void.
 
+### Bridge liveness: the check log (1.33.0)
+
+The watchdog polls Supervisor for the bridge's container state every
+`bridge_watchdog_interval_min` (**5**, floor 5, was 60 until 2026-08-03) and
+writes **one JSONL line per pass** to `/data/bridge_checks.jsonl` — including
+the passes where nothing happened. That is deliberate and was a reversal: the
+first cut logged transitions only, until it became clear an empty sparse log
+reads identically whether the bridge was solid or the watchdog never ran.
+Uneventful rows are the evidence of stability; filter them out at read time
+(`?actions_only=1`), don't decline to write them.
+
+- `action` ∈ `none | restarted | restart_failed | recovered | waited |
+  observed_down | probe_failed | no_token`. A record also carries `from_state`
+  when the state changed, so a down-episode is countable.
+- Retention is a **trailing 30 days**, not a row cap — pruned at boot and every
+  288 checks (~daily). ~8,600 records ≈ 530 KB at 63 bytes each.
+- Appends are O(1) (`open(..., "a+")`). ⚠️ `_log_check` repairs a missing
+  trailing newline *before* appending: a write torn by a container kill leaves
+  an unterminated line, and without the repair the next append concatenates
+  onto it and destroys that record too — one interrupted write costing two.
+- Read it at **`GET /internal/watchdog/history?days=N&actions_only=1`** (same
+  `_require_local_or_secret()` auth). It is deliberately NOT in
+  `/internal/snapshot`, which carries only `summary()` plus the last 20 checks
+  — the snapshot already ships every booking and has no business carrying 8,600
+  more records.
+- ⚠️ **`restarts_*` undercounts and says so** in a `caveat` field. Supervisor's
+  own add-on watchdog is enabled on the bridge (`watchdog: true`) and is
+  event-driven, so a crash it repairs between two polls is never observed —
+  ours sees `started` before and `started` after. Counting those needs the
+  bridge to POST its own process start; not built. Any reading of "0 restarts"
+  means "0 restarts *we* performed."
+
 ### Nightly pipeline: sync → push → Telegram (1.24.x)
 
 The nightly job is **sync-then-digest, strictly ordered**, inside the existing
