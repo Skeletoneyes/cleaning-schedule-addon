@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: active
-updated: 2026-08-02T12:45:00-07:00
-progress: 149/156
+updated: 2026-08-03T10:30:00-07:00
+progress: 156/168
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -301,6 +301,28 @@ never silently loses a same-day schedule change again.
 - [x] ISC-153: Every model prompt in the pipeline opens with a dating header stating TODAY and, when different, the message's SEND date.
 - [x] ISC-154: Anti: relative terms resolve against the SEND date, so reprocessing a January message in August cannot re-date it.
 - [x] ISC-155: The nightly job reads the clock exactly once and dates every downstream stage from that value.
+
+### Operational history: restart frequency + operator actions (2026-08-03)
+
+*Provoked by two questions asked an hour apart that turned out to be one question:
+"how often does the bridge actually need restarting?" and "why didn't you know I
+backfilled the transcript yesterday?" Both want a record of **events on the live
+system**. This ISA had 156 criteria about what was built and none about what was
+done to it — verified by probe: `operator`, `operational event`, `restart count`
+and `transcript ingest` returned zero hits across the whole file.*
+
+- [x] ISC-156: The watchdog records every state transition, restart, outage and probe error as a timestamped event, so restart *frequency* is answerable rather than only current state.
+- [x] ISC-157: Anti: a steady healthy state writes no events — at a 5-minute poll a chatty log would be 288 rows a day and would bury the handful that matter.
+- [x] ISC-158: The event log is capped and drops oldest-first, so the state file cannot grow without bound.
+- [x] ISC-159: `summary()` reports restarts over 24h / 7d / 30d windows and outage counts, derived from the event log rather than from the lifetime `heals` counter (which has no time axis).
+- [x] ISC-160: Anti: a malformed stored timestamp must not crash `summary()` — it is skipped, not raised on.
+- [x] ISC-161: Anti: a persistent probe error logs one event on the transition into failure, not one per poll.
+- [x] ISC-162: The restart figure travels with an explicit statement that it **undercounts** — a crash Supervisor's own add-on watchdog repairs between two polls is unobservable to a poll, and a reassuring number that hides that is worse than no number.
+- [ ] ISC-163: The bridge liveness poll runs at 5-minute resolution, cutting worst-case detection lag from 60 minutes to 5.
+- [ ] ISC-164: Operator actions on the live system (transcript ingest, finding dismissal) are recorded **as actions** in an append-only ops log, not left to be inferred from their side effects.
+- [ ] ISC-165: Anti: a failure to write the ops log must never fail the operation it was logging.
+- [ ] ISC-166: The watchdog summary and the ops log are readable off-host via `/internal/snapshot`, so a later session can read what was done to the system instead of reconstructing it from `source:` tags on data rows.
+- [ ] ISC-167: Anti: the reporting helpers must not be able to raise inside `/internal/snapshot` — it is the off-host reconciliation lifeline and must never 500.
 
 ## Test Strategy
 

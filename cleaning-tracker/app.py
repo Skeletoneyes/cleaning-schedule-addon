@@ -58,6 +58,15 @@ GCAL_SERVICE_ACCOUNT_JSON = OPTIONS.get("gcal_service_account_json", "")
 # instead of a print() that journald truncates within a day.
 GCAL_STATUS_FILE = DATA_DIR / "gcal_push_status.json"
 SYNC_STATUS_FILE = DATA_DIR / "sync_status.json"
+# Operator actions on the live system — deliberate human interventions, not
+# scheduled machine work. The ISA records what was *built*; nothing recorded
+# what was *done*, so a repair like "pasted a WhatsApp transcript to refill a
+# blind window" left no trace but a `source: backfill` tag on the rows it
+# created. Reconstructing intent from side effects is exactly the failure this
+# codebase already learned about elsewhere (see CLAUDE.md § GCal push health).
+OPS_LOG_FILE = DATA_DIR / "ops_log.json"
+OPS_LOG_CAP = 500
+OPS_LOG_LOCK = threading.Lock()
 PUSH_STALE_HOURS = 26
 NIGHTLY_PUSH_BUDGET_S = 240
 # How long the nightly repair path will WAIT for gcal.py's _SYNC_LOCK instead
@@ -186,6 +195,46 @@ def _read_gcal_status():
     except Exception as e:
         print(f"[gcal] failed to read push status: {e}")
         return None
+
+
+def _read_ops_log():
+    """Return the operator-action log (oldest first), or [] if absent."""
+    try:
+        if not OPS_LOG_FILE.exists():
+            return []
+        with open(OPS_LOG_FILE) as f:
+            entries = json.load(f)
+        return entries if isinstance(entries, list) else []
+    except Exception as e:
+        print(f"[ops] failed to read ops log: {e}")
+        return []
+
+
+def _log_op(action, **detail):
+    """Append one operator action. Never raises — logging an action must never
+    be able to fail the action itself.
+
+    Locked because this is a read-modify-write on a whole file: the watchdog
+    timer thread and a Flask request thread can both reach it, and an interleave
+    would truncate the log to whatever the loser read. A corrupt file degrades
+    to `[]` on the next read, which loses the history silently — the exact
+    failure this log exists to prevent.
+    """
+    try:
+        with OPS_LOG_LOCK:
+            entries = _read_ops_log()
+            entries.append({
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "action": action,
+                **{k: v for k, v in detail.items() if v is not None},
+            })
+            if len(entries) > OPS_LOG_CAP:
+                del entries[:len(entries) - OPS_LOG_CAP]
+            with open(OPS_LOG_FILE, "w") as f:
+                json.dump(entries, f, indent=2)
+        print(f"[ops] {action} {detail}")
+    except Exception as e:
+        print(f"[ops] failed to log '{action}': {e}")
 
 
 def _write_gcal_status(status):
@@ -2674,6 +2723,8 @@ def internal_snapshot():
         "data": data,
         "gcal_push_status": _read_gcal_status(),
         "sync_status": _read_sync_status(),
+        "bridge_watchdog": _watchdog_summary(),
+        "ops_log": _read_ops_log(),
     })
 
 
@@ -3029,6 +3080,23 @@ def _watchdog_check_now(heal=True):
         last_message_at=last_msg,
         heal=heal,
     )
+
+
+def _watchdog_summary():
+    """Restart-frequency summary for /internal/snapshot. Never raises — a
+    reporting helper must not be able to break the snapshot it rides on."""
+    if not (BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG):
+        return {"enabled": False}
+    try:
+        state = watchdog_mod.load_state(BRIDGE_WATCHDOG_FILE)
+        out = watchdog_mod.summary(state)
+        out["enabled"] = True
+        out["interval_min"] = BRIDGE_WATCHDOG_INTERVAL_MIN
+        out["events"] = (state.get("events") or [])[-50:]
+        return out
+    except Exception as e:
+        print(f"[watchdog] summary failed: {e}")
+        return {"enabled": True, "error": str(e)}
 
 
 def _watchdog_scheduler():
@@ -3391,6 +3459,7 @@ def reconcile_dismiss():
             "reason": reason,
         }
         save_data(data)
+    _log_op("finding_dismissed", finding_id=finding_id, reason=reason or None)
     # Re-run immediately so the cached findings reflect the dismissal.
     _rerun_reconcile_cached()
     if request.form:
@@ -4513,6 +4582,20 @@ def admin_ingest_transcript():
             })
             inserted_ids.append(mid)
         save_data(data)
+
+    # The operator action, recorded as an action. Without this the only trace a
+    # transcript repair leaves is a `source: backfill` tag on the rows, which
+    # says a paste happened but never says when, how much, or which chat.
+    _log_op(
+        "transcript_ingested",
+        group=group_jid,
+        parsed_entries=len(entries),
+        inserted=len(inserted_ids),
+        skipped_duplicates=skipped,
+        applied=apply_flag,
+        earliest=entries[0]["timestamp"] if entries else None,
+        latest=entries[-1]["timestamp"] if entries else None,
+    )
 
     def _run():
         with INGEST_LOCK:

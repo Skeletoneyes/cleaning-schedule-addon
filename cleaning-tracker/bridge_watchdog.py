@@ -45,6 +45,14 @@ SUPERVISOR_BASE = "http://supervisor"
 HEALTHY_STATES = {"started"}
 TRANSIENT_STATES = {"startup", "starting", "unknown"}
 
+# The event log answers "how often does this thing actually need restarting",
+# which neither the running counters nor the blind windows can: `heals` is a
+# lifetime total with no time axis, and a blind window only exists for outages
+# long enough to also lose messages. Capped because this file is rewritten in
+# full on every pass and an unbounded list would grow without limit; 500 events
+# is years of a healthy bridge and still months of a sick one.
+EVENT_CAP = 500
+
 
 # ── State persistence ───────────────────────────────────────────────────────
 
@@ -57,6 +65,7 @@ def _default_state():
         "probe_error": None,
         "checks": 0,
         "heals": 0,
+        "events": [],
     }
 
 
@@ -81,6 +90,23 @@ def save_state(path, state):
         Path(path).write_text(json.dumps(state, indent=2))
     except OSError as e:
         print(f"[watchdog] failed to persist state: {e}")
+
+
+def _append_event(state, at, kind, **fields):
+    """Record one thing that happened, append-only.
+
+    Only *transitions* are logged, never the steady state — a healthy bridge
+    polled every five minutes would otherwise write 288 identical rows a day and
+    bury the six that matter. So a run of `started` observations produces no
+    events at all, and the log reads as a list of incidents.
+    """
+    event = {"at": at, "kind": kind}
+    event.update({k: v for k, v in fields.items() if v is not None})
+    events = state.setdefault("events", [])
+    events.append(event)
+    if len(events) > EVENT_CAP:
+        del events[:len(events) - EVENT_CAP]
+    return event
 
 
 # ── Supervisor calls ────────────────────────────────────────────────────────
@@ -124,6 +150,8 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
     state = load_state(state_path)
     state["last_check"] = now_s
     state["checks"] = int(state.get("checks") or 0) + 1
+    previous = state.get("last_state")
+    was_erroring = bool(state.get("probe_error"))
 
     if not token:
         # Fail loud. A watchdog that silently never ran is precisely the
@@ -133,17 +161,27 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
             "no SUPERVISOR_TOKEN — the add-on cannot ask Supervisor for the "
             "bridge's state. Check hassio_api/hassio_role in config.yaml."
         )
+        if not was_erroring:
+            _append_event(state, now_s, "probe_error", detail=state["probe_error"])
         save_state(state_path, state)
         return state
 
     try:
         current = _supervisor_get_state(slug, token)
+        if was_erroring:
+            _append_event(state, now_s, "probe_recovered")
         state["probe_error"] = None
     except Exception as e:
         state["probe_error"] = f"could not read bridge state: {e}"
+        # Only the transition into the error is an event. A Supervisor that
+        # stays unreachable for a day must not write 288 rows.
+        if not was_erroring:
+            _append_event(state, now_s, "probe_error", detail=str(e))
         save_state(state_path, state)
         return state
 
+    if current != previous and previous is not None:
+        _append_event(state, now_s, "state_change", from_state=previous, to_state=current)
     state["last_state"] = current
 
     if current in HEALTHY_STATES:
@@ -163,6 +201,11 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
             }
             state.setdefault("blind_windows", []).append(window)
             state["outage"] = None
+            _append_event(
+                state, now_s, "recovered",
+                detail=f"blind window {window['from']} → {window['to']}",
+                restarts=window["restarts"],
+            )
             print(f"[watchdog] bridge recovered — blind window {window['from']} → {window['to']}")
         save_state(state_path, state)
         return state
@@ -182,6 +225,8 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
             "observed_state": current,
         }
         state["outage"] = outage
+        _append_event(state, now_s, "outage_opened", to_state=current,
+                      last_message_at=last_message_at)
         print(f"[watchdog] bridge is '{current}' — outage opened")
 
     if heal:
@@ -190,13 +235,77 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True):
             outage["restart_attempts"] = int(outage.get("restart_attempts") or 0) + 1
             outage["last_restart_at"] = now_s
             state["heals"] = int(state.get("heals") or 0) + 1
+            _append_event(state, now_s, "restart",
+                          attempt=outage["restart_attempts"], observed_state=current)
             print(f"[watchdog] started bridge (attempt {outage['restart_attempts']})")
         except Exception as e:
             outage["last_restart_error"] = str(e)
+            _append_event(state, now_s, "restart_failed", detail=str(e))
             print(f"[watchdog] start FAILED: {e}")
 
     save_state(state_path, state)
     return state
+
+
+# ── Reporting ───────────────────────────────────────────────────────────────
+
+def summary(state, now=None):
+    """Restart frequency over rolling windows — 'how bad is this actually'.
+
+    ⚠️ This undercounts, and the `caveat` field says so out loud rather than
+    letting a reassuring number stand unqualified. The check is a poll, so a
+    crash that Supervisor's own add-on watchdog repairs between two polls is
+    never observed: the bridge reads `started` before and `started` after. What
+    is counted here is restarts *this watchdog performed*. Closing that gap
+    needs the bridge to report its own process start, which is a change to the
+    bridge add-on, not to this one.
+    """
+    now = now or datetime.now()
+    events = state.get("events") or []
+
+    def _within(kinds, days):
+        cutoff = now - timedelta(days=days)
+        n = 0
+        for e in events:
+            if e.get("kind") not in kinds:
+                continue
+            try:
+                if datetime.fromisoformat(e["at"]) >= cutoff:
+                    n += 1
+            except (KeyError, TypeError, ValueError):
+                continue
+        return n
+
+    restarts = [e for e in events if e.get("kind") == "restart"]
+    outages = [e for e in events if e.get("kind") == "outage_opened"]
+    first_at = events[0]["at"] if events else None
+
+    return {
+        "observed_since": first_at,
+        "last_check": state.get("last_check"),
+        "last_state": state.get("last_state"),
+        "healthy": state.get("last_state") in HEALTHY_STATES and not state.get("outage"),
+        "checks": int(state.get("checks") or 0),
+        "restarts_24h": _within({"restart"}, 1),
+        "restarts_7d": _within({"restart"}, 7),
+        "restarts_30d": _within({"restart"}, 30),
+        "restarts_logged": len(restarts),
+        "restarts_lifetime": int(state.get("heals") or 0),
+        "outages_7d": _within({"outage_opened"}, 7),
+        "outages_30d": _within({"outage_opened"}, 30),
+        "outages_logged": len(outages),
+        "last_restart_at": restarts[-1]["at"] if restarts else None,
+        "open_outage": bool(state.get("outage")),
+        "unacknowledged_blind_windows": len(
+            [w for w in state.get("blind_windows", []) if not w.get("acknowledged")]
+        ),
+        "probe_error": state.get("probe_error"),
+        "caveat": (
+            "Counts restarts performed by this watchdog only. A crash repaired "
+            "by Supervisor's own add-on watchdog between two polls is invisible "
+            "here — the true restart count is >= this one."
+        ),
+    }
 
 
 # ── Findings ────────────────────────────────────────────────────────────────

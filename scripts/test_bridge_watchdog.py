@@ -151,5 +151,74 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("down for 3 day(s)", why)
 
 
+class EventLogTests(WatchdogTests):
+    """The event log answers 'how often does this actually need restarting'.
+
+    Its whole value is that it stays sparse: only transitions are recorded, so
+    the log reads as a list of incidents rather than a poll transcript. At a
+    five-minute interval a chatty log would be 288 rows a day.
+    """
+
+    def test_steady_state_writes_no_events(self):
+        self._wire(FakeSupervisor("started"))
+        for _ in range(10):
+            state = wd.check(self.path, "slug", "token")
+        self.assertEqual(state["events"], [])
+        self.assertEqual(wd.summary(state)["restarts_24h"], 0)
+
+    def test_a_restart_is_recorded_and_counted(self):
+        sup = FakeSupervisor("stopped")
+        self._wire(sup)
+        state = wd.check(self.path, "slug", "token")
+        kinds = [e["kind"] for e in state["events"]]
+        self.assertIn("outage_opened", kinds)
+        self.assertIn("restart", kinds)
+        s = wd.summary(state)
+        self.assertEqual(s["restarts_24h"], 1)
+        self.assertEqual(s["restarts_7d"], 1)
+        self.assertEqual(s["outages_logged"], 1)
+        self.assertIsNotNone(s["last_restart_at"])
+
+    def test_summary_states_the_undercount_out_loud(self):
+        # A restart Supervisor's own watchdog performs between two polls is
+        # invisible here. A number that quietly undercounts is worse than one
+        # that admits it, so the caveat travels with the figure.
+        self._wire(FakeSupervisor("started"))
+        state = wd.check(self.path, "slug", "token")
+        self.assertIn(">=", wd.summary(state)["caveat"])
+
+    def test_a_persistent_probe_error_logs_once_not_every_poll(self):
+        sup = FakeSupervisor("started")
+        sup.fail_info = True
+        self._wire(sup)
+        for _ in range(6):
+            state = wd.check(self.path, "slug", "token")
+        errs = [e for e in state["events"] if e["kind"] == "probe_error"]
+        self.assertEqual(len(errs), 1)
+        # ...and recovery closes it, so the next failure is a fresh event.
+        sup.fail_info = False
+        state = wd.check(self.path, "slug", "token")
+        self.assertEqual([e["kind"] for e in state["events"]][-1], "probe_recovered")
+
+    def test_event_log_is_capped(self):
+        state = wd._default_state()
+        for i in range(wd.EVENT_CAP + 50):
+            wd._append_event(state, f"2026-01-01T00:00:{i % 60:02d}", "restart", attempt=i)
+        self.assertEqual(len(state["events"]), wd.EVENT_CAP)
+        # The cap must drop the OLDEST, never the newest.
+        self.assertEqual(state["events"][-1]["attempt"], wd.EVENT_CAP + 49)
+
+    def test_summary_survives_a_malformed_timestamp(self):
+        state = wd._default_state()
+        state["events"] = [
+            {"at": "not-a-timestamp", "kind": "restart"},
+            {"kind": "restart"},
+            {"at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "kind": "restart"},
+        ]
+        s = wd.summary(state)          # must not raise
+        self.assertEqual(s["restarts_24h"], 1)
+        self.assertEqual(s["restarts_logged"], 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

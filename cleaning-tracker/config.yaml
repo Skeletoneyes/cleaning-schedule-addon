@@ -1,5 +1,5 @@
 name: Cleaning Schedule Tracker
-version: "1.31.1"
+version: "1.32.0"
 slug: cleaning-tracker
 description: Airbnb cleaning schedule tracker with iCal sync and AI-powered WhatsApp parsing
 init: false
@@ -45,7 +45,7 @@ options:
   phone_notify_service: ""
   bridge_watchdog_enabled: true
   bridge_watchdog_slug: ""
-  bridge_watchdog_interval_min: 60
+  bridge_watchdog_interval_min: 5
   repeat_horizon_days: 21
   review_expiry_days: 7
   digest_include_quotes: false
