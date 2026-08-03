@@ -1790,6 +1790,11 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
   <button class="tab" onclick="showTab('conflicts-tab', this)" id="conflicts-tab-btn">
     Conflicts{% if conflicts_attn %} <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:0.75rem;margin-left:4px;">{{ conflicts_attn }}</span>{% endif %}
   </button>
+  {% if bridge_enabled %}
+  <button class="tab" onclick="showTab('bridge-tab', this)" id="bridge-tab-btn">
+    Bridge <span title="{{ 'Running' if bridge_up else 'NOT running' }}" style="display:inline-block;width:9px;height:9px;border-radius:50%;margin-left:5px;vertical-align:middle;background:{{ '#28a745' if bridge_up else '#dc3545' }};"></span>
+  </button>
+  {% endif %}
 </div>
 
 <div id="notify-tab" class="panel active">
@@ -1917,6 +1922,122 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
   {% endif %}
 </div>
 
+{% if bridge_enabled %}
+<div id="bridge-tab" class="panel">
+  <style>
+    .bw-hero { display:flex; align-items:center; gap:12px; padding:14px 16px; border-radius:8px;
+               margin-bottom:14px; border:1px solid #e3e3e3; }
+    .bw-hero.up   { background:#eef9f1; border-color:#c3e6cd; }
+    .bw-hero.down { background:#fdecee; border-color:#f5c2c7; }
+    .bw-dot { width:14px; height:14px; border-radius:50%; flex:none; }
+    .bw-stats { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:16px; }
+    .bw-stat { flex:1 1 130px; border:1px solid #e6e6e6; border-radius:8px; padding:10px 12px; background:#fff; }
+    .bw-stat .n { font-size:1.4rem; font-weight:700; line-height:1.1; }
+    .bw-stat .l { font-size:0.75rem; color:#777; margin-top:2px; }
+    .bw-strip { display:flex; gap:3px; margin:6px 0 4px; }
+    .bw-day { flex:1 1 0; height:34px; border-radius:3px; min-width:6px; }
+    .bw-day.ok      { background:#28a745; }
+    .bw-day.partial { background:#28a745; opacity:.42; }
+    .bw-day.warn    { background:#fd7e14; }
+    .bw-day.bad     { background:#dc3545; }
+    .bw-day.nodata  { background:#e0e0e0; }
+    .bw-legend { font-size:0.75rem; color:#777; display:flex; flex-wrap:wrap; gap:12px; margin-top:6px; }
+    .bw-legend span::before { content:''; display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:4px; }
+    .bw-tbl { width:100%; border-collapse:collapse; font-size:0.85rem; }
+    .bw-tbl th { text-align:left; font-size:0.72rem; text-transform:uppercase; color:#888; padding:4px 6px; }
+    .bw-tbl td { padding:5px 6px; border-top:1px solid #eee; }
+    .bw-act { font-weight:600; }
+    .bw-act.restarted, .bw-act.restart_failed, .bw-act.observed_down { color:#dc3545; }
+    .bw-act.recovered { color:#28a745; }
+    .bw-act.probe_failed, .bw-act.no_token { color:#fd7e14; }
+  </style>
+
+  {% if bridge_error %}
+    <div class="focus-card empty-state"><div style="color:#dc3545;">Could not read watchdog state: {{ bridge_error }}</div></div>
+  {% else %}
+  <div class="bw-hero {{ 'up' if bridge_up else 'down' }}">
+    <div class="bw-dot" style="background:{{ '#28a745' if bridge_up else '#dc3545' }};"></div>
+    <div>
+      <div style="font-weight:700;font-size:1.05rem;">
+        WhatsApp bridge is {{ 'running' if bridge_up else 'NOT running' }}
+      </div>
+      <div style="font-size:0.82rem;color:#666;">
+        Last checked {{ bridge.last_check or 'never' }} · every {{ bridge.interval_min or '?' }} min
+        {% if bridge.probe_error %} · <span style="color:#dc3545;">{{ bridge.probe_error }}</span>{% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="bw-stats">
+    <div class="bw-stat">
+      <div class="n">{% if bridge.healthy_pct is not none %}{{ bridge.healthy_pct }}%{% else %}—{% endif %}</div>
+      <div class="l">checks found it up</div>
+    </div>
+    <div class="bw-stat">
+      <div class="n">{{ bridge.restarts_7d if bridge.restarts_7d is not none else '—' }}</div>
+      <div class="l">restarts, last 7 days</div>
+    </div>
+    <div class="bw-stat">
+      <div class="n">{{ bridge.restarts_30d if bridge.restarts_30d is not none else '—' }}</div>
+      <div class="l">restarts, last 30 days</div>
+    </div>
+    <div class="bw-stat">
+      <div class="n">{{ bridge.down_episodes_30d if bridge.down_episodes_30d is not none else '—' }}</div>
+      <div class="l">times it went down</div>
+    </div>
+    <div class="bw-stat">
+      <div class="n">{{ bridge.checks_logged or 0 }}</div>
+      <div class="l">checks recorded</div>
+    </div>
+  </div>
+
+  <div style="font-weight:600;font-size:0.9rem;margin-bottom:2px;">Last 30 days</div>
+  <div class="bw-strip">
+    {% for d in bridge_days %}<div class="bw-day {{ d.cls }}" title="{{ d.label }}"></div>{% endfor %}
+  </div>
+  <div style="display:flex;justify-content:space-between;font-size:0.72rem;color:#999;">
+    <span>{{ bridge_days[0].date if bridge_days else '' }}</span><span>today</span>
+  </div>
+  <div class="bw-legend">
+    <span style="--c:#28a745;"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#28a745;margin-right:4px;"></i>all healthy</span>
+    <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#28a745;opacity:.42;margin-right:4px;"></i>fewer checks than expected</span>
+    <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#fd7e14;margin-right:4px;"></i>seen unhealthy</span>
+    <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#dc3545;margin-right:4px;"></i>restarted</span>
+    <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#e0e0e0;margin-right:4px;"></i>no checks recorded</span>
+  </div>
+
+  <div style="font-weight:600;font-size:0.9rem;margin:18px 0 4px;">
+    Things that happened{% if bridge_actions %} ({{ bridge_actions|length }}){% endif %}
+  </div>
+  {% if bridge_actions %}
+  <table class="bw-tbl">
+    <tr><th>When</th><th>State</th><th>Action</th><th>Detail</th></tr>
+    {% for a in bridge_actions %}
+    <tr>
+      <td style="white-space:nowrap;">{{ a.at|replace('T',' ') }}</td>
+      <td>{{ a.state or '—' }}{% if a.from_state %} <span style="color:#999;">(was {{ a.from_state }})</span>{% endif %}</td>
+      <td class="bw-act {{ a.action }}">{{ a.action|replace('_',' ') }}</td>
+      <td style="color:#666;">{{ a.detail or '' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div style="font-size:0.85rem;color:#666;padding:10px 0;">
+    Nothing but healthy checks in the window — no restarts, no outages, no failed probes.
+  </div>
+  {% endif %}
+
+  <div style="font-size:0.75rem;color:#888;margin-top:16px;line-height:1.5;border-top:1px solid #eee;padding-top:10px;">
+    ⚠️ Restart counts are the ones <em>this</em> watchdog performed. Home Assistant's own
+    add-on watchdog is also enabled on the bridge and reacts faster than this 5-minute
+    check, so a crash it repairs in between is never seen here — the real number is at
+    least this one, possibly higher. A grey day means no checks were recorded at all,
+    which is a gap in the evidence rather than a healthy day.
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
 <script>
 function showTab(id, btn) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -1932,6 +2053,10 @@ if (location.hash === '#review') {
 } else if (location.hash === '#conflicts') {
   document.addEventListener('DOMContentLoaded', function() {
     showTab('conflicts-tab', document.getElementById('conflicts-tab-btn'));
+  });
+} else if (location.hash === '#bridge') {
+  document.addEventListener('DOMContentLoaded', function() {
+    showTab('bridge-tab', document.getElementById('bridge-tab-btn'));
   });
 }
 </script>
@@ -2472,6 +2597,7 @@ def index():
     ctx = build_focus_context(data, request.args.get("i", 0))
     review = _build_review_context(data)
     conflicts = _build_conflicts_context()
+    bridge = _build_bridge_context()
     return render_template_string(
         FOCUS_TEMPLATE,
         error=request.args.get("error"),
@@ -2479,7 +2605,90 @@ def index():
         **ctx,
         **review,
         **conflicts,
+        **bridge,
     )
+
+
+def _build_bridge_context():
+    """Bridge stability for the home page.
+
+    This exists because the check log was built API-only, and an operator who
+    will never run a curl command has no way to see it — a health signal nobody
+    looks at is the same as no health signal, which is the mistake this whole
+    subsystem exists to correct. So it renders where the rest of the app lives.
+
+    The per-day strip is the point: one cell per day for 30 days. A day with no
+    checks renders GREY rather than green, because "we never looked" and "it was
+    fine" are the two things this must never conflate.
+    """
+    if not (BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG):
+        return {"bridge_enabled": False, "bridge_days": [], "bridge_actions": [],
+                "bridge": {}, "bridge_up": None}
+    try:
+        state = watchdog_mod.load_state(BRIDGE_WATCHDOG_FILE)
+        summary = watchdog_mod.summary(state, log_path=BRIDGE_CHECK_LOG)
+        records = watchdog_mod.read_checks(BRIDGE_CHECK_LOG, days=30)
+    except Exception as e:
+        print(f"[bridge-ui] context failed: {e}")
+        return {"bridge_enabled": True, "bridge_error": str(e), "bridge_days": [],
+                "bridge_actions": [], "bridge": {}, "bridge_up": None}
+
+    per_day = {}
+    for r in records:
+        day = (r.get("at") or "")[:10]
+        if not day:
+            continue
+        bucket = per_day.setdefault(day, {"total": 0, "healthy": 0, "restarts": 0, "bad": 0})
+        bucket["total"] += 1
+        if r.get("state") in watchdog_mod.HEALTHY_STATES:
+            bucket["healthy"] += 1
+        else:
+            bucket["bad"] += 1
+        if r.get("action") in ("restarted", "restart_failed"):
+            bucket["restarts"] += 1
+
+    # A full day at the configured interval. Anything well short of it means the
+    # watchdog itself was not running, which is a gap in the evidence, not health.
+    per_day_expected = max(1, int(24 * 60 / max(5, BRIDGE_WATCHDOG_INTERVAL_MIN)))
+    now = datetime.now()
+    today = date.today()
+    days = []
+    for offset in range(29, -1, -1):
+        d = (today - timedelta(days=offset)).isoformat()
+        b = per_day.get(d)
+        # Today is only partly over, so pro-rate what "a full day" means for it.
+        # Without this the cell the operator looks at most — today's — is
+        # permanently amber-ish and the strip cries wolf every single day.
+        if offset == 0:
+            elapsed = max(0.04, (now.hour * 60 + now.minute) / 1440.0)
+        else:
+            elapsed = 1.0
+        expected = max(1, int(per_day_expected * elapsed))
+
+        if not b or b["total"] == 0:
+            cls, label = "nodata", "no checks recorded"
+        elif b["restarts"]:
+            cls, label = "bad", f"{b['restarts']} restart(s), {b['total']} checks"
+        elif b["bad"]:
+            cls, label = "warn", f"{b['bad']} unhealthy of {b['total']} checks"
+        elif b["total"] < expected * 0.9:
+            cls, label = "partial", f"only {b['total']} of ~{expected} expected checks — watchdog gap"
+        else:
+            cls, label = "ok", f"{b['total']} checks, all healthy"
+        days.append({"date": d, "cls": cls, "label": f"{d}: {label}"})
+
+    actions = [r for r in records if r.get("action") != "none"]
+    actions = list(reversed(actions[-25:]))
+
+    return {
+        "bridge_enabled": True,
+        "bridge_error": None,
+        "bridge": summary,
+        "bridge_up": bool(summary.get("healthy")),
+        "bridge_days": days,
+        "bridge_actions": actions,
+        "bridge_expected_per_day": expected,
+    }
 
 
 def _build_conflicts_context():

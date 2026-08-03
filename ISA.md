@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-03T10:30:00-07:00
-progress: 168/177
+progress: 175/184
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -332,6 +332,13 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-174: Anti: a write torn before its newline must cost at most the record it was writing — it must not concatenate the next append onto itself and destroy that one too.
 - [x] ISC-175: `summary()` reports the share of checks that found the bridge healthy, so a watchdog that silently stopped running reads as missing checks rather than as apparent perfect health.
 - [x] ISC-176: The full check history is served from its own endpoint, not from `/internal/snapshot` — an ~8,600-record log must not ride a payload that already carries every booking.
+- [x] ISC-177: The Telegram digest must render EVERY finding pushed — the triage model returns JSON citing finding ids per bullet, and coverage is a set-equality check in code, not a hope about prose.
+- [x] ISC-178: Anti: a triage result that drops, invents, or double-cites a finding id is REJECTED and the deterministic formatter takes over — it renders all findings unconditionally.
+- [x] ISC-179: Anti: a fallback to deterministic formatting is stated in the message itself — a silent downgrade is how the original defect hid, since both outputs looked well-formed.
+- [x] ISC-180: Bridge stability is visible **inside the cleaning app**, not only via the API — a health signal the operator will not go and fetch is the same as no health signal.
+- [x] ISC-181: The 30-day strip renders a day with NO recorded checks as GREY, never green — "we never looked" and "it was fine" must never render alike.
+- [x] ISC-182: Anti: today's cell must be judged against the fraction of the day elapsed, not a full day — otherwise the most-viewed cell is permanently degraded and the strip cries wolf daily.
+- [x] ISC-183: Anti: the bridge panel must not be able to break the home page — its context builder returns a rendered error state rather than raising.
 
 ## Test Strategy
 
@@ -466,6 +473,10 @@ and `transcript ingest` returned zero hits across the whole file.*
 - 2026-08-03 12:26: Shipped 1.32.1 + 1.33.0 as a **single** add-on update on Josh's explicit instruction, mid-turnover rather than after it. One restart, not two — 1.33.0's tree already contains the 1.32.1 lock fix, so updating once carried both and halved the exposure. The stated risk was accepted knowingly: the bridge's `forward()` has no retry, so an inbound WhatsApp message landing during the restart is dropped permanently, and a cleaner was on site. Recorded because the reasoning matters more than the outcome — the message watermark was unchanged across the deploy (636 messages, newest 2026-07-30T12:35), which shows nothing WAS lost but could never have shown that nothing COULD be.
 
 ## Changelog
+- 2026-08-03 | conjectured: shipping the check log behind `GET /internal/watchdog/history` delivered the stability record that was asked for.
+  refuted by: Josh — *"I'm never going to do curl commands to read something like this."* True and predictable: the operator's interface to this system is the add-on's web UI, and everything else in it lives there. An API-only health signal is one nobody looks at.
+  learned: **a monitoring feature is not delivered until it is delivered to where the human already is.** This project already had the lesson in a different costume — a finding that landed in HA persistent notifications rather than Telegram was "indistinguishable from no detection" — and I re-made it one layer down, in the instrument built to fix the first version. The reach question ("who sees this, where, without being told to look") belongs in the design, not in a follow-up.
+  criterion now: ISC-180, ISC-181.
 - 2026-08-03 | conjectured: logging only transitions was right, because a 5-minute poll writing 288 rows a day would bury the handful of rows that matter.
   refuted by: Josh, asking for the opposite — every check, with its action, on a trailing 30 days. The sparse design has a defect the volume argument hid: **an empty log is ambiguous.** Zero incidents and a watchdog that never ran render identically, which is the same "silence is indistinguishable from death" failure this project already has a Principle about, reappearing one level up in the instrument built to detect it.
   learned: **for an availability record, the uneventful observations ARE the signal.** 8,640 consecutive `started / none` rows is a claim with evidence behind it; an empty file is only a claim. Optimising a log for readability at the cost of its evidentiary value is the wrong trade — read the incidents through a filter (`?actions_only=1`), don't refuse to write the evidence. Corollary on volume: the objection was really about write cost, and that is solved by an append-only JSONL (O(1) per pass) rather than by recording less.
@@ -604,6 +615,8 @@ and `transcript ingest` returned zero hits across the whole file.*
 - ISC-167: happy-path live probe (snapshot returned 200 with both new keys) plus structural — both `_watchdog_summary()` and `_read_ops_log()` swallow their own exceptions and degrade to `{"enabled": True, "error": ...}` / `[]`.
 - ISC-168, ISC-169: unit — `ConcurrencyTests` (8 threads through a `Barrier` into `check()`): `heals` equals the count of `restart` events and `checks == 8`, i.e. no thread's write was lost. Suite now **38 tests, OK**.
 - ISC-171..175: unit — `CheckLogTests` (10 tests) covers uneventful passes still being logged, action + `from_state` capture, `healthy_pct` from observations, per-pass probe-failure logging, trailing-window prune, and torn-line recovery. Suite **41 tests, OK**. Volume simulated at full scale: 8,640 records = 532 KB, 63 bytes/record, prune drops a 45-day-old row and keeps 8,640.
+- ISC-177..179: unit — `renderTriageResult()` coverage suite in `~/dev/pai-telegram-bot/test/cleaning.test.ts` (8 cases: full coverage renders the model's wording; a dropped finding throws `dropped N finding(s)`; invented id throws; double-cite throws; prose throws; fenced JSON tolerated; empty section renders `none`; malformed bullet rejected) plus 3 service-level cases proving the dropped finding still reaches Telegram via the fallback and the message says so. **Bot suite 122 pass / 0 fail, `tsc --noEmit` clean.** The pre-existing "SDK succeeds -> sends verbatim" test was rewritten: it fed prose, which now falls back, so it had started passing through the fallback path while claiming to test the happy path.
+- ISC-180..183: rendered offline against a seeded 30-day log (8,352 records incl. a restart day and a day with no checks at all) through the real `FOCUS_TEMPLATE`: 21,768 bytes, tab + panel + strip + stats + caveat all present; day cells `{ok: 29, nodata: 1}`; the watchdog-gap day reads `2026-07-14: no checks recorded` in grey; today reads `151 checks, all healthy` in green after pro-rating.
 - ISC-176: live — 1.33.0 deployed 2026-08-03 12:26 (Supervisor: `{"version":"1.33.0","state":"started","interval":5}`). `GET /internal/watchdog/history?days=1` → **HTTP 200**, `count: 1`, first record `{"at":"2026-08-03T12:26:26","state":"started","action":"none"}` — the startup pass, logged although nothing happened, which is the criterion. `/internal/snapshot` carries `summary` + `recent_checks` (1) and no longer carries `events`. Boot prune fired clean: `[watchdog] check log pruned to 30d — 0 record(s)`. Ops log survived the restart with both dismissals intact.
 - ISC-164: live — two real dismissals (the stale blind-window and the Itzel false alarm) at 2026-08-03 10:35, authorised by Josh. `/internal/snapshot` → `ops_log` holds both entries with `action: finding_dismissed`, the finding id, and the reason; `/reconcile/last` drops 16 → 14 findings with only genuine `drift` remaining. No synthetic write was ever made — a fake entry in an audit log is worse than an empty one.
 - ISC-165: `[DEFERRED-VERIFY]` — structural only (`_log_op` wraps its whole body in `try/except` and is called after `save_data()` has committed). Proving it needs fault injection: make `OPS_LOG_FILE` unwritable, dismiss a finding, confirm the dismissal still lands. Follow-up: bundle with the 1.32.1 deploy tonight.
