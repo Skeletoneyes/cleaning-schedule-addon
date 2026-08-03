@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-03T10:30:00-07:00
-progress: 163/171
+progress: 162/171
 ---
 
 # Cleaning Schedule Tracker — Project ISA
