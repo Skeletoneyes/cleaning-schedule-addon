@@ -228,8 +228,33 @@ proposals) was removed 2026-07-21 at Josh's request — superseded by
   classic `parse_whatsapp_message` (routing decision for one booking) AND
   `facts_mod.extract_facts` (every scheduling assertion in the message,
   for the reconciler). Facts are stored regardless of parse outcome.
-- Auto-apply gate (parse path): `confidence ≥ 0.85` AND known cleaner
-  JID AND known booking → writes to booking. Everything else → Review tab.
+- Auto-apply gate (parse path, `_auto_apply_decision` — pure, unit-tested):
+  `confidence ≥ 0.85` AND known cleaner JID AND known booking AND
+  **`cleaning_date` == the booking's `end`** → writes to booking. Everything
+  else → Review tab, with the date disagreement spelled out on the card.
+- **⚠️ `confidence` does not mean "this is the right booking."** It is the
+  model's certainty about its *reading of the sentence*, and on the 2026-08-05
+  message that started this it was 0.90 and the reading was correct — a known
+  cleaner really was confirming a real cleaning. What no self-reported score
+  can express is whether the uid it chose is the right row, because until
+  1.35.0 nothing had ever compared that uid to anything. Hence the separate
+  `cleaning_date`: the model names the day in its own words, and two fields
+  that must agree can catch what one confident number cannot.
+- **The candidate list is CLEANINGS, not reservations** (`upcoming_booking_list`).
+  It emits one row, one date — `{uid, cleaning_date, weekday, when,
+  current_cleaner}` — and deliberately does **not** emit `checkin`. 53% of
+  cleanings here fall on a day that is also the next guest's check-in, so the
+  old reservation shape (`{checkin, checkout, label: "Aug 05 → Aug 10"}`) put
+  today's date on two different rows on most cleaning days. 16 of 48
+  auto-applied confirmations had landed on the stay that *started* that day,
+  including "I'm here", "I'm done" and "see u today". **Do not add `checkin`
+  back** — the prompt already said "checkout date = cleaning day" and lost to
+  the payload, so the fix had to be in the data, not the wording.
+- The list is anchored on `_msg_local_day(msg)`, the **local** send day, not
+  `date.today()` and not `ts[:10]`. Live timestamps are UTC, so any message
+  sent after ~17:00 Vancouver carries tomorrow's UTC date; slicing the string
+  would label the wrong row "today" and silently re-date every relative term.
+  Backfilled naive timestamps pass through unchanged.
 - Review tab UI: pending-message queue with accept/override/ignore; group
   label editor; unmapped-sender flow (map to existing cleaner OR create new,
   then re-queue that sender's pending messages).

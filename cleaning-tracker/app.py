@@ -616,30 +616,95 @@ def sync_ical():
 AUTO_APPLY_CONFIDENCE = 0.85
 
 
-def upcoming_booking_list(bookings):
-    """Booking list shown to the LLM — checkout within recent past + future."""
-    today = date.today()
+def _msg_local_day(msg, default=None):
+    """The LOCAL calendar day a message was sent, or `default`.
+
+    Distinct from `_msg_day`, which slices `ts[:10]` off the raw string and is
+    correct for the history windows that use it (day-granularity, ±1 day is
+    noise). Here ±1 day is the whole answer: this date anchors the word
+    "today" in both the prompt header and the candidate list, and live
+    timestamps are UTC (`2026-08-05T19:12:30.000Z`). Vancouver is UTC-7/8, so
+    every message sent after ~17:00 local carries TOMORROW's UTC date — an
+    evening "see you tomorrow" would resolve two days out. Backfilled
+    timestamps are naive local already and are passed through untouched.
+    """
+    ts = (msg or {}).get("timestamp") if isinstance(msg, dict) else msg
+    if not ts or len(ts) < 10:
+        return default
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return date.fromisoformat(str(ts)[:10])
+        except ValueError:
+            return default
+    if dt.tzinfo is None:
+        return dt.date()
+    try:
+        import zoneinfo
+        return dt.astimezone(zoneinfo.ZoneInfo(gcal_mod.LOCAL_TZ)).date()
+    except Exception:
+        return dt.date()
+
+
+def _relative_day(delta):
+    """Plain-language day offset, so the model never has to do date maths."""
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta == -1:
+        return "yesterday"
+    if delta > 0:
+        return f"in {delta} days"
+    return f"{-delta} days ago"
+
+
+def upcoming_booking_list(bookings, anchor=None):
+    """The CLEANINGS offered to the model as match candidates.
+
+    One row, one date. This used to emit reservations — `{checkin, checkout,
+    label: "Aug 03 → Aug 05"}` — and that shape is what caused the recurring
+    wrong-booking bug found 2026-08-06: 53% of cleanings here fall on a day
+    that is also the next guest's check-in, so on most cleaning days TWO rows
+    displayed that day's date, one as a checkout and one as a check-in. The
+    prompt said "checkout date = cleaning day" once; the payload argued the
+    opposite sixty times, and the payload won. 16 of 48 auto-applied
+    confirmations had landed on the stay that STARTED that day rather than the
+    one being cleaned — including "I'm here", "I'm done" and "see u today".
+
+    Fixing the prompt was the wrong lever: the prompt was already correct.
+    Emitting one date per row removes the ambiguity at the source, because the
+    model cannot match on a date it never sees. Check-in is not shown at all —
+    nothing in a confirm/decline decision needs it.
+
+    `anchor` is the day relative terms resolve against: the message's local
+    send date, NOT today, so a backfilled February message sees February's
+    candidates and reads "today" as February. Defaults to today, which is what
+    the live path wants — there the two are the same day.
+    """
+    anchor = anchor or date.today()
     out = []
     for uid, b in bookings.items():
         if b.get("status") != "active":
             continue
         try:
             end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-            start = datetime.strptime(b["start"], "%Y-%m-%d").date()
         except (ValueError, TypeError, KeyError):
             continue
-        # Include cleanings from 3 days ago up to 60 days ahead — short replies
-        # like "yes" may arrive after the actual clean date for past tense.
-        if end < today - timedelta(days=3) or end > today + timedelta(days=60):
+        # Cleanings from 3 days before the anchor to 60 days after — short
+        # replies like "yes" may arrive after the clean date, in past tense.
+        delta = (end - anchor).days
+        if delta < -3 or delta > 60:
             continue
         out.append({
             "uid": uid,
-            "checkin": b["start"],
-            "checkout": b["end"],
-            "label": f"{start.strftime('%b %d')} → {end.strftime('%b %d')}",
+            "cleaning_date": b["end"],
+            "weekday": end.strftime("%A"),
+            "when": _relative_day(delta),
             "current_cleaner": b.get("cleaner"),
         })
-    out.sort(key=lambda x: x["checkout"])
+    out.sort(key=lambda x: x["cleaning_date"])
     return out
 
 
@@ -655,13 +720,10 @@ def _date_header(msg, today=None):
     Stating only today would silently re-date the entire backfill.
     """
     today = today or date.today()
-    ts = (msg or {}).get("timestamp") or ""
-    sent_day = None
-    if len(ts) >= 10:
-        try:
-            sent_day = date.fromisoformat(ts[:10])
-        except ValueError:
-            sent_day = None
+    # Local send day, not the raw UTC date slice — this value anchors the word
+    # "today" for both the model and the candidate list, and those two must
+    # agree or the whole date-agreement check below is comparing to a fiction.
+    sent_day = _msg_local_day(msg)
     lines = [f"TODAY IS {today.isoformat()} ({today.strftime('%A')})."]
     if sent_day and sent_day != today:
         lines.append(
@@ -687,7 +749,7 @@ def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleane
     if not ANTHROPIC_API_KEY:
         return None, "No Anthropic API key configured."
 
-    booking_list = upcoming_booking_list(bookings)
+    booking_list = upcoming_booking_list(bookings, anchor=_msg_local_day(msg))
     history_lines = []
     for h in history:
         grp = labels.get(h.get("group")) or h.get("group") or "unknown-group"
@@ -709,7 +771,8 @@ def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleane
 Known cleaners: {json.dumps(known_cleaners)}
 {sender_hint}
 
-Upcoming bookings (checkout date = cleaning day):
+Cleanings you may choose from. One row = one cleaning. `cleaning_date` is the day
+that cleaning happens, and `when` is that day relative to when this message was sent:
 {json.dumps(booking_list)}
 
 Message archive across all groups (most recent last). Each line is [timestamp] (group) sender: text.
@@ -722,8 +785,12 @@ The new message (from {msg.get('sender','unknown')} in group "{this_group}" at {
 
 Decide whether this message is the cleaner confirming or declining a specific cleaning. Short replies like "yes"/"ok"/"can do"/"sorry full" are only meaningful relative to the prior chatter — use the archive to resolve ambiguity. Messages from other groups may still be useful context (e.g. Michelle approving a plan in the host chat). If the message isn't actionable (chit-chat, question, unrelated) return action "none".
 
+A message about being at the house right now — "I'm here", "I'm on my way", "I'm done", "the doors are closed", "I finished" — is about the cleaning happening the day the message was SENT (the row whose `when` is "today"). It is never about a later one. If no row is "today", that message is not actionable: return action "none".
+
+Answer `cleaning_date` FIRST, in words you could defend from the message alone: which day's cleaning is this message about? Then pick the `booking_uid` of the row with that `cleaning_date`. The two must agree — a mismatch is thrown out and sent for human review, so do not guess a uid to fill the field. If you cannot name the day, return action "none".
+
 Return ONLY valid JSON, no other text:
-{{"action":"confirm|decline|none","booking_uid":"uid or null","cleaner":"cleaner name or null","confidence":0.0,"reason":"one short sentence"}}"""
+{{"action":"confirm|decline|none","cleaning_date":"YYYY-MM-DD or null","booking_uid":"uid or null","cleaner":"cleaner name or null","confidence":0.0,"reason":"one short sentence"}}"""
 
     try:
         resp = requests.post(
@@ -1158,19 +1225,15 @@ def process_message(msg_id):
             return
 
         action = (result.get("action") or "none").lower()
-        confidence = float(result.get("confidence") or 0.0)
         booking_uid = result.get("booking_uid")
         cleaner = result.get("cleaner") or sender_cleaner
 
-        sender_known = sender_cleaner is not None
-        booking_known = booking_uid and booking_uid in data.get("bookings", {})
-        auto = (
-            action in ("confirm", "decline")
-            and confidence >= AUTO_APPLY_CONFIDENCE
-            and sender_known
-            and booking_known
-            and cleaner in known
-        )
+        booking = data.get("bookings", {}).get(booking_uid) if booking_uid else None
+        auto, block = _auto_apply_decision(result, booking, sender_cleaner, cleaner, known)
+        if block:
+            msg["auto_block"] = block
+        else:
+            msg.pop("auto_block", None)
 
         if action == "none":
             msg["review_state"] = "ignored"
@@ -1182,6 +1245,59 @@ def process_message(msg_id):
             msg["review_state"] = "pending"
 
         save_data(data)
+
+
+def _auto_apply_decision(result, booking, sender_cleaner, cleaner, known_cleaners):
+    """May this parse result write to a booking with no human in the loop?
+
+    Returns `(auto, block_reason)`. Pure: no data access, no clock, so the
+    rule can be tested directly instead of through a copy of itself.
+
+    The load-bearing clause is `cleaning_date == booking["end"]`, added
+    2026-08-06. Every other clause was already here, and together they still
+    let a wrong answer through, because confidence does not mean what it looks
+    like it means. It is the model's certainty about its READING of the
+    sentence — and on the message that started this, "Hello guys I'm here",
+    that reading was correct: a known cleaner really was confirming a real
+    cleaning, at 0.90. What the score could not express is whether the uid it
+    attached that reading to was the right row, because nothing in the
+    pipeline had ever compared that uid to anything. A number a model reports
+    about itself can never contradict itself. Two fields that must agree can:
+    the model now names the cleaning day in its own words, and if that day is
+    not the chosen booking's cleaning day, one of the two is wrong and a human
+    looks at it.
+
+    Fails closed on a missing `cleaning_date` — an older cached result, or a
+    model that ignored the schema, is exactly the case not to trust.
+    """
+    action = (result.get("action") or "none").lower()
+    if action not in ("confirm", "decline"):
+        return False, None
+
+    confidence = float(result.get("confidence") or 0.0)
+    claimed_date = (result.get("cleaning_date") or "").strip() or None
+    booking_date = (booking or {}).get("end")
+    date_agrees = booking is not None and claimed_date is not None and claimed_date == booking_date
+
+    auto = (
+        confidence >= AUTO_APPLY_CONFIDENCE
+        and sender_cleaner is not None
+        and booking is not None
+        and date_agrees
+        and cleaner in known_cleaners
+    )
+    if auto:
+        return True, None
+
+    # Only explain the date disagreement — the other gates (unknown sender,
+    # unmapped cleaner, low confidence) are already legible in the review card.
+    if booking is not None and not date_agrees:
+        return False, (
+            f"Held for review: the model said this message is about the "
+            f"{claimed_date or '(unstated)'} cleaning, but picked the booking "
+            f"cleaned {booking_date}. Those must agree to auto-apply."
+        )
+    return False, None
 
 
 def _find_message(data, msg_id):
@@ -1640,6 +1756,7 @@ _REVIEW_PANEL = """
         {% if m.haiku_confidence is not none %} (conf {{ '%.0f' | format(m.haiku_confidence * 100) }}%){% endif %}
         {% if m.haiku_reason %}<div style="font-size:0.8rem;color:#666;margin-top:2px;">{{ m.haiku_reason }}</div>{% endif %}
       {% endif %}
+      {% if m.auto_block %}<div style="font-size:0.8rem;color:#a94442;background:#f9e4e4;border-radius:4px;padding:4px 6px;margin-top:6px;">⚠️ {{ m.auto_block }}</div>{% endif %}
     </div>
     <form action="{{ prefix }}/review/accept/{{ m.id }}" method="POST" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px;">
       <select name="booking_uid" style="padding:4px 8px;border-radius:4px;border:1px solid #ccc;font-size:0.85rem;">
@@ -4990,6 +5107,7 @@ def _build_review_context(data):
             "haiku_booking_uid": booking_uid,
             "haiku_booking_label": booking_label,
             "parse_error": m.get("parse_error"),
+            "auto_block": m.get("auto_block"),
         })
 
     # Build booking options for manual assignment in review UI

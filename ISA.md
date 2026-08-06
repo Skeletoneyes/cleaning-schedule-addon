@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: active
-updated: 2026-08-03T13:05:00-07:00
-progress: 175/185
+updated: 2026-08-06T09:40:00-07:00
+progress: 183/190
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -340,6 +340,14 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-182: Anti: today's cell must be judged against the fraction of the day elapsed, not a full day — otherwise the most-viewed cell is permanently degraded and the strip cries wolf daily.
 - [x] ISC-183: Anti: the bridge panel must not be able to break the home page — its context builder returns a rendered error state rather than raising.
 - [ ] ISC-184: Anti: every ISC carries a `## Test Strategy` row — a wrap-up audit joins Criteria against Test Strategy per-ISC, because a stale table scores identically to a current one under a section-presence check.
+- [x] ISC-185: The candidate list handed to the parser contains CLEANINGS, one date per row — a reservation carries two dates and only one of them is a cleaning, so a reservation-shaped payload is ambiguous by construction on every turnover day.
+- [x] ISC-186: Anti: a check-in date must not appear anywhere in a candidate row — not as a field, not embedded in a label. 53% of cleanings fall on a day that is also the next guest's check-in, so any surviving check-in date puts today's date on two rows.
+- [x] ISC-187: The auto-apply gate requires the model's independently-stated `cleaning_date` to equal the chosen booking's cleaning day; disagreement routes to human review and says which two dates disagreed.
+- [x] ISC-188: Anti: a missing or blank `cleaning_date` fails CLOSED — an older cached result or a schema-ignoring reply is exactly the case not to trust, and absence must never read as agreement.
+- [x] ISC-189: Anti: `confidence` is never treated as evidence that the chosen booking is correct — it is the model's certainty about its reading of the sentence, and a self-reported number that is never contradicted cannot detect its own error.
+- [x] ISC-190: The word "today" means the same day to the prompt header and to the candidate list, both anchored on the message's LOCAL send day — live timestamps are UTC, so a string slice would label the wrong row "today" for any message sent after ~17:00 Vancouver.
+- [x] ISC-191: The candidate window is anchored on the message's send day, not on today, so a backfilled message is offered the cleanings that existed when it was sent rather than whatever is current.
+- [x] ISC-192: The gate's decision is a pure function (`_auto_apply_decision`) taking result + booking and returning (auto, reason) — a rule embedded in a 60-line handler can only be tested through a copy of itself.
 
 ## Test Strategy
 
@@ -415,6 +423,14 @@ and `transcript ingest` returned zero hits across the whole file.*
 | ISC-182 | render | today's cell with a part-day of checks | class `ok`, not `partial` | offline render + live `GET /` |
 | ISC-183 | fault-injection | force `_build_bridge_context()` to raise | home page still 200, error state shown | code inspection + live `GET /` |
 | ISC-184 | invariant | set-difference of ISC ids in Criteria vs Test Strategy | empty | python3 audit in wrap-up |
+| ISC-185 | unit | turnover pair (Aug 03→05, Aug 05→10); count rows whose `cleaning_date` is Aug 5 | exactly 1, and it is the Aug-5 cleaning | test_cleaning_match.py |
+| ISC-186 | unit | assert no `checkin`/`checkout`/`label` key, and the check-in date absent from `str(row)` | absent in all rows | test_cleaning_match.py |
+| ISC-187 | replay | 7 real archived messages (4 previously mis-attributed, 2 previously correct, 1 original) through the live prompt + `claude-sonnet-5` | 7/7 name the correct cleaning day | replay harness + Inference.ts |
+| ISC-188 | unit | `cleaning_date` of None / "" / "   " with everything else valid | auto=False, reason names "(unstated)" | test_cleaning_match.py |
+| ISC-189 | unit | the original failure replayed: conf 0.90, known cleaner, real booking, wrong date | auto=False | test_cleaning_match.py |
+| ISC-190 | unit | `2026-08-06T01:00:00.000Z` (18:00 PDT Aug 5) through `_msg_local_day`; header vs list agreement | Aug 5 both | test_cleaning_match.py |
+| ISC-191 | unit | February booking with an August anchor, then a February anchor | [] then 1 row, "tomorrow" | test_cleaning_match.py |
+| ISC-192 | unit | gate called directly across 8 cases incl. every pre-existing clause | each clause still bites | test_cleaning_match.py |
 
 ## Features
 
@@ -505,6 +521,14 @@ and `transcript ingest` returned zero hits across the whole file.*
 - 2026-08-03 13:10: Left ISC-184 **failing on purpose** rather than backfilling 110 Test Strategy rows at wrap-up. Writing a `check | threshold | tool` line for ISC-86..155 today would mean inventing probes for work verified in earlier sessions whose actual evidence I did not observe — a table full of plausible retroactive entries is strictly worse than a gap that is visible and counted, because it converts a known unknown into a confident wrong. The honest remediation is per-increment: when a run touches an old ISC, give it a row then, from real evidence. The counter is the backlog. Rejected alternative: mark ISC-184 `[x]` on the grounds that the *gate* now exists and today's rows are complete — that is completion-by-format bias, the failure GPT-5.5 named on the financial ISA, and the criterion says every ISC has a row, not that a checker exists.
 
 ## Changelog
+- 2026-08-06 | conjectured: `confidence ≥ 0.85` plus a known cleaner plus a known booking was a sufficient gate for writing to a booking unattended, because a high score means the model understood the message.
+  refuted by: "Hello guys I'm here", sent 2026-08-05 at 12:12 local as Itzel walked into the cleaning for the stay checking out that day. Scored **0.90** and auto-applied to the stay checking *in* that day — marking the **Aug 10** cleaning confirmed on the strength of a message about Aug 5. The score was not wrong: she really was a known cleaner really confirming a real cleaning. It simply never spoke to the question that mattered. An audit of the whole archive found **16 of 48** auto-applied confirmations had done the same thing, 8 of them unambiguously ("I'm done", "the doors are closed", "see u today").
+  learned: **a self-reported confidence is a claim about the model's reading, not about the row it picked, and nothing that is never contradicted can detect its own error.** This is the health-probe placebo in a new costume — the same shape as a sync heartbeat writing back the sha the builder *believed* it deployed. The fix is not a higher threshold and not a better-worded prompt: it is a second field that can disagree. The model now names the cleaning day in its own words and the gate requires it to match the booking it chose. Note the base rate this hid behind: the pipeline looked healthy for months because every individual decision looked confident and most of them were right.
+  criterion now: ISC-187, ISC-188, ISC-189, ISC-192.
+- 2026-08-06 | conjectured: the parser prompt was correct, since it stated plainly that "checkout date = cleaning day" — so the mis-matching had to be a model-reasoning problem to be fixed by better instructions.
+  refuted by: reading the payload the prompt actually shipped. The header said it once; the candidate list then contradicted it sixty times, emitting **reservations** — `{checkin, checkout, label: "Aug 05 → Aug 10"}` — with the check-in leading the label. **53% of cleanings here fall on a day that is also the next guest's check-in**, so on most cleaning days two different rows displayed that day's date, one as a checkout and one as a check-in. Rewriting the instruction would have argued louder against the same data.
+  learned: **when instructions and data disagree, the data wins, and the fix belongs in the data.** The unit of work shown to a model must be the unit of work being decided about: a reservation carries two dates and only one is a cleaning, so *any* reservation-shaped list re-creates this ambiguity forever. Emitting one date per row removes the mechanism rather than arguing with it — the model cannot match on a date it never sees. Corollary found in passing: the anchor for "today" was `ts[:10]` on a **UTC** timestamp, so every message sent after ~17:00 Vancouver was silently anchored to tomorrow.
+  criterion now: ISC-185, ISC-186, ISC-190, ISC-191.
 - 2026-08-03 | conjectured: a session that adds criteria, verifies them, and records Decisions and Changelog entries has kept the ISA whole.
   refuted by: the wrap-up audit. First pass: 0 of 28 new criteria (ISC-156..183) had a `## Test Strategy` row. Writing the gate to prove that fixed then revealed the real number — **110 of 185 criteria have no row**, in runs at ISC-11..14, 25..31, 46..53, 62..71, 74..77 and above all **ISC-86..155**, an unbroken 70-criterion gap covering the entire GCal-repair, attestation, liveness and facts-layer era. The table has been decorative since roughly ISC-85. Structure passed the E5 gate throughout, because `## Test Strategy` was `present` on the strength of 41 rows written months earlier.
   learned: **section-level completeness cannot see per-row rot, and the first measurement of a gap usually understates it.** A stale table scores identically to a current one under a presence check, so "all twelve sections present" was true and uninformative for months. Two compounding causes: Test Strategy is written at OBSERVE/PLAN, and *reactive* work — a user correction, a review finding, a defect surfaced mid-deploy — jumps straight to EXECUTE and never comes back for it; and nothing ever joined the two sections, so the omission was unobservable by construction. Note also the second-order error: the entry originally written here claimed the gap was 28, because it measured only the ISCs in front of it. Widen the probe before writing the lesson.

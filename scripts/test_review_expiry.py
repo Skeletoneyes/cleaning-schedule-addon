@@ -9,8 +9,9 @@ Run: python3 scripts/test_review_expiry.py
 from __future__ import annotations
 
 import ast
+import types
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,9 +30,14 @@ def _extract(names, ns):
     return ns
 
 
-NS = {"date": date, "timedelta": timedelta,
-      "cleaning_date_for": lambda b: b.get("end")}
-_extract(["_review_subject_date", "_date_header"], NS)
+# `_date_header` reads the send day through `_msg_local_day` (2026-08-06) so
+# that the word "today" means the same day in the prompt header and in the
+# candidate list the model picks from. Extract it too rather than stubbing it —
+# a stub here would let the two drift apart without failing anything.
+NS = {"date": date, "datetime": datetime, "timedelta": timedelta,
+      "cleaning_date_for": lambda b: b.get("end"),
+      "gcal_mod": types.SimpleNamespace(LOCAL_TZ="America/Vancouver")}
+_extract(["_review_subject_date", "_msg_local_day", "_date_header"], NS)
 subject_date = NS["_review_subject_date"]
 date_header = NS["_date_header"]
 
