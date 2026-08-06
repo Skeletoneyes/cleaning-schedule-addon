@@ -115,6 +115,25 @@ VPS_PUSH_ENABLED = bool(OPTIONS.get("vps_push_enabled", False))
 VPS_PUSH_URL = OPTIONS.get("vps_push_url", "")
 VPS_PUSH_SECRET = OPTIONS.get("vps_push_secret", "")
 
+# How long to wait for the bot's reply. This MUST exceed the bot's own triage
+# budget, because the bot deliberately does not answer until it has run the
+# findings through its triage model AND sent the Telegram message — so its 200
+# carries the strong claim "Josh has been told", not the weak one "bytes
+# arrived". Keeping that claim means waiting for the work behind it.
+#
+# It was 20s against a 60s budget, and on 2026-08-06 the two finally crossed:
+# the bot logged `digest received 15:00:04.530Z` / `message sent 15:00:25.806Z`
+# — 21.3s — so the Pi hung up 1.3s early, and Josh got the digest AND a
+# "delivery failed" alarm for the same successful delivery. The cost of that is
+# not the one false alarm; it is that every future REAL failure now arrives in
+# a channel he has learned to disbelieve.
+#
+# 90s = the bot's 60s triage budget (`sdkTriageTimeoutMs`,
+# ~/dev/pai-telegram-bot/src/cleaning.ts) + the Telegram round trip + margin.
+# ⚠️ If that budget is ever raised, raise this with it — they are one number
+# split across two machines, and nothing but this comment links them.
+VPS_PUSH_TIMEOUT_S = 90
+
 # Escalation channel for alerts that must not wait for someone to open Home
 # Assistant. A persistent notification is a place the host *visits*; this is a
 # place a message *finds* him — and critically it does not route through the
@@ -4423,7 +4442,7 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
             VPS_PUSH_URL,
             json=payload,
             headers={"X-Push-Secret": VPS_PUSH_SECRET},
-            timeout=20,
+            timeout=VPS_PUSH_TIMEOUT_S,
         )
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")

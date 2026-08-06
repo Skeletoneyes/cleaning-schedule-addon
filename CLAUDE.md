@@ -790,3 +790,21 @@ Updates: bump `version` in `config.yaml`, push to GitHub, then
   (WhatsApp pipeline covers it), split stays-vs-cleanings calendars,
   retiring `/print` (Michelle still uses it), bot-account swap to SpeakOut
   number (pending — see `whatsapp-bridge/` for the re-pair procedure).
+
+### ⚠️ The push timeout and the bot's triage budget are ONE number on two machines
+
+`VPS_PUSH_TIMEOUT_S` (90s, `app.py`) must stay greater than the bot's
+`sdkTriageTimeoutMs` (60s, `~/dev/pai-telegram-bot/src/cleaning.ts`) plus the
+Telegram round trip. The bot deliberately does not answer the push until it has
+triaged the findings **and** sent the Telegram message, so its 200 means "Josh
+has been told" rather than "bytes arrived" — a claim worth keeping, and keeping
+it means waiting for the work behind it.
+
+The two crossed on 2026-08-06 at the old 20s: the bot logged
+`digest received 15:00:04.530Z` and `message sent 15:00:25.806Z` (**21.3s**),
+so the Pi hung up 1.3s early and posted "Cleaning digest push failed" for a
+delivery that had entirely succeeded. Josh received the digest and the failure
+alarm for the same event. **The damage is not the false alarm — it is that
+every future real failure now arrives in a channel he has been taught to
+disbelieve.** Raise one of these numbers and you must raise the other; nothing
+in either codebase links them except this note and the comment at the constant.
