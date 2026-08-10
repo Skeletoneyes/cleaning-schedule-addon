@@ -52,6 +52,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     findings.extend(_time_agreement(
         bookings, facts_records, today_str,
         (today + timedelta(days=TIME_HORIZON_DAYS)).isoformat(),
+        messages_by_id,
     ))
     if ical_events is not None:
         findings.extend(_ical_vs_bookings(bookings, ical_events, today_str))
@@ -409,7 +410,8 @@ _CLEANER_TIME_KINDS = ("confirm", "time_proposal")
 TIME_HORIZON_DAYS = 21
 
 
-def _time_agreement(bookings, facts_records, today_str, horizon_str):
+def _time_agreement(bookings, facts_records, today_str, horizon_str,
+                    messages_by_id=None):
     """Two distinct ways a cleaning time can be wrong, both previously silent.
 
     `time_mismatch` — the cleaner named a time and the booking says a different
@@ -430,8 +432,17 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str):
     # Latest cleaner-authored time per (date, cleaner). Latest-wins mirrors
     # `_fact_timeline`'s handling of confirm-vs-decline: people change their
     # minds, and the most recent statement is the operative one.
+    #
+    # Ordered by the MESSAGE's send time, never by `extracted_at`. Extraction
+    # time is when the model last looked at the message, so a reprocess —
+    # which this system runs on demand after every prompt-version bump —
+    # restamps ancient messages as the newest opinion and silently resurrects
+    # a superseded time. `_fact_timeline` already learned this; the send time
+    # is the only clock that describes when a human actually said something.
+    msgs = messages_by_id or {}
     latest = {}
     for msg_id, rec in (facts_records or {}).items():
+        said_at = (msgs.get(msg_id) or {}).get("timestamp") or ""
         for f in rec.get("facts", []) or []:
             if f.get("kind") not in _CLEANER_TIME_KINDS or f.get("tentative"):
                 continue
@@ -440,10 +451,8 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str):
                 continue
             key = (tgt, cleaner)
             prev = latest.get(key)
-            # `extracted_at` orders statements; ties keep the first seen.
-            stamp = rec.get("extracted_at") or ""
-            if prev is None or stamp > prev[0]:
-                latest[key] = (stamp, tm, msg_id)
+            if prev is None or said_at > prev[0]:
+                latest[key] = (said_at, tm, msg_id)
 
     for uid, b in (bookings or {}).items():
         if b.get("status") != "active" or b.get("type") == "custom_stay":
@@ -455,6 +464,29 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str):
 
         booked = (b.get("clean_time") or "")[:5] or None
         said = latest.get((d, cleaner))
+
+        # She answered, but with something we could not turn into one time —
+        # "anytime after 11am and before 3pm" is a WINDOW, a perfectly normal
+        # human reply, not a parse failure. Without its own finding this falls
+        # through to the drift queue, whose prescribed action is "tell the
+        # cleaner" — the opposite of what is needed. The right action is to ask
+        # her which hour, and only a distinct finding can say so.
+        note = b.get("time_note")
+        if note:
+            out.append({
+                "id": f"time_ambiguous:{uid}",
+                "detector": "time_agreement",
+                "kind": "time_ambiguous",
+                "severity": "needs-attention",
+                "booking_uid": uid,
+                "cleaner": cleaner,
+                "date": d,
+                "why": (f"{cleaner} answered about the {d} cleaning time but "
+                        f"{note} — ask her which one; the booking still says "
+                        f"{booked or 'no time'} and nobody has agreed to it"),
+                "evidence": [],
+            })
+            continue
 
         if said and booked and said[1] != booked:
             out.append({

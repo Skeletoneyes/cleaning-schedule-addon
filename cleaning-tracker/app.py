@@ -3031,6 +3031,11 @@ def assign(uid):
                 data["bookings"][uid]["clean_time"] = clean_time_raw + ":00"
             else:
                 data["bookings"][uid]["clean_time"] = None
+            # A human setting the time resolves any ambiguity the cleaner's
+            # wording left behind. Without this the `time_ambiguous` finding
+            # would outlive its own cause and sit in the digest forever —
+            # a finding that cannot resolve is how a monitor becomes noise.
+            data["bookings"][uid].pop("time_note", None)
             save_data(data)
     return redirect(ingress_prefix() + "/")
 

@@ -260,7 +260,11 @@ class TimeAgreementDetectorTests(unittest.TestCase):
                              "facts": [fact()]}}
 
     def run_det(self, today="2026-08-09", horizon="2026-08-30"):
-        return reconcile._time_agreement(self.bookings, self.facts, today, horizon)
+        msgs = {"m1": {"timestamp": "2026-08-08T04:35:34.000Z"},
+                "old": {"timestamp": "2026-03-30T08:31:00"},
+                "new": {"timestamp": "2026-08-08T04:35:34.000Z"}}
+        return reconcile._time_agreement(self.bookings, self.facts, today,
+                                         horizon, msgs)
 
     def test_mismatch_is_needs_attention(self):
         """ISC-213: the finding that would have caught Aug 10 on Aug 8."""
@@ -312,6 +316,42 @@ class TimeAgreementDetectorTests(unittest.TestCase):
         out = self.run_det()
         self.assertEqual(len(out), 1)
         self.assertIn("said 11:00", out[0]["why"])
+
+    def test_reprocessing_cannot_resurrect_a_superseded_time(self):
+        """Advisor catch. Ordering by `extracted_at` means a reprocess — which
+        runs after every prompt-version bump — restamps ancient messages as the
+        newest opinion. Here the OLD message was extracted most recently; the
+        March 17:00 must still lose to the August 11:00."""
+        self.facts = {
+            "old": {"extracted_at": "2026-09-01T00:00:00",   # reprocessed last
+                    "facts": [fact(time="17:00")]},
+            "new": {"extracted_at": "2026-08-08T04:35:40",
+                    "facts": [fact(time="11:00")]},
+        }
+        self.bookings["u1"]["clean_time"] = "09:00:00"
+        out = self.run_det()
+        self.assertEqual(len(out), 1)
+        self.assertIn("said 11:00", out[0]["why"])
+
+    def test_a_stated_window_gets_its_own_finding(self):
+        """Advisor catch, highest value. "anytime after 11am and before 3pm"
+        is a valid human answer. Without its own kind it falls into the drift
+        queue, whose prescribed action is "tell the cleaner" — the opposite of
+        the truth, which is that SHE told US and we need to pick an hour."""
+        self.bookings["u1"]["time_note"] = "names 2 different times (11:00, 15:00)"
+        out = self.run_det()
+        self.assertEqual(len(out), 1)
+        f = out[0]
+        self.assertEqual(f["kind"], "time_ambiguous")
+        self.assertEqual(f["severity"], "needs-attention")
+        self.assertIn("ask her which one", f["why"])
+        self.assertIn("11:00", f["why"])
+
+    def test_ambiguity_suppresses_the_mismatch_for_the_same_booking(self):
+        """One situation, one finding — never both."""
+        self.bookings["u1"]["time_note"] = "names 2 different times (11:00, 15:00)"
+        kinds = [f["kind"] for f in self.run_det()]
+        self.assertEqual(kinds, ["time_ambiguous"])
 
     def test_past_and_cancelled_are_ignored(self):
         self.bookings["u1"]["status"] = "cancelled"
