@@ -4313,7 +4313,20 @@ def _digest_compute_and_notify():
 
     with DATA_LOCK:
         bookings_now = dict(load_data().get("bookings", {}))
-    changes = _change_findings(today.isoformat(), bookings=bookings_now)
+    # Suppress anything already reported on a previous night. A change record
+    # sits inside the 24h window across two 08:00 runs whenever it lands in the
+    # evening, so without this it is announced twice. Persisting the ids
+    # without consulting them here would have been bookkeeping that looked like
+    # deduplication and did nothing.
+    in_window = _change_findings(today.isoformat(), bookings=bookings_now) + ack_findings
+    already = set(baseline.get("reported_ids") or [])
+    # Everything still inside the window stays suppressed; once it ages out of
+    # `_recent_changes` it leaves this set on its own, so nothing accumulates.
+    reported_ids = current_ids | {f["id"] for f in in_window}
+    changes = [c for c in in_window
+               if c["kind"] == "applied_change" and c["id"] not in already]
+    ack_findings = [a for a in ack_findings if a["id"] not in already]
+
     if ack_findings:
         message = message + "\n" + "\n".join(f"• [auto-cleared] {a['why']}" for a in ack_findings[:10])
     if changes:
@@ -4327,13 +4340,22 @@ def _digest_compute_and_notify():
         extra_findings=repeated + changes + _redact_quotes_for_vps(ack_findings),
     )
 
-    # Change and auto-ack ids join the baseline. They rode in `extra_findings`
-    # and were never recorded, so the once-per-episode dedup could not apply to
-    # them AT ALL — not merely "each night had a different id"; an identical id
-    # would have re-sent every night it fell inside the 24h window.
+    # TWO id sets, deliberately, because they answer different questions.
+    #
+    # `finding_ids` is the RECONCILER's set and drives the new/resolved diff.
+    # `reported_ids` is everything actually sent, and drives suppression.
+    #
+    # The first cut of this merged them, and a cross-vendor audit caught what
+    # that costs: change ids are never in the next night's reconciler output,
+    # so `resolved_count = len(baseline_ids - current_ids)` would have counted
+    # every one of them as a problem solved. One set doing two jobs invents a
+    # phantom in the other job — the same shape as `ack_notified` encoding both
+    # "she was told" and "we have a usable time", which is what this whole
+    # release is about.
     DIGEST_LAST_FILE.write_text(json.dumps({
         "run_at": datetime.now().isoformat(timespec="seconds"),
-        "finding_ids": sorted(current_ids | {f["id"] for f in changes + ack_findings}),
+        "finding_ids": sorted(current_ids),
+        "reported_ids": sorted(reported_ids),
         "first_seen": first_seen,
         "counts": result["counts"],
         "last_title": title,

@@ -409,6 +409,10 @@ _CLEANER_TIME_KINDS = ("confirm", "time_proposal")
 # repeating, rather than sitting silent and then arriving nightly out of nowhere.
 TIME_HORIZON_DAYS = 21
 
+# Same guard the write path applies in app.py. Duplicated rather than imported
+# because reconcile.py is deliberately dependency-free and pure.
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
 
 def _time_agreement(bookings, facts_records, today_str, horizon_str,
                     messages_by_id=None):
@@ -439,6 +443,13 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
     # restamps ancient messages as the newest opinion and silently resurrects
     # a superseded time. `_fact_timeline` already learned this; the send time
     # is the only clock that describes when a human actually said something.
+    # Collect the newest message per (date, cleaner) and ALL the times it
+    # names, not just one. Keeping a single time here would silently collapse
+    # "anytime after 11am and before 3pm" — which extracts as two facts — into
+    # whichever end happened to be visited last, and then report a confident
+    # mismatch against an arbitrary half of a range. The write path refuses
+    # that case, but the detector must recognise it from the raw facts too:
+    # the archive is full of messages that never went through the new writer.
     msgs = messages_by_id or {}
     latest = {}
     for msg_id, rec in (facts_records or {}).items():
@@ -449,10 +460,17 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
             tgt, cleaner, tm = f.get("target_date"), f.get("cleaner"), f.get("target_time")
             if not tgt or not cleaner or not tm or tgt < today_str:
                 continue
+            # Same HH:MM guard the write path applies. Without it a malformed
+            # model output rides straight into a finding id and into prose the
+            # host reads, dressed as a time somebody stated.
+            if not _HHMM_RE.match(str(tm)):
+                continue
             key = (tgt, cleaner)
             prev = latest.get(key)
             if prev is None or said_at > prev[0]:
-                latest[key] = (said_at, tm, msg_id)
+                latest[key] = (said_at, {str(tm)}, msg_id)
+            elif said_at == prev[0] and msg_id == prev[2]:
+                prev[1].add(str(tm))
 
     for uid, b in (bookings or {}).items():
         if b.get("status") != "active" or b.get("type") == "custom_stay":
@@ -471,7 +489,13 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
         # through to the drift queue, whose prescribed action is "tell the
         # cleaner" — the opposite of what is needed. The right action is to ask
         # her which hour, and only a distinct finding can say so.
+        # Ambiguity from either source: a note the writer left, or a raw fact
+        # set that names more than one time. The second is what covers the
+        # historical archive, which the writer never touched.
         note = b.get("time_note")
+        if not note and said and len(said[1]) > 1:
+            note = (f"names {len(said[1])} different times "
+                    f"({', '.join(sorted(said[1]))})")
         if note:
             out.append({
                 "id": f"time_ambiguous:{uid}",
@@ -488,9 +512,10 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
             })
             continue
 
-        if said and booked and said[1] != booked:
+        one_time = next(iter(said[1])) if said and len(said[1]) == 1 else None
+        if one_time and booked and one_time != booked:
             out.append({
-                "id": f"time_mismatch:{uid}:{said[1]}",
+                "id": f"time_mismatch:{uid}:{one_time}",
                 "detector": "time_agreement",
                 "kind": "time_mismatch",
                 "severity": "needs-attention",
@@ -498,7 +523,7 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
                 "cleaner": cleaner,
                 "date": d,
                 # Structured fields only — never the message text (ISC-41).
-                "why": (f"{cleaner} said {said[1]} for the {d} cleaning but the "
+                "why": (f"{cleaner} said {one_time} for the {d} cleaning but the "
                         f"booking says {booked}; the shared calendar shows {booked}"),
                 "evidence": [said[2]],
             })

@@ -384,6 +384,66 @@ class TimeAgreementDetectorTests(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class CrossVendorAuditTests(unittest.TestCase):
+    """Three defects found by a GPT-5 Codex audit after the Claude advisor
+    had already signed off. All three were real; one was a regression this
+    release introduced."""
+
+    def setUp(self):
+        self.bookings = {"u1": {
+            "start": "2026-08-05", "end": "2026-08-10", "cleaner": "Itzel",
+            "clean_time": "17:00:00", "status": "active", "type": "airbnb",
+        }}
+        self.msgs = {"m1": {"timestamp": "2026-08-08T04:35:34.000Z"}}
+
+    def det(self, facts):
+        return reconcile._time_agreement(self.bookings, facts, "2026-08-09",
+                                         "2026-08-30", self.msgs)
+
+    def test_raw_two_time_facts_are_ambiguous_not_a_confident_mismatch(self):
+        """Cato finding 2. The write path refuses a window, but the detector
+        reads the ARCHIVE — messages the new writer never touched. Collapsing
+        two facts to whichever was visited last would report a confident
+        mismatch against an arbitrary half of a range."""
+        facts = {"m1": {"facts": [fact(time="11:00"), fact(time="15:00")]}}
+        out = self.det(facts)
+        self.assertEqual([f["kind"] for f in out], ["time_ambiguous"])
+        self.assertIn("11:00", out[0]["why"])
+        self.assertIn("15:00", out[0]["why"])
+
+    def test_malformed_time_never_reaches_a_finding(self):
+        """Cato finding 3. The HH:MM guard existed on the write path only, so
+        a malformed model output could ride into a finding id and into prose
+        the host reads, dressed as a time somebody stated."""
+        for bad in ("11am", "25:00", "later", "3pm-ish"):
+            out = self.det({"m1": {"facts": [fact(time=bad)]}})
+            self.assertEqual([f["kind"] for f in out], [],
+                             f"{bad!r} leaked into a finding")
+
+    def test_one_good_time_still_fires_alongside_a_malformed_sibling(self):
+        """The guard must drop the bad value, not the whole message."""
+        out = self.det({"m1": {"facts": [fact(time="11:00"), fact(time="banana")]}})
+        self.assertEqual([f["kind"] for f in out], ["time_mismatch"])
+        self.assertIn("said 11:00", out[0]["why"])
+
+
+class BaselineIdSetTests(unittest.TestCase):
+    """Cato finding 1, the regression this release introduced. Merging change
+    ids into `finding_ids` made every one of them count as RESOLVED on the
+    following night, because they are never in the next reconciler run."""
+
+    def test_resolved_count_is_computed_only_from_reconciler_ids(self):
+        baseline_finding_ids = {"drift:u1:new", "drift:u2:new"}
+        current_ids = {"drift:u1:new", "drift:u2:new"}
+        # Yesterday also REPORTED a change finding. It must not be in the set
+        # the resolved diff is taken over.
+        reported_ids = baseline_finding_ids | {"applied:m1:2026-08-08T21:35:42"}
+        self.assertEqual(len(baseline_finding_ids - current_ids), 0,
+                         "no phantom resolutions")
+        self.assertEqual(len(reported_ids - current_ids), 1,
+                         "suppression set still remembers what was sent")
+
+
 class ChangeFindingCleanerTests(unittest.TestCase):
     """ISC-220: the hardcoded null that became 'no cleaner assigned'."""
 
