@@ -5,7 +5,7 @@ type: project
 effort: E5
 phase: active
 updated: 2026-08-09T22:20:00-07:00
-progress: 183/199
+progress: 183/202
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -365,7 +365,10 @@ path reads either.*
 - [ ] ISC-196: Anti: an `applied_change` finding must not report `cleaner: None` for a booking that has a cleaner. `_change_findings` hardcodes the field, and the VPS triage model faithfully renders the null as "no cleaner assigned; verify intended and assign if needed" — instructing the host to repair a thing that is not broken, on a booking assigned since April.
 - [ ] ISC-197: The change log feeding the nightly "what I changed" report is readable off-host, as the ops log and the watchdog check log already are. `change_log.json` lives in the add-on's private `/data` with no route; the digest can therefore assert something about the system that cannot be audited without a deploy.
 - [ ] ISC-198: Bookings mutated by a pre-1.35.0 auto-apply are identifiable after the fact. The gate stops new bad writes; it does not mark or repair the 16-of-48 already made, so a laundered value is indistinguishable from a sound one and keeps generating digest traffic.
-- [ ] ISC-199: Anti: a booking must not accumulate repeat digest bullets simply because each mutation is technically a new event. Three consecutive mornings (Aug 6/7/8) each carried a *different* finding id about the same Aug 10 cleaning, so the once-per-episode dedup could not fire — the reader experiences a nag the system believes it never sent twice.
+- [ ] ISC-199: Change and auto-ack findings enter the nightly baseline, so the once-per-episode dedup can apply to them at all. `current_ids` is built from `result["findings"]` alone and that set is what persists as `finding_ids`; `changes` + `ack_findings` ride in `extra_findings` and are never recorded. The dedup is therefore **structurally absent** for this class — an identical id would re-send every night it falls inside the 24h window, so "each night had a different id" understates it.
+- [ ] ISC-200: The digest has a channel for *"here is what I did"* that is not an alarm. The bot builds exactly two sections — `⚠️ Actions needed` and `❓ Unresolved conflicts` — routed on `isActionKind(f.kind)`, with `severity` used only for sorting. An `informational` work report has nowhere to land, so it lands in an alarm bucket, and it landed in a *different* one on Aug 6 (Actions) than on Aug 8 (Conflicts). Regression from the 2026-08-03 coverage fix (ISC-177..179): the old prose formatter invented a `🔧 Changes applied` section, and constraining the model to a two-array JSON contract removed it without replacing it in code.
+- [ ] ISC-201: Anti: a null field must not cross to the VPS carrying a meaning it does not have. `cleaning.ts` renders `${f.cleaner ?? "unassigned"}`, so `cleaner: None` — which on an `applied_change` means *not applicable to this finding type* — arrives as the assertion *this booking has no cleaner*, and the triage model expands it into remediation advice. **ISC-41's standing caveat, realised: the allowlist protects keys, not values — and the first real incident came through a meaningless field, not a leaky one.** Omit the field rather than emitting a null.
+- [ ] ISC-202: Every booking write is serialized under `DATA_LOCK`. Six routes do `load_data()` … `save_data()` **outside** it — `sync_ical` (line 557, holding a stale copy across a ~15s network fetch), `assign` (2909), `confirm` (2928), `pay` (2937), `delete_booking` (2962), `add` (2972) — while the two-thread WhatsApp worker pool holds the lock. A concurrent last-write-wins is the leading unproven candidate for the `confirmed → False` reset between Aug 5 and Aug 7 that left no change-log record.
 
 ## Test Strategy
 
@@ -455,7 +458,10 @@ path reads either.*
 | ISC-196 | unit | `_change_findings` over a change on a booking with `cleaner: "Itzel"` | finding `cleaner == "Itzel"` | pytest |
 | ISC-197 | live | `GET /internal/snapshot` → top-level key for the change log | present, ≥1 record | curl + jq |
 | ISC-198 | live | scan bookings for a marker distinguishing pre-1.35.0 auto-applied writes | every such booking flagged | curl + python |
-| ISC-199 | replay | feed the Aug 6/7/8 finding sets to the digest differ | ≤1 message per booking per episode | pytest |
+| ISC-199 | replay | feed the Aug 6/7/8 finding sets to the digest differ; assert change ids appear in the persisted `finding_ids` | ≤1 message per booking per episode | pytest |
+| ISC-200 | replay | Aug 6 + Aug 8 payloads through `renderTriageResult` | change report lands in a third, non-alarm section | bun test |
+| ISC-201 | unit | a finding with no cleaner field vs one with `cleaner: null` | neither renders the word "unassigned" | bun test |
+| ISC-202 | static | AST/grep for `load_data()`…`save_data()` pairs whose enclosing function lacks `DATA_LOCK` | 0 | python script |
 
 ## Features
 
@@ -713,6 +719,10 @@ path reads either.*
 - Aug 6 bullet provenance — the 2026-08-05T15:33:04Z message "Hello guys yes see u at noon" carries `haiku_result {action: confirm, confidence: 0.97, cleaning_date: null, booking_uid: <the Aug 10 booking>}` and `review_state: auto`, while its facts record correctly reads `target_date: 2026-08-05, target_time: "12:00"`. It was processed **one day before** the ISC-187/188 gate shipped, so `cleaning_date` was absent and could not fail closed. Deployed version confirmed current: Supervisor reports `1.35.1`, matching `config.yaml`.
 - ISC-193.1 provenance, live — every fact ever recorded for `target_date 2026-08-10`, in order: `2026-03-23 schedule_assertion "August 10 - anytime after 11am"` · `2026-03-30 confirm + time_proposal Itzel "August 10 - 5:00pm" → 17:00` · `2026-04-13 schedule_assertion Itzel 17:00` · `2026-08-06 schedule_assertion Itzel (host: "next Monday the 10th right?")` · `2026-08-08 confirm Itzel 11:00`. The 17:00 was correctly agreed and correctly stored in March; the 11:00 revision is what the system cannot represent.
 - Blast radius, measured — across all `active` bookings, joining each on the latest non-tentative fact carrying a `target_time` for its cleaning day **and the same cleaner**: **1 disagreement** (Aug 10, booking 17:00 vs stated 11:00), and 0 cases where the booking had no `clean_time` under that join. ⚠️ A parallel analysis using a looser join (any assigned cleaner, `clean_time` absent) reported 21-of-22 bookings with an asserted-but-unwritten time and 11 turnovers since June where GCal rendered its `"11:00:00"` fallback against a contrary assertion — **not re-verified here**, and it measures a different population (missing time) than this probe (contradicted time). Both are real classes; only the first is confirmed by this session's own probe.
+- ISC-199 source, verified — `app.py:4050` `current_ids = {f["id"] for f in result["findings"]}`; `app.py:4197` persists exactly that set as `finding_ids`. `changes` and `ack_findings` are constructed at 4166/4181 and passed only as `extra_findings` to `_push_digest_to_vps`. They never touch the baseline.
+- ISC-200 source, verified — `cleaning.ts` defines two headers (391/392) and routes on `isActionKind(f.kind)` (343/344); `severityRank` (313) is used only in `.sort()`. No `informational` section exists in either the SDK or fallback renderer.
+- ISC-201 source, verified — `cleaning.ts:333` `${f.cleaner ?? "unassigned"}`.
+- ISC-202, verified by static scan of `app.py` — functions containing both `load_data()` and `save_data(` with no `DATA_LOCK` in the body: **`sync_ical` (557), `assign` (2909), `confirm` (2928), `pay` (2937), `delete_booking` (2962), `add` (2972)**. 21 other such functions are correctly locked, so the pattern is understood in the codebase and these six are omissions rather than a design choice. Six, not the four originally reported — the scan found `delete_booking` and `add` as well.
 - ISC-197 — probed and **absent**: `change_log.json` is not in `/internal/snapshot` (top-level keys are `bridge_watchdog, data, gcal_push_status, generated_at, ops_log, options, sync_status`), no route serves it, and `find / -name change_log.json` over SSH returns nothing because the Terminal & SSH add-on cannot see another add-on's `/data`. The intermediate write that reset `confirmed` to `False` between Aug 5 and Aug 7 therefore **could not be identified** — recorded as an open gap rather than guessed at.
 
 ### Operational history (2026-08-03, 1.32.0)
