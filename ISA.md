@@ -3,9 +3,9 @@ title: Cleaning Schedule Tracker — Project ISA
 slug: cleaning-schedule-addon
 type: project
 effort: E5
-phase: verify
-updated: 2026-08-09T22:45:00-07:00
-progress: 212/235
+phase: complete
+updated: 2026-08-09T23:25:00-07:00
+progress: 227/235
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -357,18 +357,18 @@ right on both counts, and the second half is the finding: the facts layer had al
 extracted the correct date AND the correct time from both messages. Nothing on the write
 path reads either.*
 
-- [ ] ISC-193: A confirmation that states a time writes that time to the booking's `clean_time`. `facts.py` already extracts `target_time` correctly ("see you on Monday at 11:00 am" → `11:00`); `_apply_booking_change("confirm")` never touches `clean_time`, so the stated time is parsed, stored, and discarded.
-- [ ] ISC-193.1: A **revision** of a previously agreed time is applied, not just a first agreement. Aug 10 carried a real `time_proposal` of 17:00 from Itzel on 2026-03-30 and a revision to 11:00 on 2026-08-08; the system holds the first and cannot represent the second. Latest-wins by fact timestamp, as `_fact_timeline` already does for confirm-vs-decline.
-- [ ] ISC-194: Anti: `ack_notified()` must not stamp a `clean_time` the cleaner has just withdrawn. It copies *current truth* into `cleaner_commitment`, so a confirmation carrying a new time re-ratifies the superseded one — and because commitment then equals truth, the notify queue goes quiet on exactly the booking that is now wrong.
-- [ ] ISC-194.1: Anti: writing `clean_time` from the facts layer must not overwrite a good value with a null or a misextraction — today's failure is wrong-in-a-stale-direction, which is visible; the naive fix trades it for wrong-in-a-confidently-extracted-direction, which is not. Gate on a non-`tentative` fact whose `target_date` equals the booking's cleaning day, and hold for review on disagreement rather than overwriting.
-- [ ] ISC-195: A disagreement between a `confirm` fact's `target_time` and the booking's `clean_time` produces a needs-attention finding. `target_time` currently appears **nowhere** in `reconcile.py` — the facts layer extracts a field no detector reads, so a six-hour error on tomorrow's cleaning is invisible to every probe the system has.
-- [ ] ISC-196: Anti: an `applied_change` finding must not report `cleaner: None` for a booking that has a cleaner. `_change_findings` hardcodes the field, and the VPS triage model faithfully renders the null as "no cleaner assigned; verify intended and assign if needed" — instructing the host to repair a thing that is not broken, on a booking assigned since April.
-- [ ] ISC-197: The change log feeding the nightly "what I changed" report is readable off-host, as the ops log and the watchdog check log already are. `change_log.json` lives in the add-on's private `/data` with no route; the digest can therefore assert something about the system that cannot be audited without a deploy.
+- [x] ISC-193: A confirmation that states a time writes that time to the booking's `clean_time`. `facts.py` already extracts `target_time` correctly ("see you on Monday at 11:00 am" → `11:00`); `_apply_booking_change("confirm")` never touches `clean_time`, so the stated time is parsed, stored, and discarded.
+- [x] ISC-193.1: A **revision** of a previously agreed time is applied, not just a first agreement. Aug 10 carried a real `time_proposal` of 17:00 from Itzel on 2026-03-30 and a revision to 11:00 on 2026-08-08; the system holds the first and cannot represent the second. Latest-wins by fact timestamp, as `_fact_timeline` already does for confirm-vs-decline.
+- [x] ISC-194: Anti: `ack_notified()` must not stamp a `clean_time` the cleaner has just withdrawn. It copies *current truth* into `cleaner_commitment`, so a confirmation carrying a new time re-ratifies the superseded one — and because commitment then equals truth, the notify queue goes quiet on exactly the booking that is now wrong.
+- [x] ISC-194.1: Anti: writing `clean_time` from the facts layer must not overwrite a good value with a null or a misextraction — today's failure is wrong-in-a-stale-direction, which is visible; the naive fix trades it for wrong-in-a-confidently-extracted-direction, which is not. Gate on a non-`tentative` fact whose `target_date` equals the booking's cleaning day, and hold for review on disagreement rather than overwriting.
+- [x] ISC-195: A disagreement between a `confirm` fact's `target_time` and the booking's `clean_time` produces a needs-attention finding. `target_time` currently appears **nowhere** in `reconcile.py` — the facts layer extracts a field no detector reads, so a six-hour error on tomorrow's cleaning is invisible to every probe the system has.
+- [x] ISC-196: Anti: an `applied_change` finding must not report `cleaner: None` for a booking that has a cleaner. `_change_findings` hardcodes the field, and the VPS triage model faithfully renders the null as "no cleaner assigned; verify intended and assign if needed" — instructing the host to repair a thing that is not broken, on a booking assigned since April.
+- [x] ISC-197: The change log feeding the nightly "what I changed" report is readable off-host, as the ops log and the watchdog check log already are. `change_log.json` lives in the add-on's private `/data` with no route; the digest can therefore assert something about the system that cannot be audited without a deploy.
 - [ ] ISC-198: Bookings mutated by a pre-1.35.0 auto-apply are identifiable after the fact. The gate stops new bad writes; it does not mark or repair the 16-of-48 already made, so a laundered value is indistinguishable from a sound one and keeps generating digest traffic.
-- [ ] ISC-199: Change and auto-ack findings enter the nightly baseline, so the once-per-episode dedup can apply to them at all. `current_ids` is built from `result["findings"]` alone and that set is what persists as `finding_ids`; `changes` + `ack_findings` ride in `extra_findings` and are never recorded. The dedup is therefore **structurally absent** for this class — an identical id would re-send every night it falls inside the 24h window, so "each night had a different id" understates it.
-- [ ] ISC-200: The digest has a channel for *"here is what I did"* that is not an alarm. The bot builds exactly two sections — `⚠️ Actions needed` and `❓ Unresolved conflicts` — routed on `isActionKind(f.kind)`, with `severity` used only for sorting. An `informational` work report has nowhere to land, so it lands in an alarm bucket, and it landed in a *different* one on Aug 6 (Actions) than on Aug 8 (Conflicts). Regression from the 2026-08-03 coverage fix (ISC-177..179): the old prose formatter invented a `🔧 Changes applied` section, and constraining the model to a two-array JSON contract removed it without replacing it in code.
-- [ ] ISC-201: Anti: a null field must not cross to the VPS carrying a meaning it does not have. `cleaning.ts` renders `${f.cleaner ?? "unassigned"}`, so `cleaner: None` — which on an `applied_change` means *not applicable to this finding type* — arrives as the assertion *this booking has no cleaner*, and the triage model expands it into remediation advice. **ISC-41's standing caveat, realised: the allowlist protects keys, not values — and the first real incident came through a meaningless field, not a leaky one.** Omit the field rather than emitting a null.
-- [ ] ISC-202: Every booking write is serialized under `DATA_LOCK`. Six routes do `load_data()` … `save_data()` **outside** it — `sync_ical` (line 557, holding a stale copy across a ~15s network fetch), `assign` (2909), `confirm` (2928), `pay` (2937), `delete_booking` (2962), `add` (2972) — while the two-thread WhatsApp worker pool holds the lock. A concurrent last-write-wins is the leading unproven candidate for the `confirmed → False` reset between Aug 5 and Aug 7 that left no change-log record.
+- [x] ISC-199: Change and auto-ack findings enter the nightly baseline, so the once-per-episode dedup can apply to them at all. `current_ids` is built from `result["findings"]` alone and that set is what persists as `finding_ids`; `changes` + `ack_findings` ride in `extra_findings` and are never recorded. The dedup is therefore **structurally absent** for this class — an identical id would re-send every night it falls inside the 24h window, so "each night had a different id" understates it.
+- [x] ISC-200: The digest has a channel for *"here is what I did"* that is not an alarm. The bot builds exactly two sections — `⚠️ Actions needed` and `❓ Unresolved conflicts` — routed on `isActionKind(f.kind)`, with `severity` used only for sorting. An `informational` work report has nowhere to land, so it lands in an alarm bucket, and it landed in a *different* one on Aug 6 (Actions) than on Aug 8 (Conflicts). Regression from the 2026-08-03 coverage fix (ISC-177..179): the old prose formatter invented a `🔧 Changes applied` section, and constraining the model to a two-array JSON contract removed it without replacing it in code.
+- [x] ISC-201: Anti: a null field must not cross to the VPS carrying a meaning it does not have. `cleaning.ts` renders `${f.cleaner ?? "unassigned"}`, so `cleaner: None` — which on an `applied_change` means *not applicable to this finding type* — arrives as the assertion *this booking has no cleaner*, and the triage model expands it into remediation advice. **ISC-41's standing caveat, realised: the allowlist protects keys, not values — and the first real incident came through a meaningless field, not a leaky one.** Omit the field rather than emitting a null.
+- [x] ISC-202: Every booking write is serialized under `DATA_LOCK`. Six routes do `load_data()` … `save_data()` **outside** it — `sync_ical` (line 557, holding a stale copy across a ~15s network fetch), `assign` (2909), `confirm` (2928), `pay` (2937), `delete_booking` (2962), `add` (2972) — while the two-thread WhatsApp worker pool holds the lock. A concurrent last-write-wins is the leading unproven candidate for the `confirmed → False` reset between Aug 5 and Aug 7 that left no change-log record.
 
 ### Wiring the stated time through (2026-08-09, E5 — Josh: "yes fix it")
 
@@ -400,9 +400,9 @@ rows once measured against live data instead of a stale repo snapshot — see De
 
 **Digest honesty — stop reporting work as an alarm**
 - [x] ISC-220: An `applied_change` finding carries the booking's actual cleaner instead of a hardcoded `None`.
-- [ ] ISC-221: Anti: the bot must never render a missing cleaner as the word "unassigned" — omit the clause instead. A null meaning *not applicable to this finding type* must not arrive as the assertion *this booking has no cleaner*.
-- [ ] ISC-222: The bot renders a third section, `🔧 Changes applied`, for `informational` findings. Restores the channel the 2026-08-03 two-array contract removed, so a work report has somewhere to land that is not an alarm bucket.
-- [ ] ISC-223: Anti: the ISC-177 set-equality coverage check still enforces that every pushed finding id is rendered exactly once, now across three sections rather than two.
+- [x] ISC-221: Anti: the bot must never render a missing cleaner as the word "unassigned" — omit the clause instead. A null meaning *not applicable to this finding type* must not arrive as the assertion *this booking has no cleaner*.
+- [x] ISC-222: The bot renders a third section, `🔧 Changes applied`, for `informational` findings. Restores the channel the 2026-08-03 two-array contract removed, so a work report has somewhere to land that is not an alarm bucket.
+- [x] ISC-223: Anti: the ISC-177 set-equality coverage check still enforces that every pushed finding id is rendered exactly once, now across three sections rather than two.
 - [x] ISC-224: Change and auto-ack finding ids enter the persisted nightly baseline, so the once-per-episode dedup can apply to them at all.
 
 **Auditability and concurrency**
@@ -415,7 +415,7 @@ rows once measured against live data instead of a stale repo snapshot — see De
 - [x] ISC-229: `py_compile` passes on every changed Python file.
 - [x] ISC-230: New unit tests exist and the full existing suite still passes (no regression).
 - [x] ISC-231: Antecedent: the **real** 2026-08-08 message replayed through the confirm path yields `clean_time == "11:00:00"` — the defect that started this, reproduced as a passing test.
-- [ ] ISC-232: Bot suite passes and `tsc --noEmit` is clean.
+- [x] ISC-232: Bot suite passes and `tsc --noEmit` is clean.
 - [x] ISC-233: Work committed and pushed to both repos.
 - [x] ISC-234: Supervisor reports the new add-on version running on the Pi.
 - [x] ISC-235: Live: a post-deploy `POST /reconcile/run` surfaces the three `time_unagreed` findings and introduces no regression in the pre-existing count.
@@ -836,6 +836,14 @@ rows once measured against live data instead of a stale repo snapshot — see De
 - ISC-234: Supervisor — `{"version": "1.36.2", "state": "started"}`.
 - ISC-235: live — 18 findings, of which the 15 pre-existing (14 `drift_unassigned` + 1 `bridge_blind_window`) are unchanged from the pre-deploy baseline. No regression.
 - End-to-end, tomorrow's cleaning: shared calendar feed reads `🧹 Itzel · 11:00 AM | 20260810T180000Z` — right hour, and the `⚠️` drift prefix cleared.
+
+**Bot side (ISC-221..223, ISC-232) — delegated to Forge on the VPS repo, verified independently here:**
+- ISC-232: re-ran rather than trusted the report — `bun test` **170 pass / 0 fail**, 355 expect() calls across 4 files; `bunx tsc --noEmit` exit 0.
+- ISC-221: `formatFindingLine` now omits the clause instead of substituting a word. The `undefined` / empty-string edge is closed one layer up: `cleaner: isNonEmptyString(r.cleaner) ? r.cleaner : null` normalises both to null before rendering, so the `!== null` test is total.
+- ISC-222/223: `changes` is parsed as a third `TriageBullet[]` and folded into the SAME set-equality check — `for (const b of [...actions, ...conflicts, ...changes])` — so a dropped id and an id cited in two sections both still throw and fall back to the deterministic renderer.
+- **End-to-end replay of the two messages Josh actually received.** Feeding the real Aug 8 finding (`cleaner: null`) through the new renderer: the word "unassigned" is gone and it lands under `🔧 Changes applied` instead of `❓ Unresolved conflicts`. Feeding the post-1.36.2 shape: *"2026-08-09 — Itzel: 2026-08-10 cleaning — time 17:00:00 → 11:00:00; confirmed False → True (auto-applied from WhatsApp)."*
+- Deployed: `scp` to `/opt/pai-telegram-bot/src/cleaning.ts`, sha1 **matches local** (`ad699d69…`), service restarted, journal shows `cleaning digest listener started {port:8899}` + `Bot started: @josh_vela_claude_bot`, and `GET /cleaning/health` through Caddy returns **200**.
+- ⚠️ Forge flagged a genuine read-trap: the pre-existing `sampleFinding` fixture uses the literal string `"unassigned"` as a real cleaner value, so `- unassigned:` lines in the test log are legitimate data, not a regression of the bug.
 
 **Advisor findings (Rule 2), both fixed in 1.36.1:**
 - Ordering by `extracted_at` let a *reprocess* — run after every prompt-version bump — restamp an ancient message as the newest opinion and resurrect a superseded time. Now ordered by the message's **send** time. Test: `test_reprocessing_cannot_resurrect_a_superseded_time`.
