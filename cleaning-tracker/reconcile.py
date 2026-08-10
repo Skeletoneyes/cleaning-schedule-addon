@@ -47,6 +47,12 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
     findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id))
+    # Inside run() and before filter_and_sort, so counts derive from findings
+    # automatically — the ISC-40 lesson, applied a third time.
+    findings.extend(_time_agreement(
+        bookings, facts_records, today_str,
+        (today + timedelta(days=TIME_HORIZON_DAYS)).isoformat(),
+    ))
     if ical_events is not None:
         findings.extend(_ical_vs_bookings(bookings, ical_events, today_str))
     if gcal_events is not None:
@@ -391,6 +397,96 @@ def _channel_silence(silence, today_str):
 # For each confirm/decline fact, look up the booking on that date and compare
 # to what the cleaner said. Only future dates — past bookings are history, not
 # conflict material.
+
+# Only the cleaner can agree to a time. `schedule_assertion` is host-authored
+# by the role-tagged facts prompt — the host restating a plan is not the cleaner
+# accepting it, and it is the largest bucket of timed facts in the archive.
+_CLEANER_TIME_KINDS = ("confirm", "time_proposal")
+
+# How far ahead a missing time is worth mentioning. Matched to the digest's
+# repeat horizon so a finding starts appearing at the same moment it starts
+# repeating, rather than sitting silent and then arriving nightly out of nowhere.
+TIME_HORIZON_DAYS = 21
+
+
+def _time_agreement(bookings, facts_records, today_str, horizon_str):
+    """Two distinct ways a cleaning time can be wrong, both previously silent.
+
+    `time_mismatch` — the cleaner named a time and the booking says a different
+    one. This is the probe that would have caught the 2026-08-10 cleaning on the
+    morning of Aug 8 instead of nobody catching it at all.
+
+    `time_unagreed` — nobody ever named a time. That reads as harmless until you
+    look at `gcal.py`, which substitutes `11:00:00` when `clean_time` is None
+    (three separate sites). So on the one surface the cleaners actually read,
+    an absent time renders as a specific, plausible, agreed-looking hour. That
+    is a fail-open on the outward-facing artifact, which is exactly the class
+    this project keeps rediscovering.
+
+    Pure: no data access, no clock — `today_str` and `horizon_str` are passed in.
+    """
+    out = []
+
+    # Latest cleaner-authored time per (date, cleaner). Latest-wins mirrors
+    # `_fact_timeline`'s handling of confirm-vs-decline: people change their
+    # minds, and the most recent statement is the operative one.
+    latest = {}
+    for msg_id, rec in (facts_records or {}).items():
+        for f in rec.get("facts", []) or []:
+            if f.get("kind") not in _CLEANER_TIME_KINDS or f.get("tentative"):
+                continue
+            tgt, cleaner, tm = f.get("target_date"), f.get("cleaner"), f.get("target_time")
+            if not tgt or not cleaner or not tm or tgt < today_str:
+                continue
+            key = (tgt, cleaner)
+            prev = latest.get(key)
+            # `extracted_at` orders statements; ties keep the first seen.
+            stamp = rec.get("extracted_at") or ""
+            if prev is None or stamp > prev[0]:
+                latest[key] = (stamp, tm, msg_id)
+
+    for uid, b in (bookings or {}).items():
+        if b.get("status") != "active" or b.get("type") == "custom_stay":
+            continue
+        d = b.get("end")
+        cleaner = b.get("cleaner")
+        if not d or not cleaner or d < today_str:
+            continue
+
+        booked = (b.get("clean_time") or "")[:5] or None
+        said = latest.get((d, cleaner))
+
+        if said and booked and said[1] != booked:
+            out.append({
+                "id": f"time_mismatch:{uid}:{said[1]}",
+                "detector": "time_agreement",
+                "kind": "time_mismatch",
+                "severity": "needs-attention",
+                "booking_uid": uid,
+                "cleaner": cleaner,
+                "date": d,
+                # Structured fields only — never the message text (ISC-41).
+                "why": (f"{cleaner} said {said[1]} for the {d} cleaning but the "
+                        f"booking says {booked}; the shared calendar shows {booked}"),
+                "evidence": [said[2]],
+            })
+        elif not booked and d <= horizon_str:
+            out.append({
+                "id": f"time_unagreed:{uid}",
+                "detector": "time_agreement",
+                "kind": "time_unagreed",
+                "severity": "suggest",
+                "booking_uid": uid,
+                "cleaner": cleaner,
+                "date": d,
+                "why": (f"No agreed time for the {d} cleaning ({cleaner}); the "
+                        f"shared calendar is showing 11:00 AM as a default, "
+                        f"which nobody actually agreed to"),
+                "evidence": [],
+            })
+
+    return out
+
 
 def _facts_vs_bookings(bookings, facts_records, today_str):
     by_date = {}

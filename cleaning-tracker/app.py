@@ -563,22 +563,36 @@ def sync_ical():
     prove the same way. `last_sync` advances only on success, so it answers
     "when did a sync last work", never "did the most recent attempt work", and
     those diverge exactly when it matters.
-    """
-    data = load_data()
 
+    The feed is fetched BEFORE the lock; only the merge runs inside it. This
+    whole function was unlocked until 1.36.0 while the WhatsApp worker pool
+    held DATA_LOCK on the same file — a read-modify-write race whose losing
+    write vanishes without a trace. Wrapping it wholesale would trade that for
+    a different fault: holding the lock across a 15-second network call stalls
+    every inbound message behind the sync.
+    """
     if not ICAL_URL:
         err = "No iCal URL configured. Set it in the add-on options."
         _write_sync_status(False, err)
-        return data, err
+        with DATA_LOCK:
+            return load_data(), err
 
     try:
         resp = requests.get(ICAL_URL, timeout=15)
         resp.raise_for_status()
     except Exception as e:
         _write_sync_status(False, e)
-        return data, str(e)
+        with DATA_LOCK:
+            return load_data(), str(e)
 
     cal = __import__("icalendar").Calendar.from_ical(resp.text)
+    with DATA_LOCK:
+        return _merge_ical_events(cal)
+
+
+def _merge_ical_events(cal):
+    """Merge parsed feed events into data.json. Caller holds DATA_LOCK."""
+    data = load_data()
     seen_uids = set()
 
     for event in cal.walk("VEVENT"):
@@ -1257,7 +1271,8 @@ def process_message(msg_id):
         if action == "none":
             msg["review_state"] = "ignored"
         elif auto:
-            _apply_booking_change(data, booking_uid, cleaner, action, msg)
+            _apply_booking_change(data, booking_uid, cleaner, action, msg,
+                                  facts_list=facts_list)
             msg["review_state"] = "auto"
             msg["applied_uid"] = booking_uid
         else:
@@ -1365,6 +1380,21 @@ def _record_change(before, after, booking_uid, action, msg, auto):
         print(f"[changelog] failed to record change: {e}")
 
 
+def _read_change_log_tail(limit=100):
+    """Most recent change records, newest last. Never raises.
+
+    Read by `/internal/snapshot`, which is the off-host reconciliation lifeline
+    and must never 500 — same discipline as `_read_ops_log` (ISC-167).
+    """
+    try:
+        if not CHANGE_LOG_FILE.exists():
+            return []
+        log = json.loads(CHANGE_LOG_FILE.read_text())
+        return log[-limit:] if isinstance(log, list) else []
+    except (OSError, ValueError):
+        return []
+
+
 def _recent_changes(hours=24, now=None):
     """Applied changes inside the last `hours`. Used by the nightly digest."""
     now = now or datetime.now()
@@ -1393,7 +1423,7 @@ _CHANGE_LABELS = {
 }
 
 
-def _change_findings(today_str, hours=24, now=None):
+def _change_findings(today_str, hours=24, now=None, bookings=None):
     """Turn the last day's applied changes into digest findings.
 
     Rides the findings channel rather than a parallel one so it inherits the
@@ -1420,7 +1450,14 @@ def _change_findings(today_str, hours=24, now=None):
             "kind": "applied_change",
             "severity": "informational",
             "booking_uid": e.get("booking_uid"),
-            "cleaner": None,
+            # The booking's REAL cleaner. This was hardcoded to None until
+            # 1.36.0, and the VPS bot rendered a null cleaner as the literal
+            # word "unassigned" — so a change report on a booking Itzel has
+            # held since April arrived on Josh's phone as "no cleaner
+            # assigned; verify intended and assign if needed", twice. A null
+            # meaning "not applicable to this finding type" must never travel
+            # as the assertion "this booking has no cleaner".
+            "cleaner": ((bookings or {}).get(e.get("booking_uid")) or {}).get("cleaner"),
             "date": today_str,
             "why": f"{when} cleaning — {'; '.join(bits)} ({src} from WhatsApp).",
             "evidence": [],
@@ -1428,7 +1465,58 @@ def _change_findings(today_str, hours=24, now=None):
     return out
 
 
-def _apply_booking_change(data, booking_uid, cleaner_name, action, msg, auto=True):
+# Fact kinds that may set a cleaning time. `schedule_assertion` is HOST-only by
+# the role-tagged facts prompt and is the single largest bucket of timed facts in
+# the live archive (84 of 235) — writing from it would let Josh's own plan
+# masquerade as the cleaner's agreement, which is the whole distinction this
+# system exists to keep. `unclear` carries a time 5 times in the archive and by
+# definition means the extractor could not tell what was meant.
+CLEANER_TIME_KINDS = ("confirm", "time_proposal")
+
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _stated_clean_time(facts_list, cleaning_date):
+    """The time the CLEANER named for `cleaning_date` in one message.
+
+    Pure — takes the facts extracted from a single message and returns
+    `(clean_time, unusable_reason)`, exactly one of which is set, or
+    `(None, None)` when the message says nothing about the time at all. That
+    last case is the overwhelmingly common one and is not a problem.
+
+    The `unusable_reason` case is the interesting one and is why this returns a
+    pair rather than an Optional: it means she said something about the time
+    that we must NOT act on. The caller has to know the difference, because
+    "she named no time" and "she named a time I could not use" call for
+    opposite handling of the acknowledgement — see `_apply_booking_change`.
+    """
+    times = {
+        f.get("target_time")
+        for f in (facts_list or [])
+        if isinstance(f, dict)
+        and f.get("kind") in CLEANER_TIME_KINDS
+        and not f.get("tentative")
+        and f.get("target_date") == cleaning_date
+        and f.get("target_time")
+    }
+    if not times:
+        return None, None
+    if len(times) > 1:
+        # Real case from the archive: "anytime after 11am and before 3pm"
+        # extracts as 11:00 AND 15:00. That is a range, not a time, and
+        # choosing either end would invent an agreement nobody made.
+        listed = ", ".join(sorted(str(t) for t in times))
+        return None, f"names {len(times)} different times ({listed})"
+    stated = str(times.pop())
+    if not _HHMM_RE.match(stated):
+        # 235 of 235 archive samples parse clean. That is evidence about the
+        # model's habit, not a guarantee about the next one.
+        return None, f"unparseable time {stated!r}"
+    return f"{stated}:00", None
+
+
+def _apply_booking_change(data, booking_uid, cleaner_name, action, msg,
+                          auto=True, facts_list=None):
     """Apply a confirm/decline to a booking. Caller holds DATA_LOCK."""
     booking = data["bookings"].get(booking_uid)
     if not booking:
@@ -1440,8 +1528,30 @@ def _apply_booking_change(data, booking_uid, cleaner_name, action, msg, auto=Tru
             booking["cleaner"] = cleaner_name
             booking["cleaner_since"] = now
         booking["confirmed"] = True
-        # Cleaner has confirmed via WhatsApp — record that as the notified state.
-        ack_notified(booking, via="whatsapp")
+
+        # The time she named in THIS message, if she named one. Until 1.36.0
+        # the confirm path wrote `confirmed` and nothing else, so "see you on
+        # Monday at 11:00 am" was extracted correctly by the facts layer,
+        # stored, and then discarded — the booking kept a 5:00pm agreed back in
+        # March and the shared calendar showed it for a cleaning happening at
+        # 11. A revision wins over a standing agreement (Josh's ruling
+        # 2026-08-09): being wrong on the calendar for two days is the failure
+        # being fixed, so this applies rather than queueing for review.
+        stated, unusable = _stated_clean_time(facts_list, cleaning_date_for(booking))
+        if stated:
+            booking["clean_time"] = stated
+        if unusable:
+            booking["time_note"] = unusable
+        else:
+            booking.pop("time_note", None)
+
+        # Ratify only what we can stand behind. `ack_notified` stamps CURRENT
+        # truth into the commitment, so calling it after a message that named a
+        # time we could not use would record an agreement she did not make —
+        # and because commitment would then equal truth, the notify queue would
+        # go silent on precisely the booking that just became doubtful.
+        if not unusable:
+            ack_notified(booking, via="whatsapp")
     elif action == "decline":
         # Clear the cleaner so the booking surfaces as "needs cleaner" again.
         # Preserve notes so the history of what the cleaner said is visible.
@@ -2907,38 +3017,41 @@ def gcal_sync():
 
 @app.route("/assign/<path:uid>", methods=["POST"])
 def assign(uid):
-    data = load_data()
     cleaner = request.form.get("cleaner", "").strip()
     clean_time_raw = request.form.get("clean_time", "").strip()
-    if uid in data["bookings"]:
-        data["bookings"][uid]["cleaner"] = cleaner or None
-        data["bookings"][uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") if cleaner else None
-        if not cleaner:
-            data["bookings"][uid]["confirmed"] = False
-        # input type="time" gives "HH:MM"; store as "HH:MM:SS"
-        if clean_time_raw:
-            data["bookings"][uid]["clean_time"] = clean_time_raw + ":00"
-        else:
-            data["bookings"][uid]["clean_time"] = None
-        save_data(data)
+    with DATA_LOCK:
+        data = load_data()
+        if uid in data["bookings"]:
+            data["bookings"][uid]["cleaner"] = cleaner or None
+            data["bookings"][uid]["cleaner_since"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") if cleaner else None
+            if not cleaner:
+                data["bookings"][uid]["confirmed"] = False
+            # input type="time" gives "HH:MM"; store as "HH:MM:SS"
+            if clean_time_raw:
+                data["bookings"][uid]["clean_time"] = clean_time_raw + ":00"
+            else:
+                data["bookings"][uid]["clean_time"] = None
+            save_data(data)
     return redirect(ingress_prefix() + "/")
 
 
 @app.route("/confirm/<path:uid>", methods=["POST"])
 def confirm(uid):
-    data = load_data()
-    if uid in data["bookings"]:
-        data["bookings"][uid]["confirmed"] = True
-        save_data(data)
+    with DATA_LOCK:
+        data = load_data()
+        if uid in data["bookings"]:
+            data["bookings"][uid]["confirmed"] = True
+            save_data(data)
     return redirect(ingress_prefix() + "/")
 
 
 @app.route("/pay/<path:uid>", methods=["POST"])
 def pay(uid):
-    data = load_data()
-    if uid in data["bookings"]:
-        data["bookings"][uid]["paid"] = True
-        save_data(data)
+    with DATA_LOCK:
+        data = load_data()
+        if uid in data["bookings"]:
+            data["bookings"][uid]["paid"] = True
+            save_data(data)
     return redirect(ingress_prefix() + "/")
 
 
@@ -2960,11 +3073,12 @@ def edit(uid):
 
 @app.route("/delete/<path:uid>", methods=["POST"])
 def delete_booking(uid):
-    data = load_data()
-    booking = data["bookings"].get(uid)
-    if booking and (booking.get("type") in ("custom_stay", "manual_cleaning") or booking.get("status") == "cancelled"):
-        del data["bookings"][uid]
-        save_data(data)
+    with DATA_LOCK:
+        data = load_data()
+        booking = data["bookings"].get(uid)
+        if booking and (booking.get("type") in ("custom_stay", "manual_cleaning") or booking.get("status") == "cancelled"):
+            del data["bookings"][uid]
+            save_data(data)
     return redirect(ingress_prefix() + "/")
 
 
@@ -2979,6 +3093,12 @@ def add():
 
     entry_type = request.form.get("entry_type", "cleaning")
     notes = request.form.get("notes", "").strip()
+    with DATA_LOCK:
+        return _add_booking(entry_type, notes)
+
+
+def _add_booking(entry_type, notes):
+    """Create a stay or cleaning from the /add form. Caller holds DATA_LOCK."""
     data = load_data()
 
     if entry_type == "stay":
@@ -3079,6 +3199,14 @@ def internal_snapshot():
         "sync_status": _read_sync_status(),
         "bridge_watchdog": _watchdog_summary(),
         "ops_log": _read_ops_log(),
+        # The nightly digest reports "here is what I changed" from this log,
+        # and until 1.36.0 it was the one such record unreadable off-host —
+        # so the digest could assert something about the system that no
+        # investigator could audit without a deploy. That cost a real answer:
+        # a `confirmed → False` write between Aug 5 and Aug 7 could not be
+        # attributed. Tail only; the full log is capped at CHANGE_LOG_MAX and
+        # the snapshot already carries every booking.
+        "change_log": _read_change_log_tail(),
     })
 
 
@@ -4178,7 +4306,9 @@ def _digest_compute_and_notify():
             "evidence": [],
         })
 
-    changes = _change_findings(today.isoformat())
+    with DATA_LOCK:
+        bookings_now = dict(load_data().get("bookings", {}))
+    changes = _change_findings(today.isoformat(), bookings=bookings_now)
     if ack_findings:
         message = message + "\n" + "\n".join(f"• [auto-cleared] {a['why']}" for a in ack_findings[:10])
     if changes:
@@ -4192,9 +4322,13 @@ def _digest_compute_and_notify():
         extra_findings=repeated + changes + _redact_quotes_for_vps(ack_findings),
     )
 
+    # Change and auto-ack ids join the baseline. They rode in `extra_findings`
+    # and were never recorded, so the once-per-episode dedup could not apply to
+    # them AT ALL — not merely "each night had a different id"; an identical id
+    # would have re-sent every night it fell inside the 24h window.
     DIGEST_LAST_FILE.write_text(json.dumps({
         "run_at": datetime.now().isoformat(timespec="seconds"),
-        "finding_ids": sorted(list(current_ids)),
+        "finding_ids": sorted(current_ids | {f["id"] for f in changes + ack_findings}),
         "first_seen": first_seen,
         "counts": result["counts"],
         "last_title": title,
@@ -5188,7 +5322,15 @@ def review_accept(msg_id):
         action = override_action or res.get("action") or "confirm"
         cleaner = override_cleaner or res.get("cleaner") or lookup_cleaner_by_jid(data, msg.get("sender"))
         if booking_uid and booking_uid in data.get("bookings", {}) and action in ("confirm", "decline"):
-            _apply_booking_change(data, booking_uid, cleaner, action, msg, auto=False)
+            # Same facts this message produced at ingest, so accepting from the
+            # Review tab applies the stated time exactly as the auto path does.
+            # An override_uid may point at a different booking than the model
+            # chose; `_stated_clean_time` keys on that booking's own cleaning
+            # date, so a mismatched date simply yields no time rather than
+            # writing one message's time onto an unrelated day.
+            stored_facts = (data.get("message_facts", {}).get(msg_id) or {}).get("facts")
+            _apply_booking_change(data, booking_uid, cleaner, action, msg,
+                                  auto=False, facts_list=stored_facts)
             msg["review_state"] = "auto"
             msg["applied_uid"] = booking_uid
             save_data(data)
