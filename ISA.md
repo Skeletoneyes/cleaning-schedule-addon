@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-09T23:25:00-07:00
-progress: 227/235
+updated: 2026-08-18T22:50:00-07:00
+progress: 227/238
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -420,6 +420,11 @@ rows once measured against live data instead of a stale repo snapshot — see De
 - [x] ISC-234: Supervisor reports the new add-on version running on the Pi.
 - [x] ISC-235: Live: a post-deploy `POST /reconcile/run` surfaces the three `time_unagreed` findings and introduces no regression in the pre-existing count.
 
+**Found 2026-08-18 during a live reconcile — open**
+- [ ] ISC-236: A dismissed watchdog finding stays dismissed across a full reconcile run. `_run_full_reconcile()` merges `watchdog_mod.findings()` into `findings` **and** `findings_raw` after `reconcile_mod.run()` has applied the dismissed-id filter, so `bridge_blind_window` re-appears on every run and its Conflicts badge cannot be cleared by any UI button. *(Live-confirmed 2026-08-18: id dismissed at 13:02:28, present again in a 13:02:41 run.)*
+- [ ] ISC-237: The facts extractor resolves relative dates against **America/Vancouver**, not UTC. An evening message (`2026-08-18T02:44Z` = Aug 17 19:44 local) saying "see u tomorrow" was extracted as `target_date: 2026-08-19`; the clean actually happened Aug 18. Same conversation produced both Aug 18 and Aug 19 for the same event, so the bug is silent and self-contradicting rather than uniformly offset.
+- [ ] ISC-238: Josh confirms a digest/alert notification **actually arrived on his phone** — not that the send returned 200. Carried here from `PROJECTS.md` 2026-08-18, where it had sat as index status with no home in the record. Open because the ISA's own principle says the alert channel is part of the alert: an unverified delivery path fails in the direction that feels fine.
+
 ## Test Strategy
 
 | isc | type | check | threshold | tool |
@@ -546,6 +551,9 @@ rows once measured against live data instead of a stale repo snapshot — see De
 | ISC-233 | git | both repos pushed | remote sha matches | git |
 | ISC-234 | live | Supervisor addon info | version 1.36.2, started | ssh ha |
 | ISC-235 | live | post-deploy reconcile vs pre-deploy baseline | 15 pre-existing unchanged | curl |
+| ISC-236 | behavior | dismiss a `bridge_blind_window` id, then `POST /reconcile/run` | id absent from `findings` | curl + jq |
+| ISC-237 | unit | replay an evening-local message with a relative date through `facts.py` | target_date == local tomorrow | test file |
+| ISC-238 | live | Josh reports receipt on-device after a digest run | confirmed by Josh | ask |
 
 ## Features
 
@@ -573,6 +581,8 @@ rows once measured against live data instead of a stale repo snapshot — see De
 
 ## Decisions
 
+- 2026-08-18 (wrap): **Index trap-ledger — three lines left `PROJECTS.md`, none vanished.** (1) *"Deploy: bump `config.yaml` → push → `ha store reload && ha addons update 27cbea7f_cleaning-tracker` over SSH"* → **IN** `cleaning-schedule-addon/CLAUDE.md:731` (+ host/key in `HomeAssistant/CLAUDE.md`); pure procedure the record states in full. (2) *"Live P0: bridge session-corruption can drop messages; re-pair is manual"* → **IN** `ISA.md:618` (the 2026-07-24 GOTCHA) and `CLAUDE.md:464`; both state it more accurately than the index did — the index line invited re-pairing as a first response, and the record's precondition is that re-pair is the LAST step. Replaced in the index by a pointer, not deleted blind. (3) *"Needs Josh: confirm the test phone notification actually arrived"* → **MOVED** here as ISC-238; it was live status with no home in any record, which is the one thing the index is not for. `PROJECTS.md` 11,955 → 11,881 chars.
+- 2026-08-18: **The Jul 28 – Aug 2 bridge blind window is CLOSED — Josh backfilled it, and the evidence was already in the archive. Do not raise it again.** The `bridge_blind_window` finding's own `why` text says the undelivered messages "cannot be recovered"; that wording is stale and wrong. A message-archive check shows **27 `source: backfill` messages dated inside the window** (Jul 28 ×2, Jul 29 ×2, Jul 30 ×25), and they were present in the 12:32 snapshot — i.e. the backfill predates this session. Jul 31 – Aug 2 hold zero messages, which is consistent with quiet days and was not investigated further on Josh's instruction. ⚠️ **The lesson is mine: I relayed the finding's 'unrecoverable' claim three times in one session without once querying `data.messages` for that date range, which would have refuted it in a single pass.** A detector's prose is a conjecture about the world, not a reading of it — check the archive before repeating the alarm. ⚠️ Second defect, independent of the above: the finding cannot be cleared from the UI. `_run_full_reconcile()` merges `watchdog_mod.findings()` into both `findings` and `findings_raw` **after** `reconcile_mod.run()` has applied the dismissed-id filter, so the id is recorded in `data.dismissed_findings` (it is, with a corrected reason) and still re-injected by every subsequent full run — an unclearable Conflicts badge. Fix is a filter pass over the merged list; not shipped as of 1.36.2.
 - 2026-08-09 23:40: **The authorised backfill was not built, because it had nothing to operate on.** Josh chose "backfill them all now" over "surface only", explicitly accepting a ~21-item notify-queue flood. Measured against a live pull, the candidate set is **zero** — the 21 came from an eleven-week-old `_live.json` (see Changelog). Both options he was choosing between therefore produce identical output today, so no scope was narrowed by not building a migration for an empty set; the detector (ISC-214) covers the class going forward and surfaces the three genuinely time-less bookings now. Reported to him with the numbers rather than silently dropped. If he wants the one-shot route anyway for future use, it is ~20 lines.
 - 2026-08-09 23:55: **Capability honesty — two named at OBSERVE were not invoked as tools.** Council and Science appeared in `🏹 CAPABILITIES SELECTED`; Council was never run, and Science's *method* was performed (hypothesis-plural falsifiable replay: H1 the detector fires on the real Aug 10 case, H2 it goes quiet once repaired, H2b it does not flood at a wide horizon — and H2 failed on the first attempt, correctly, because the input snapshot was stale) but the skill was not invoked. Tool-invoked thinking capabilities: IterativeDepth, SystemsThinking, RootCauseAnalysis, FirstPrinciples, ISA, Advisor, plus ReReadCheck inline — **7 against an E5 hard floor of 8**. Recorded as a miss rather than back-filled with a ceremonial invocation, because the point of the floor is depth actually applied and a retroactive call would be the phantom the rule exists to prevent. The one question Council would genuinely have earned — whether skipping `ack_notified` on the unusable-time path overloads one flag with two jobs, which the advisor argued and I did not accept — is left open and named here so it can be taken up deliberately.
 - 2026-08-09 23:40: ISC floor relaxation (E5 soft ≥256): 33 new criteria, each naming a single-tool probe in the Test Strategy table. Same show-your-math as the 2026-08-01 relaxation — inflating to 256 would fabricate granularity on a ~250-line change to a one-household add-on.
