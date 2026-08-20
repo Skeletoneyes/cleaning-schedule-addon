@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-18T22:50:00-07:00
-progress: 227/238
+updated: 2026-08-20T11:55:00-07:00
+progress: 268/286
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -653,7 +653,114 @@ rows once measured against live data instead of a stale repo snapshot — see De
 
 - 2026-08-03 13:10: Left ISC-184 **failing on purpose** rather than backfilling 110 Test Strategy rows at wrap-up. Writing a `check | threshold | tool` line for ISC-86..155 today would mean inventing probes for work verified in earlier sessions whose actual evidence I did not observe — a table full of plausible retroactive entries is strictly worse than a gap that is visible and counted, because it converts a known unknown into a confident wrong. The honest remediation is per-increment: when a run touches an old ISC, give it a row then, from real evidence. The counter is the backlog. Rejected alternative: mark ISC-184 `[x]` on the grounds that the *gate* now exists and today's rows are complete — that is completion-by-format bias, the failure GPT-5.5 named on the financial ISA, and the criterion says every ISC has a row, not that a checker exists.
 
+- [x] ISC-239: `save_data` writes to a temp file in the same directory, fsyncs, then `os.replace`s — no truncating write of the live store.
+- [x] ISC-240: A failed serialize leaves the previous `data.json` byte-identical and no `.tmp` file behind.
+- [x] ISC-241: `load_data` raises `DataVanished` when `data.json` is absent but `.data-initialized` exists, instead of returning an empty store the next save commits.
+- [x] ISC-242: Deleting `.data-initialized` still permits a deliberate fresh start.
+- [x] ISC-243: `/internal/restore` does not call `load_data`, so the guard cannot block its own recovery path.
+- [x] ISC-244: `_merge_ical_events` refuses a feed that would cancel every future active booking, at any count.
+- [x] ISC-245: It also refuses one cancelling >= `MASS_CANCEL_MIN` and > `MASS_CANCEL_RATIO` of future active bookings.
+- [x] ISC-246: A refused merge calls `save_data` zero times and mutates no booking status.
+- [x] ISC-247: One genuine cancellation still applies — the guard does not break what it guards.
+- [x] ISC-248: Every sync poll logs the absent-future-booking count, so a guard that never evaluated is distinguishable from one that passed.
+- [x] ISC-249: `process_message` makes exactly one model call per message.
+- [x] ISC-250: `parse_whatsapp_message`, `_auto_apply_decision`, `upcoming_booking_list` and `_relative_day` are absent from `app.py`.
+- [x] ISC-251: `_route_from_facts` resolves a fact's `target_date` to exactly one active non-`custom_stay` booking, or writes nothing.
+- [x] ISC-252: Anti: no booking identifier is ever read from model output — a fabricated `booking_uid` on a fact changes nothing.
+- [x] ISC-253: Anti: the model is not shown the booking list, so a turnover day cannot present two rows bearing one date.
+- [x] ISC-254: A fact naming a cleaner other than the sender never writes.
+- [x] ISC-255: `tentative` facts and facts below `ROUTE_CONFIDENCE` are held with a stated reason.
+- [x] ISC-256: A date carrying two bookings is held for a human, not resolved by guess.
+- [x] ISC-257: A message that both confirms and declines one cleaning writes nothing.
+- [x] ISC-258: One message decides many bookings; `applied_uids` carries the full set.
+- [x] ISC-259: `haiku_result` is synthesized from routed decisions, so its `booking_uid` always resolves.
+- [x] ISC-260: `_unread_messages` emits a finding for a message with `review_state: pending` or an unresolved `parse_error`.
+- [x] ISC-261: That finding is dated to the cleaning it concerns, not to the message.
+- [x] ISC-262: Anti: its `why` never carries message text (ISC-41's caveat, at a new site).
+- [x] ISC-263: It is wired into `reconcile.run()` — a shipped detector nothing calls is the 2026-06-11 failure.
+- [x] ISC-264: Over the full 724-message live corpus it emits 4 findings, not a sweep of history.
+- [x] ISC-265: `resolve_subjects` collapses findings about one booking into one statement before any ranking.
+- [x] ISC-266: A finding carrying no `booking_uid` joins by date when exactly one booking sits on it.
+- [x] ISC-267: The merged finding takes the MAX severity of its group, so it still repeats nightly.
+- [x] ISC-268: The merged finding carries the resolved `booking_uid`, so the one-tap action survives.
+- [x] ISC-269: Anti: calendar-projection findings are never merged into a cleaning.
+- [x] ISC-270: Anti: health findings never join by date, though they are stamped with today.
+- [x] ISC-271: A finding is dismissed when its own id is, or when every absorbed id was.
+- [x] ISC-272: Findings rank by decision state; an evidence-free finding no longer outranks one holding the answer.
+- [x] ISC-273: The Conflicts-tab Assign button keys on `decision == "approve"`, not a kind whitelist.
+- [x] ISC-274: `_schedule_vs_bookings` gates on confidence and `tentative`, and `schedule_mismatch` is `suggest`.
+- [x] ISC-275: `_facts_vs_bookings` honours `tentative`.
+- [x] ISC-276: `/admin/reprocess-facts` returns `409 needs_confirmation` without `confirm=1` and writes nothing.
+- [x] ISC-277: The VPS payload carries `decision`; the bot validates it against a closed enum and drops anything else.
+- [x] ISC-278: The bot accepts a payload from an add-on that omits `decision`, so the two deploy independently.
+- [x] ISC-279: The triage prompt groups by subject, not by kind.
+- [x] ISC-280: Live: the Sept 10 booking reads Itzel / 11:00:00; Nov 24 reads Itzel / 13:00:00.
+- [ ] ISC-281: Live: add-on 1.37.0 is installed and `started` on the Pi. [BLOCKED — deploy commands refused by the session's command classifier; Josh runs them]
+- [ ] ISC-282: Live: post-deploy snapshot returns 200 with booking count 67, unchanged from the pre-deploy baseline.
+- [ ] ISC-283: Live: `/data` holds zero `data.json.tmp*` files after a save.
+- [ ] ISC-284: Live: the first real inbound message makes one model call and routes correctly.
+- [ ] ISC-285: Live: the next nightly digest arrives and leads Sept 10 with the confirmation rather than the gap.
+- [ ] ISC-286: The bot is redeployed to the VPS with the subject-grouping triage prompt.
+
 ## Changelog
+
+### 2026-08-20 — the model was reading correctly and the pipeline discarded it
+
+- **conjectured:** the false "Sept 10 unbooked" digest meant the LLM had misread
+  Itzel's confirmation — the interpretation layer was the weak part.
+  **refuted by:** the stored `haiku_result`, correct on every semantic field
+  (`confirm` / `2026-09-10` / `Itzel` / 0.90) and naming the right booking, with
+  the facts call independently agreeing. Set membership showed the emitted uid
+  resolved only after appending `@airbnb.com`.
+  **learned:** the model failed at *transcription*, not comprehension, and the
+  pipeline had handed it a machine's job — exact-matching a 56-character opaque
+  key — while ignoring the machine-checkable field it got right. A field a model
+  is asked to emit is a field it can get wrong; ask only for what the model alone
+  can supply.
+  **criterion now:** ISC-251, ISC-252 — route on the stated date resolved in
+  code; never on a model-transcribed key.
+
+- **conjectured:** the date-agreement gate (`cleaning_date == booking["end"]`)
+  was a genuine cross-check, being "two fields that must agree".
+  **refuted by:** reading the prompt that produced them. It instructed the model
+  to answer `cleaning_date` first and *then pick the uid of the row with that
+  date* — so the two were one estimate and a transcription of it. Agreement
+  between a value and a copy of that value is the health-probe-reports-its-own-
+  expectations shape, and it could only ever catch transcription failure, which
+  is the sole error class the uid itself introduced.
+  **learned:** two fields corroborate only when produced by independent routes.
+  **criterion now:** ISC-250 — the gate and the field it guarded are both gone.
+
+- **conjectured:** the five findings for one date were redundant noise from
+  over-detection, and the fix was fewer detectors.
+  **refuted by:** the repeat filter. Severity is a literal fixed at each emit
+  site, and `persisting` requires `needs-attention`, so the only finding that
+  survived past night one was `drift_unassigned` — whose entire input is one
+  booking dict and whose `evidence` is a hardcoded `[]`. The digest did not
+  mis-order once; it decayed toward noise by construction.
+  **learned:** ranking by detector provenance inverts the information gradient,
+  and any filter keyed on that ranking inherits the inversion. Resolution to one
+  statement per subject must happen before ranking.
+  **criterion now:** ISC-265 … ISC-272.
+
+- **conjectured:** merging findings was a presentation change, safe to apply to
+  every finding about a booking.
+  **refuted by:** `test_gcal_repair.py`, which failed the moment
+  `gcal_stale_event` was absorbed into a schedule finding — and by the merged
+  Sept 10 finding inheriting `informational` from its primary, which would have
+  silently stopped it repeating.
+  **learned:** a merge is a claim that two findings have the same repair and the
+  same audience. Severity must be the group's max, and the mergeable set is an
+  allowlist so a detector added later surfaces on its own.
+  **criterion now:** ISC-267, ISC-269, ISC-270.
+
+- **conjectured:** the mass-cancellation guard needed a floor and a ratio.
+  **refuted by:** the advisor pass, which pointed out that at three future
+  bookings a feed cancelling all three is under the `>= 4` floor — inert exactly
+  where this household lives.
+  **learned:** a proportional guard needs an absolute total-wipe clause; the
+  low-count regime is the one a ratio cannot see.
+  **criterion now:** ISC-244.
 - 2026-08-09 (late) | conjectured: the archive numbers quoted earlier in this session — 21 of 22 bookings carrying an unrecorded stated time, 11 turnovers since June where GCal rendered its 11:00 fallback against a contrary assertion — described the system as it is now, and justified Josh's ruling to backfill every one of them.
   refuted by: measuring against a live pull instead of the file the analysis had read. `_live.json`, sitting in the repo root, is a snapshot from **2026-05-23** — eleven weeks stale. Live: 22 active bookings, not 43; 8 with a cleaner, not 35; **3** with no time, not 22; and **0** of those three has any fact asserting a time. The authorised backfill had zero rows.
   learned: **a file in the working tree is not a probe, and an eleven-week-old artifact answers a question about May in the present tense.** This project already carries the rule in a narrower form — *never compare a cached reading against a live one and call the difference an effect* — and this is the same error one step earlier: not comparing a cache to live, but never checking whether the thing being read was live at all. The number was quoted with a caveat ("not re-verified"), which is what made it cheap to falsify; had it gone into the ISA unqualified it would have justified writing 21 bookings that do not exist. **Two survivors of the refutation:** the *principle* was right even though the count was fiction — `gcal.py` really does substitute `11:00:00`, so a missing time really does render as an agreed-looking hour, and that is now ISC-214 with three live instances. And the reasoning shape generalises: an agent handed a repo will read what is in the repo, so the freshness of its inputs is the caller's job, not the agent's.
