@@ -9,6 +9,10 @@ WhatsApp conversations with cleaners (live traffic via a dedicated WhatsApp
 Bridge HA add-on, plus `/admin/ingest` for historical transcript backfill)
 to detect confirmations and declines.
 
+**One model call per message, and it is never asked to name a booking (1.37.0).**
+The model reports what was said; `_route_from_facts` resolves the stated date
+against the data. See "WhatsApp — inbound pipeline" below.
+
 ## Architecture
 
 Single-file Flask app (`cleaning-tracker/app.py`) running as an HA add-on with
@@ -39,9 +43,13 @@ fallbacks) and passes them to the detectors. See `RECONCILER_PLAN.md`.
 repository.yaml              # HA custom repo metadata
 cleaning-tracker/
 ├── config.yaml              # Add-on config: name, version, options schema
-├── Dockerfile               # python:3.12-slim, COPY app.py gcal.py facts.py reconcile.py ./
+├── Dockerfile               # python:3.12-slim. COPY lists every module —
+│                            #   omitting one boots into ModuleNotFoundError
+│                            #   (bridge_watchdog.py, 2026-08-02)
 ├── requirements.txt         # flask, requests, icalendar, anthropic, google-api-*
-├── app.py                   # Flask routes, templates, logic — ~2800 lines
+├── app.py                   # Flask routes, templates, logic — ~5,500 lines,
+│                            #   of which ~2,900 executable (rest: templates,
+│                            #   prompts, comments). 139 functions.
 ├── gcal.py                  # Google Calendar projection (one-way: data.json → GCal)
 ├── facts.py                 # Versioned structured-fact extractor (Sonnet, FACTS_PROMPT_VERSION)
 └── reconcile.py             # Pure-function reconciler: detectors → ranked findings
@@ -143,9 +151,10 @@ Lazily backfilled on read; all fields are additive and backwards-compatible.
     sender_name_raw?}`. `source: "backfill"` + `sender_name_raw` are set
   by the paste-ingest path; `haiku_result.backfill_ingest=true` marks a
   facts-only ingest that should never route to the Review tab.
-- `message_facts` — Parallel to `messages`, keyed by message id. Stored
-  shape: `{facts: [...], reported_by_jid, model_version, prompt_version,
-  extracted_at}`. Each fact: `{kind, target_date, target_time, cleaner,
+- `message_facts` — Parallel to `messages`, keyed by message id. **This is
+  the only interpretation layer; it is what the write path routes from.**
+  Stored shape: `{facts: [...], reported_by_jid, model_version,
+  prompt_version, extracted_at}`. Each fact: `{kind, target_date, target_time, cleaner,
   confidence, tentative, evidence}` where `kind ∈ {confirm, decline,
   time_proposal, date_proposal, schedule_assertion, unclear}`. Versioned:
   reconciler reads only records matching the current
@@ -224,40 +233,52 @@ proposals) was removed 2026-07-21 at Josh's request — superseded by
 - `POST /internal/whatsapp/inbound`: dedups on message id, enqueues to a
   2-thread worker pool. Loopback calls bypass auth; non-loopback callers
   must present `X-Shared-Secret` matching `whatsapp_shared_secret`.
-- `process_message` runs TWO independent claude-sonnet-5 calls per message: the
-  classic `parse_whatsapp_message` (routing decision for one booking) AND
-  `facts_mod.extract_facts` (every scheduling assertion in the message,
-  for the reconciler). Facts are stored regardless of parse outcome.
-- Auto-apply gate (parse path, `_auto_apply_decision` — pure, unit-tested):
-  `confidence ≥ 0.85` AND known cleaner JID AND known booking AND
-  **`cleaning_date` == the booking's `end`** → writes to booking. Everything
-  else → Review tab, with the date disagreement spelled out on the card.
-- **⚠️ `confidence` does not mean "this is the right booking."** It is the
-  model's certainty about its *reading of the sentence*, and on the 2026-08-05
-  message that started this it was 0.90 and the reading was correct — a known
-  cleaner really was confirming a real cleaning. What no self-reported score
-  can express is whether the uid it chose is the right row, because until
-  1.35.0 nothing had ever compared that uid to anything. Hence the separate
-  `cleaning_date`: the model names the day in its own words, and two fields
-  that must agree can catch what one confident number cannot.
-- **The candidate list is CLEANINGS, not reservations** (`upcoming_booking_list`).
-  It emits one row, one date — `{uid, cleaning_date, weekday, when,
-  current_cleaner}` — and deliberately does **not** emit `checkin`. 53% of
-  cleanings here fall on a day that is also the next guest's check-in, so the
-  old reservation shape (`{checkin, checkout, label: "Aug 05 → Aug 10"}`) put
-  today's date on two different rows on most cleaning days. 16 of 48
-  auto-applied confirmations had landed on the stay that *started* that day,
-  including "I'm here", "I'm done" and "see u today". **Do not add `checkin`
-  back** — the prompt already said "checkout date = cleaning day" and lost to
-  the payload, so the fix had to be in the data, not the wording.
-- The list is anchored on `_msg_local_day(msg)`, the **local** send day, not
-  `date.today()` and not `ts[:10]`. Live timestamps are UTC, so any message
-  sent after ~17:00 Vancouver carries tomorrow's UTC date; slicing the string
-  would label the wrong row "today" and silently re-date every relative term.
-  Backfilled naive timestamps pass through unchanged.
+- `process_message` runs **ONE** claude-sonnet-5 call — `facts_mod.extract_facts`
+  — and then routes its output to bookings **in code** via `_route_from_facts`.
+- **The model is never asked which booking a message is about, and is never
+  shown the booking list.** This is the 1.37.0 change and the reason the
+  routing is now testable. What it replaced: a second Sonnet call was handed a
+  list of candidate cleanings tagged with 56-character uids and asked to copy
+  one back. On 2026-08-20 Itzel wrote "Yes Sept 10 I can do it at 11:00"; that
+  call returned the right action, the right date, the right cleaner and 0.90
+  confidence — and the uid **without its `@airbnb.com` suffix**. The lookup
+  returned `None`, the write was refused, and because the branch that
+  *explains* a refusal also required the booking it was explaining about, the
+  hold was recorded with `auto_block: null`. Across the archive 79 of 81 uids
+  resolved; one was truncated and one was invented outright.
+- **The routing rule** (`_route_from_facts`, pure, unit-tested). A fact writes
+  only when all hold: kind is `confirm`/`decline`; not `tentative`; confidence
+  ≥ `ROUTE_CONFIDENCE` (0.85); the sender maps to a known cleaner; the fact's
+  cleaner **is** the sender (so "Itzel told me she's taking the 17th" cannot
+  confirm on Itzel's behalf); `target_date` is not in the past; and that date
+  resolves to **exactly one** active non-`custom_stay` booking. Zero matches
+  is not actionable, two or more is a question for a human. Anything held
+  carries a stated reason in `auto_block`.
+- **One message can decide many bookings.** A cleaner re-posting a dated list
+  is the dominant real pattern; `applied_uids` carries the full set alongside
+  the legacy singular `applied_uid`.
+- ⚠️ **Do not reintroduce a model-supplied identifier, and do not show the
+  model the booking list.** 53% of cleanings here fall on a day that is also
+  the next guest's check-in, which is what made the old candidate list
+  ambiguous and put 16 of 48 auto-applied confirmations on the wrong stay
+  (2026-08-06). Resolving the date in code makes that class impossible rather
+  than guarded. Regression test: `scripts/test_cleaning_match.py`.
+- `haiku_result` is still written, now **synthesized from the routed
+  decisions** (`_synthesize_result`), so the Review tab, `/review/accept` and
+  `_review_subject_date` keep working — and every uid in it came from code, so
+  it always resolves. The field name is historical; renaming it needs a data
+  migration.
+- The old `AUTO_APPLY_CONFIDENCE` gate, `_auto_apply_decision`,
+  `parse_whatsapp_message` and `upcoming_booking_list` are **deleted**.
 - Review tab UI: pending-message queue with accept/override/ignore; group
   label editor; unmapped-sender flow (map to existing cleaner OR create new,
   then re-queue that sender's pending messages).
+- **Rate limits retry.** `extract_facts` retries 429/5xx with backoff. The
+  deleted parse path did not, which is why 60 of 75 recorded parse errors were
+  un-retried 429s — each one silently abandoning that message's routing.
+- **A message the system fails to read is now a finding** (`_unread_messages`,
+  reconcile.py), dated to the cleaning it concerns. Nothing watched
+  `parse_error` or `pending` before 2026-08-20.
 - **Credit-exhaustion circuit breaker (1.19.0).** When a call returns the
   Anthropic `400 "credit balance is too low"`, `process_message` does NOT bury
   it as a silent `pending` parse_error. Instead `_flag_credit_exhausted` posts
@@ -283,10 +304,17 @@ proposals) was removed 2026-07-21 at Josh's request — superseded by
   Anthropic TPM budget (one stalled ingest sat at 284/952 for 5 hours
   before the cap was added). Only the facts path uses the window; the
   parse path keeps full history.
-- `FACTS_PROMPT_VERSION` (currently `facts-v2`) stamps every stored
-  record. The reconciler reads only current-version facts, so
-  half-reprocessed state is safe. Bump the version after any prompt
-  edit, then `POST /admin/reprocess-facts`.
+- `FACTS_PROMPT_VERSION` (currently `facts-v4`) stamps every stored
+  record. ⚠️ **The reconciler reads ALL fact versions.** `reconcile.py` has
+  never contained the string `prompt_version`; `run()` takes
+  `data["message_facts"]` whole. The version gates only which messages
+  `/admin/reprocess-facts` considers stale. A bump therefore changes the
+  meaning of records already in the corpus with no migration, and a
+  half-finished reprocess feeds the detectors two prompt generations whose
+  kind labels mean different things. Bump, then run the reprocess **to
+  completion** — and note the route now returns `409 needs_confirmation`
+  without `confirm=1`, because one bump plus one POST re-extracts the whole
+  archive (~4.5M input tokens at the current corpus).
 - **Rate-limit handling**: `extract_facts` retries 429 / 5xx / timeouts
   with exponential backoff honouring `retry-after`. Bulk ingest paces
   at 0.8s/call.
@@ -301,7 +329,13 @@ unassigned booking), `informational` (confirm with no booking,
 changed-mind timeline). Findings dedup on stable id so re-runs are
 idempotent.
 
-**Shipped detectors**:
+**Shipped detectors** (ten; `_redact_error` is a sanitiser, not a detector):
+- `_unread_messages` — a message the system never decided. Emits
+  `unread_message` (extraction failed) / `undecided_message` (held for review),
+  **dated to the cleaning it concerns**, so it escalates toward that date and
+  `filter_and_sort` retires it after — unlike `expire_stale_reviews`, which
+  fires seven days *after* the cleaning and cannot be made timely. `why`
+  carries structured fields only; message text must never reach it (ISC-41).
 - `_ical_vs_bookings` — Airbnb iCal ⇄ bookings. `/reconcile/run`
   fetches the feed inline. Emits `ical_missing_booking`,
   `booking_not_in_ical`, `ical_date_mismatch`, `ical_resurrected`.
@@ -334,6 +368,34 @@ idempotent.
   every morning. Lives in the always-running tracker (not the bridge, which
   can't reliably alarm on its own death) and rides the existing daily-digest
   HA notification automatically.
+
+**Subject resolution + decision ranking (1.37.0).** Before anything is ranked,
+`resolve_subjects()` collapses findings about ONE booking into one statement.
+Findings that carry no `booking_uid` (`changed_mind`, `confirm_no_booking`) are
+joined by date when exactly one booking sits on it — that missing join is why,
+on 2026-08-20, "Sept 10 booking needs a cleaner" and "Itzel said decline then
+confirm for 2026-09-10; latest is confirm" were reported as separate lines two
+severity tiers apart.
+
+Three rules, each of which cost something to learn:
+- **Merged severity is the MAX of the group.** The nightly repeat filter keys
+  on `needs-attention`; a merged finding inheriting `informational` from its
+  primary would be reported once and never again.
+- **Only schedule-state detectors merge** (`MERGEABLE_DETECTORS`). Calendar
+  projection and health findings stay separate — a stale calendar event has a
+  different repair, and a health finding describes how much of the list to
+  believe rather than belonging to it. Health findings also refuse to join by
+  date, since they are stamped with today and today is eventually some
+  cleaning's date.
+- **Dismissals carry through the merge.** A finding is dismissed if its own id
+  is, OR every id it absorbed was — otherwise months of existing dismissals
+  would go inert the moment resolution shipped.
+
+Ranking is then by `decision` — `adjudicate` (two claims held, a human must
+pick) → `approve` (the answer is held, one tap) → `investigate` (nothing held,
+go find out) → `observe`. Severity survives as a secondary sort key and as the
+repeat-filter input, but no longer decides what Josh reads first. Unknown kinds
+fall to `investigate`, which fails toward asking.
 
 The cached result stores `findings_raw` (pre-dismiss) alongside
 `findings` (post-filter). `reconcile.filter_and_sort()` is the pure

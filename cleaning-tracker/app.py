@@ -3424,8 +3424,22 @@ def admin_facts():
 def admin_reprocess_facts():
     """Re-extract facts for any message whose record is missing or stale.
 
-    Idempotent: running repeatedly is safe. The reconciler only reads
-    current-version facts, so a half-complete reprocess can't corrupt results.
+    Idempotent: running repeatedly is safe.
+
+    ⚠️ It is NOT free, and it is not safe in the way this docstring used to
+    claim. The old text said "the reconciler only reads current-version facts,
+    so a half-complete reprocess can't corrupt results." `reconcile.py` has
+    never contained the string `prompt_version`; `run()` takes
+    `data["message_facts"]` whole. The version gates which messages THIS route
+    considers stale, and nothing else. A half-finished reprocess therefore
+    feeds the detectors a corpus spanning two prompt generations whose kind
+    labels mean different things — and the safety rationale for pressing the
+    button was printed on the button.
+
+    Cost gate added 2026-08-20, mirroring `/admin/ingest-transcript`'s: one
+    version bump plus one POST re-extracts the entire archive, which at the
+    current corpus is roughly 4.5M input tokens. Unconfirmed calls report the
+    count and change nothing.
     """
     _require_local_or_secret()
 
@@ -3449,6 +3463,20 @@ def admin_reprocess_facts():
     # facts that were established BEFORE it — the same order live processing
     # sees. Stored order is append order, which backfill inserts can violate.
     stale.sort(key=lambda m: m.get("timestamp") or "")
+
+    # Confirm gate. A true no-op without `confirm=1`: counts, reports, writes
+    # nothing. Same shape as the ingest route's, for the same reason.
+    if stale and not _truthy(request.values.get("confirm")):
+        return jsonify({
+            "status": "needs_confirmation",
+            "stale": len(stale),
+            "prompt_version": facts_mod.FACTS_PROMPT_VERSION,
+            "estimated_calls": len(stale),
+            "message": (
+                f"{len(stale)} message(s) would be re-extracted at 1 model call each. "
+                "Nothing has been written. Re-POST with confirm=1 to proceed."
+            ),
+        }), 409
 
     extracted = 0
     errors = 0
@@ -4675,6 +4703,12 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
                 "detector": f.get("detector"),
                 "kind": f.get("kind"),
                 "severity": f.get("severity"),
+                # What the reader must supply — adjudicate / approve /
+                # investigate / observe. Derived from the finding's content, so
+                # the bot can lead with the answer instead of the gap. A closed
+                # enum of four literals: it widens the crossing surface by
+                # nothing, unlike a free-text field would.
+                "decision": f.get("decision"),
                 "date": f.get("date"),
                 "cleaner": f.get("cleaner"),
                 "why": f.get("why"),

@@ -9,12 +9,13 @@ description: Pull the HA add-on snapshot, Airbnb iCal, GCal iCal, and WhatsApp a
 
 Pulls four data sources and cross-checks them for drift. Use this skill
 when you need cross-source findings that the in-add-on reconciler
-doesn't yet cover (Airbnb iCal ⇄ bookings and bookings ⇄ GCal — detectors
-1 and 2). For the detectors that *are* shipped (drift, facts⇄bookings,
-fact timeline, schedule⇄bookings), prefer `POST /reconcile/run` and read
-`/reconcile/last` — it's faster and the output feeds the Conflicts tab.
+doesn't yet cover . ⚠️ **All ten detectors ship in the add-on now**, including
+Airbnb iCal ⇄ bookings and bookings ⇄ GCal, which this file used to say it
+could not do. Prefer `POST /reconcile/run` and read `/reconcile/last` — it is
+faster, it feeds the Conflicts tab, and re-implementing a shipped detector by
+hand is wasted work.
 
-1. **HA add-on snapshot** — `data.json` plus non-secret options, via authenticated `GET /internal/snapshot`. Includes the **WhatsApp message archive** (`data.messages`), the **structured facts** (`data.message_facts` — per-message list of `{kind, target_date, target_time, cleaner, confidence, tentative, evidence}` stamped with `prompt_version`; only current-`prompt_version` facts are trustworthy), and `data.dismissed_findings` (the human-dismissed finding ids — filter these out before reporting). See `RECONCILER_PLAN.md`.
+1. **HA add-on snapshot** — `data.json` plus non-secret options, via authenticated `GET /internal/snapshot`. Includes the **WhatsApp message archive** (`data.messages`), the **structured facts** (`data.message_facts` — per-message list of `{kind, target_date, target_time, cleaner, confidence, tentative, evidence}` stamped with `prompt_version`; the reconciler reads ALL versions, so a fragmented corpus mixes prompt generations), and `data.dismissed_findings` (the human-dismissed finding ids — filter these out before reporting). See `RECONCILER_PLAN.md`.
 2. **Airbnb iCal** — upstream feed fetched directly from the URL stored in the add-on options.
 3. **GCal iCal** — the shared calendar's secret iCal URL (configured in `.secrets/urls.json`).
 
@@ -39,8 +40,8 @@ fact timeline, schedule⇄bookings), prefer `POST /reconcile/run` and read
    `GET /reconcile/last` to retrieve the current findings and
    start from there. Then extend with what the in-process reconciler
    can't see:
-   - **Airbnb vs `data.bookings`** *(detector 1, add-on can't do this)*: every `VEVENT` with `SUMMARY: Reserved` in the iCal should have a matching UID in `data.bookings` with `type=airbnb`. Flag bookings present in one but not the other.
-   - **`data.bookings` vs GCal** *(detector 2, add-on can't do this)*: every active booking with a cleaner assigned should project into GCal. An event titled `⚠️ <cleaner>` means drift the add-on already knows about.
+   - **Airbnb vs `data.bookings`** *(shipped as `_ical_vs_bookings`)*: every `VEVENT` with `SUMMARY: Reserved` in the iCal should have a matching UID in `data.bookings` with `type=airbnb`. Flag bookings present in one but not the other.
+   - **`data.bookings` vs GCal** *(shipped as `_bookings_vs_gcal`)*: every active booking with a cleaner assigned should project into GCal. An event titled `⚠️ <cleaner>` means drift the add-on already knows about.
    - **`data.messages` coverage**: check whether recent confirmation-style messages auto-applied (`review_state=auto`) or are stuck pending. Flag sustained pending counts.
    - **Cross-check the cached findings**: fetch `GET /reconcile/last` to see what the add-on's in-process reconciler currently reports. If your pull surfaces something the cache doesn't (e.g. Airbnb dropped a booking), flag it.
 
