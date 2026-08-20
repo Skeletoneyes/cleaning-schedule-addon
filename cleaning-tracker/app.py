@@ -2227,7 +2227,7 @@ FOCUS_TEMPLATE = """<!DOCTYPE html>
       <div class="conflict-why">{{ f.why }}</div>
       {% if f.quote %}<div class="conflict-quote">&ldquo;{{ f.quote }}&rdquo;</div>{% endif %}
       <div class="conflict-actions">
-        {% if f.kind in ('unrecorded_confirmation', 'schedule_unassigned') and f.booking_uid and f.cleaner %}
+        {% if f.decision == 'approve' and f.booking_uid and f.cleaner %}
         <form action="{{ prefix }}/assign/{{ f.booking_uid }}" method="POST" style="display:inline;">
           <input type="hidden" name="cleaner" value="{{ f.cleaner }}">
           <button type="submit" class="btn btn-sm btn-success">Assign {{ f.cleaner }}</button>

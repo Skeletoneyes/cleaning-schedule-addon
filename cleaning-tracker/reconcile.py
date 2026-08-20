@@ -43,6 +43,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
 
     findings = []
     findings.extend(_drift(drift_items))
+    findings.extend(_unread_messages(data.get("messages", []), facts_records, today_str))
     findings.extend(_channel_silence(silence, today_str))
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
@@ -91,11 +92,212 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
         seen.setdefault(f["id"], f)
     findings = list(seen.values())
 
+    # One statement per cleaning, before anything is ranked.
+    findings = resolve_subjects(findings, bookings)
+
     return filter_and_sort({
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "version": RECONCILER_VERSION,
         "findings_raw": findings,
     }, dismissed)
+
+
+# ── Subject resolution + decision-state ranking ─────────────────────────────
+# Added 2026-08-20, after the digest told Josh that Sept 10 needed a cleaner on
+# a night it also held, two severity tiers lower, "Itzel said decline then
+# confirm for 2026-09-10; latest is confirm".
+#
+# Two defects, one shape. Severity was a string literal fixed at each
+# detector's emit site — a property of the FUNCTION THAT SPOKE, never of the
+# finding — and `_drift`, whose entire input is one booking dict and whose
+# `evidence` is a hardcoded `[]`, was pinned top. Then the nightly repeat
+# filter keyed on that same severity, so the only Sept 10 line that survived
+# past night one was the one guaranteed to carry nothing. The digest did not
+# merely mis-order once; it decayed toward noise.
+#
+# So: resolve every finding about one cleaning into one statement BEFORE
+# ranking, then rank by what the reader must supply that the system cannot.
+# The absorb-and-count primitive already existed in this file for the GCal
+# case; this generalises it rather than inventing a second one.
+
+# What the reader has to do. Lower sorts first.
+DECISION_RANK = {
+    "adjudicate": 0,   # two claims held, the system cannot pick — a human must
+    "approve": 1,      # incomplete, but a candidate answer is held — one tap
+    "investigate": 2,  # incomplete, nothing held — go find out
+    "observe": 3,      # nothing to do
+}
+
+# Which decision each finding kind demands. Anything unlisted is treated as
+# `investigate`, which fails toward asking rather than toward silence.
+_KIND_DECISION = {
+    "contested_cleaner": "adjudicate",
+    # A change of mind whose LATEST statement is unambiguous is not a
+    # contradiction to settle — it is an answer to accept. `_facts_vs_bookings`
+    # raises the genuinely contested cases separately.
+    "changed_mind": "approve",
+    "time_ambiguous": "adjudicate",
+    "decline_still_assigned": "adjudicate",
+    "schedule_mismatch": "adjudicate",
+    "ical_date_mismatch": "adjudicate",
+    "unrecorded_confirmation": "approve",
+    "schedule_unassigned": "approve",
+    "undecided_message": "approve",
+    "unread_message": "investigate",
+    "drift_unassigned": "investigate",
+    "drift_new": "investigate",
+    "drift_changed": "investigate",
+    "drift_cancelled": "investigate",
+    "time_unagreed": "investigate",
+    "confirm_no_booking": "observe",
+}
+
+
+def _decision_of(kind):
+    return _KIND_DECISION.get(kind, "investigate")
+
+
+# Only findings about SCHEDULE STATE — who cleans when, and whether they were
+# told — resolve into one statement. Deliberately an allowlist, so a detector
+# added later shows up on its own rather than silently vanishing into a merge.
+#
+# `bookings_vs_gcal` is excluded on purpose: a stale or missing calendar event
+# is a claim about the PROJECTION, not about the cleaning. It has a different
+# repair (re-push) and a different audience, and folding it into "Itzel
+# confirmed Sept 10" would hide a broken calendar behind a solved booking.
+MERGEABLE_DETECTORS = {
+    "drift",
+    "facts_vs_bookings",
+    "fact_timeline",
+    "schedule_vs_bookings",
+    "time_agreement",
+    "unread_messages",
+    "ical_vs_bookings",
+}
+
+
+def _subject_of(f, date_to_uid):
+    """What this finding is ABOUT — a booking — or None if it is about the system.
+
+    Findings that name no booking (`changed_mind`, `confirm_no_booking`) still
+    carry a date, and a date resolves to a booking whenever exactly one exists
+    on it. That is the join the reconciler never made: the finding holding the
+    Sept 10 answer had `booking_uid: None` and was therefore never connected to
+    the finding asking the Sept 10 question.
+    """
+    uid = f.get("booking_uid")
+    if uid:
+        return uid
+    # Join by date ONLY when the finding names a cleaner. Health findings —
+    # stale push, bridge silent, blind window — carry no booking and no
+    # cleaner, and they are stamped with TODAY's date so the staleness filter
+    # cannot drop them. Today is eventually some cleaning's date, and without
+    # this guard "the calendar has not been written in 26h" would be folded
+    # into "Itzel confirmed Sept 10" and disappear. A health finding describes
+    # how much of the list to believe; it is not a member of it.
+    if not f.get("cleaner"):
+        return None
+    d = f.get("date")
+    if d:
+        return date_to_uid.get(d)
+    return None
+
+
+def resolve_subjects(findings, bookings):
+    """Collapse findings about one booking into one statement each.
+
+    Health findings — no booking, no cleaner — are left alone: they describe
+    how much of the list to believe rather than belonging to it.
+    """
+    date_to_uid = {}
+    for uid, b in (bookings or {}).items():
+        if b.get("status") != "active" or b.get("type") == "custom_stay":
+            continue
+        d = b.get("end")
+        if d:
+            date_to_uid.setdefault(d, []).append(uid)
+    date_to_uid = {d: uids[0] for d, uids in date_to_uid.items() if len(uids) == 1}
+
+    groups, loose = {}, []
+    for f in findings:
+        subj = (_subject_of(f, date_to_uid)
+                if f.get("detector") in MERGEABLE_DETECTORS else None)
+        if subj is None:
+            loose.append(f)
+        else:
+            groups.setdefault(subj, []).append(f)
+
+    # Health findings carry no booking and belong to no cleaning. They describe
+    # how much of the rest of the list to believe, so they are never merged —
+    # but they do get an explicit decision rather than falling through to a
+    # default nobody wrote down.
+    out = [dict(f, decision=_decision_of(f["kind"])) for f in loose]
+    for subj, members in groups.items():
+        if len(members) == 1:
+            out.append(dict(members[0], decision=_decision_of(members[0]["kind"])))
+            continue
+        # The primary is the member demanding the most of the reader; ties go to
+        # the one carrying evidence, because between two findings that ask the
+        # same thing the informed one is the one worth reading.
+        members.sort(key=lambda f: (
+            DECISION_RANK[_decision_of(f["kind"])],
+            0 if f.get("evidence") else 1,
+            f["id"],
+        ))
+        primary = dict(members[0])
+        others = members[1:]
+        primary["decision"] = _decision_of(primary["kind"])
+        primary["absorbed"] = [f["id"] for f in others]
+        # Carry the booking the group resolved to. `changed_mind` and
+        # `confirm_no_booking` are emitted with `booking_uid: None` — they were
+        # never joined to a booking, which is exactly why the Sept 10 answer
+        # was never connected to the Sept 10 question. Without this the merged
+        # finding reaches the Conflicts tab with no uid and therefore no
+        # one-tap action, which is the same information arriving unusable.
+        if not primary.get("booking_uid"):
+            primary["booking_uid"] = subj
+        # Merge what the other findings knew, so nothing is lost by being
+        # absorbed — the failure this whole change exists to end.
+        merged_ev = list(primary.get("evidence") or [])
+        for f in others:
+            for e in (f.get("evidence") or []):
+                if e not in merged_ev:
+                    merged_ev.append(e)
+        primary["evidence"] = merged_ev
+        if not primary.get("quote"):
+            for f in others:
+                if f.get("quote"):
+                    primary["quote"] = f["quote"]
+                    break
+        if not primary.get("cleaner"):
+            for f in others:
+                if f.get("cleaner"):
+                    primary["cleaner"] = f["cleaner"]
+                    break
+        # Severity is the MAX across the group, not the primary's own. Getting
+        # this wrong is silent and expensive: the nightly repeat filter keys on
+        # `needs-attention`, so a merged finding that inherited `informational`
+        # from its primary would be reported once and never again — rebuilding
+        # the exact decay this change exists to stop, one layer up.
+        primary["severity"] = min(
+            (f["severity"] for f in members),
+            key=lambda sev: _SEVERITY_RANK.get(sev, 99),
+        )
+        # Lead with the answer, then the two most informative corroborations,
+        # then a count. Concatenating all of them produced a five-clause
+        # run-on — the digest is read on a phone, and a wall of joined clauses
+        # fails the same way the five separate lines did.
+        others.sort(key=lambda f: (0 if f.get("evidence") else 1,
+                                   DECISION_RANK[_decision_of(f["kind"])]))
+        shown = others[:2]
+        rest = len(others) - len(shown)
+        primary["why"] = (
+            primary["why"]
+            + "".join(f" · {f['why']}" for f in shown)
+            + (f" · +{rest} more signal{'s' if rest != 1 else ''} on this cleaning" if rest else "")
+        )
+        out.append(primary)
+    return out
 
 
 STALE_DAYS = 5  # findings whose date is older than this are auto-suppressed
@@ -109,12 +311,33 @@ def filter_and_sort(result, dismissed):
     """
     raw = list(result.get("findings_raw") or result.get("findings") or [])
     cutoff = (date.today() - timedelta(days=STALE_DAYS)).isoformat()
-    dismissed_count = sum(1 for f in raw if f["id"] in dismissed)
-    stale_count = sum(1 for f in raw if f["id"] not in dismissed and f.get("date") and f["date"] < cutoff)
-    kept = [f for f in raw if f["id"] not in dismissed and not (f.get("date") and f["date"] < cutoff)]
+
+    def _is_dismissed(f):
+        """A merged finding is dismissed when its own id is, or when every
+        finding it absorbed was already dismissed individually.
+
+        Subject resolution (2026-08-20) means an id a human dismissed last
+        month may now be absorbed into a primary with a different id. Keying
+        only on the primary would make every one of those dismissals inert at
+        once and resurface months of resolved noise — which is exactly how a
+        channel teaches you to ignore it.
+        """
+        if f["id"] in dismissed:
+            return True
+        absorbed = f.get("absorbed") or []
+        return bool(absorbed) and all(a in dismissed for a in absorbed)
+
+    dismissed_count = sum(1 for f in raw if _is_dismissed(f))
+    stale_count = sum(1 for f in raw if not _is_dismissed(f) and f.get("date") and f["date"] < cutoff)
+    kept = [f for f in raw if not _is_dismissed(f) and not (f.get("date") and f["date"] < cutoff)]
+    # Rank by what the reader must DO, then by proximity. Severity survives as
+    # a secondary key and as the repeat-filter input, but it no longer decides
+    # what Josh reads first — a detector that has never seen a message cannot
+    # outrank one holding the answer just because its emit site said so.
     kept.sort(key=lambda f: (
-        _SEVERITY_RANK.get(f["severity"], 99),
+        DECISION_RANK.get(f.get("decision") or _decision_of(f["kind"]), 2),
         f.get("date") or "",
+        _SEVERITY_RANK.get(f["severity"], 99),
         f["id"],
     ))
     counts = {"total": len(kept), "dismissed": dismissed_count, "stale": stale_count}
@@ -128,6 +351,77 @@ def filter_and_sort(result, dismissed):
         "findings_raw": raw,
         "counts": counts,
     }
+
+
+# ── Detector 10: messages the system never decided ──────────────────────────
+# The ISA's first Principle reads "Fail loudly, never silently. A broken
+# dependency must produce a signal a human sees, not a row stuck in pending."
+# Until 2026-08-20 it was the one principle with no implementation: nine
+# detectors, a 5-minute container watchdog and two mutual dead-man switches,
+# and `review_state`, `pending` and `parse_error` appeared nowhere in this
+# file. 75 messages carried a parse error, 60 of them un-retried rate limits,
+# and 67 had been bulk-filed as `ignored` — including "Perfect I'll be there
+# Friday at noon". The 2026-08-15 half of the Sept 10 failure died there.
+#
+# Two properties make this different from the review queue it replaces as the
+# attention mechanism. It is dated to the CLEANING the message concerns, not to
+# the message, so it escalates as that date approaches and `filter_and_sort`
+# retires it naturally once the date passes — where `expire_stale_reviews`
+# fires seven days AFTER the cleaning, which no setting can make timely. And it
+# rides the digest, so it reaches the phone instead of a badge on a tab.
+#
+# `why` carries structured fields only. Message text must never reach it: the
+# VPS payload allowlist protects keys, not values (ISC-41).
+
+UNREAD_URGENT_DAYS = 7
+
+
+def _unread_messages(messages, facts_records, today_str, horizon_days=UNREAD_URGENT_DAYS):
+    urgent_before = (
+        date.fromisoformat(today_str) + timedelta(days=horizon_days)
+    ).isoformat()
+    out = []
+    for m in messages:
+        state = m.get("review_state")
+        undecided = state == "pending" or (m.get("parse_error") and not m.get("parsed"))
+        if not undecided:
+            continue
+        msg_id = m.get("id")
+        if not msg_id:
+            continue
+
+        # The cleaning this message is about: the soonest future date any of
+        # its facts named. Falling back to the message's own day keeps a
+        # message whose extraction FAILED — the case with no facts at all, and
+        # the one that matters most — from being silently dropped here too.
+        dates = [
+            f.get("target_date")
+            for f in (facts_records.get(msg_id) or {}).get("facts", [])
+            if f.get("target_date") and f["target_date"] >= today_str
+        ]
+        subject = min(dates) if dates else (m.get("timestamp") or "")[:10]
+        if not subject or subject < today_str:
+            continue
+
+        broke = bool(m.get("parse_error"))
+        why = (
+            f"a message from {(m.get('sender_name_raw') or 'a cleaner')} about the "
+            f"{subject} cleaning was never read — extraction failed"
+            if broke else
+            f"a message about the {subject} cleaning is waiting for a decision"
+        )
+        out.append({
+            "id": f"unread:{msg_id}",
+            "detector": "unread_messages",
+            "kind": "unread_message" if broke else "undecided_message",
+            "severity": "needs-attention" if subject <= urgent_before else "suggest",
+            "booking_uid": None,
+            "cleaner": None,
+            "date": subject,
+            "why": why,
+            "evidence": [msg_id],
+        })
+    return out
 
 
 # ── Detector 3: commitment drift ────────────────────────────────────────────
@@ -562,6 +856,11 @@ def _facts_vs_bookings(bookings, facts_records, today_str):
             cleaner = f.get("cleaner")
             if not tgt or not cleaner or tgt < today_str:
                 continue
+            # A statement the speaker herself flagged as provisional is not a
+            # commitment. `tentative` was extracted, stored and read by exactly
+            # one detector (_time_agreement) until 2026-08-20.
+            if f.get("tentative"):
+                continue
             conf = f.get("confidence") or 0.0
             quote = f.get("evidence") or ""
             matches = by_date.get(tgt, [])
@@ -704,6 +1003,20 @@ def _schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id=Non
             cleaner = f.get("cleaner")
             if not tgt or not cleaner or tgt < today_str:
                 continue
+            # Gated from 2026-08-20. `schedule_assertion` is the most inferred
+            # kind in the schema — it is whatever the host said that named a
+            # date — and it had the loosest gate and the loudest severity in
+            # the file, which is exactly backwards. The facts vocabulary has
+            # `decline` as the negative of `confirm` but NOTHING as the
+            # negative of `schedule_assertion` and no kind for a question, so a
+            # host sentence naming a date can only be filed as an assertion.
+            # That is how "only Sept 10 you cannot do" produced a finding that
+            # Darya WAS scheduled for Sept 10, and how "do we have you booked
+            # for July 24?" was read as a booking (dismissed 2026-07-21).
+            if f.get("tentative"):
+                continue
+            if (f.get("confidence") or 0.0) < CONFIRM_THRESHOLD:
+                continue
             key = (cleaner, tgt)
             existing = latest_assertions.get(key)
             if existing is None or ts > existing[0]:
@@ -735,7 +1048,12 @@ def _schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id=Non
                     "id": f"schedule_mismatch:{uid}:{cleaner}",
                     "detector": "schedule_vs_bookings",
                     "kind": "schedule_mismatch",
-                    "severity": "needs-attention",
+                    # Demoted from needs-attention 2026-08-20. This is the host
+                    # contradicting the record — a data-entry question, not a
+                    # cleaner-coordination emergency. When the cleaner has also
+                    # spoken about the date, `_facts_vs_bookings` says so at
+                    # the severity that judgement deserves.
+                    "severity": "suggest",
                     "booking_uid": uid,
                     "cleaner": cleaner,
                     "date": tgt,
