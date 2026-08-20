@@ -654,13 +654,14 @@ def sync_ical():
         with DATA_LOCK:
             return _merge_ical_events(cal)
     except SuspiciousFeed as e:
+        # Deliberately NOT a phone escalation of its own. `_digest_scheduler`
+        # already raises on any non-empty sync error and escalates that to the
+        # phone, so notifying here would double-alert on one event — and the
+        # phone tier is reserved, by test, for the four cases where nobody
+        # would otherwise find out. A refused feed is not one of them: the
+        # schedule is frozen, not lost, and the stale-sync sentinel says so
+        # within 26h even if the nightly notification is missed.
         _write_sync_status(False, e)
-        _post_ha_notification(
-            "Airbnb sync refused a suspicious feed",
-            f"{e} The schedule on the Pi is unchanged.",
-            notification_id="cleaning_suspicious_feed",
-            to_phone=True,
-        )
         with DATA_LOCK:
             return load_data(), str(e)
     except Exception as e:
@@ -766,10 +767,6 @@ def _merge_ical_events(cal):
 
 # ── Inbound WhatsApp: message parsing with chat context ─────────────────────
 
-# Auto-apply threshold. Haiku-returned confidence ≥ this value AND a known
-# cleaner AND an unambiguous booking → apply directly to the booking. Anything
-# else lands in the review queue.
-AUTO_APPLY_CONFIDENCE = 0.85
 
 
 def _msg_local_day(msg, default=None):
@@ -803,65 +800,8 @@ def _msg_local_day(msg, default=None):
         return dt.date()
 
 
-def _relative_day(delta):
-    """Plain-language day offset, so the model never has to do date maths."""
-    if delta == 0:
-        return "today"
-    if delta == 1:
-        return "tomorrow"
-    if delta == -1:
-        return "yesterday"
-    if delta > 0:
-        return f"in {delta} days"
-    return f"{-delta} days ago"
 
 
-def upcoming_booking_list(bookings, anchor=None):
-    """The CLEANINGS offered to the model as match candidates.
-
-    One row, one date. This used to emit reservations — `{checkin, checkout,
-    label: "Aug 03 → Aug 05"}` — and that shape is what caused the recurring
-    wrong-booking bug found 2026-08-06: 53% of cleanings here fall on a day
-    that is also the next guest's check-in, so on most cleaning days TWO rows
-    displayed that day's date, one as a checkout and one as a check-in. The
-    prompt said "checkout date = cleaning day" once; the payload argued the
-    opposite sixty times, and the payload won. 16 of 48 auto-applied
-    confirmations had landed on the stay that STARTED that day rather than the
-    one being cleaned — including "I'm here", "I'm done" and "see u today".
-
-    Fixing the prompt was the wrong lever: the prompt was already correct.
-    Emitting one date per row removes the ambiguity at the source, because the
-    model cannot match on a date it never sees. Check-in is not shown at all —
-    nothing in a confirm/decline decision needs it.
-
-    `anchor` is the day relative terms resolve against: the message's local
-    send date, NOT today, so a backfilled February message sees February's
-    candidates and reads "today" as February. Defaults to today, which is what
-    the live path wants — there the two are the same day.
-    """
-    anchor = anchor or date.today()
-    out = []
-    for uid, b in bookings.items():
-        if b.get("status") != "active":
-            continue
-        try:
-            end = datetime.strptime(b["end"], "%Y-%m-%d").date()
-        except (ValueError, TypeError, KeyError):
-            continue
-        # Cleanings from 3 days before the anchor to 60 days after — short
-        # replies like "yes" may arrive after the clean date, in past tense.
-        delta = (end - anchor).days
-        if delta < -3 or delta > 60:
-            continue
-        out.append({
-            "uid": uid,
-            "cleaning_date": b["end"],
-            "weekday": end.strftime("%A"),
-            "when": _relative_day(delta),
-            "current_cleaner": b.get("cleaner"),
-        })
-    out.sort(key=lambda x: x["cleaning_date"])
-    return out
 
 
 def _date_header(msg, today=None):
@@ -893,94 +833,6 @@ def _date_header(msg, today=None):
     return "\n".join(lines)
 
 
-def parse_whatsapp_message(msg, history, bookings, known_cleaners, sender_cleaner, labels):
-    """Ask Haiku to interpret a single inbound WhatsApp message in context.
-
-    `history` is a windowed slice of the cross-group archive (most recent
-    PARSE_HISTORY_WINDOW messages before this one). `labels` is {group_jid: human_label}.
-
-    Returns ({booking_uid, cleaner, action, confidence, reason}, None) or
-    (None, error_str). `action` is "confirm", "decline", or "none".
-    """
-    if not ANTHROPIC_API_KEY:
-        return None, "No Anthropic API key configured."
-
-    booking_list = upcoming_booking_list(bookings, anchor=_msg_local_day(msg))
-    history_lines = []
-    for h in history:
-        grp = labels.get(h.get("group")) or h.get("group") or "unknown-group"
-        sender_label = h.get("sender") or "unknown"
-        history_lines.append(f"[{h.get('timestamp','')}] ({grp}) {sender_label}: {h.get('text','')}")
-    history_text = "\n".join(history_lines) if history_lines else "(no prior messages)"
-
-    sender_hint = (
-        f"This sender is known to be cleaner: {sender_cleaner}."
-        if sender_cleaner
-        else "This sender is not yet mapped to a known cleaner."
-    )
-    this_group = labels.get(msg.get("group")) or msg.get("group") or "unknown-group"
-
-    prompt = f"""You interpret a single incoming WhatsApp message from a house-cleaning group chat.
-
-{_date_header(msg)}
-
-Known cleaners: {json.dumps(known_cleaners)}
-{sender_hint}
-
-Cleanings you may choose from. One row = one cleaning. `cleaning_date` is the day
-that cleaning happens, and `when` is that day relative to when this message was sent:
-{json.dumps(booking_list)}
-
-Message archive across all groups (most recent last). Each line is [timestamp] (group) sender: text.
----
-{history_text}
----
-
-The new message (from {msg.get('sender','unknown')} in group "{this_group}" at {msg.get('timestamp','')}):
-{msg.get('text','')}
-
-Decide whether this message is the cleaner confirming or declining a specific cleaning. Short replies like "yes"/"ok"/"can do"/"sorry full" are only meaningful relative to the prior chatter — use the archive to resolve ambiguity. Messages from other groups may still be useful context (e.g. Michelle approving a plan in the host chat). If the message isn't actionable (chit-chat, question, unrelated) return action "none".
-
-A message about being at the house right now — "I'm here", "I'm on my way", "I'm done", "the doors are closed", "I finished" — is about the cleaning happening the day the message was SENT (the row whose `when` is "today"). It is never about a later one. If no row is "today", that message is not actionable: return action "none".
-
-Answer `cleaning_date` FIRST, in words you could defend from the message alone: which day's cleaning is this message about? Then pick the `booking_uid` of the row with that `cleaning_date`. The two must agree — a mismatch is thrown out and sent for human review, so do not guess a uid to fill the field. If you cannot name the day, return action "none".
-
-Return ONLY valid JSON, no other text:
-{{"action":"confirm|decline|none","cleaning_date":"YYYY-MM-DD or null","booking_uid":"uid or null","cleaner":"cleaner name or null","confidence":0.0,"reason":"one short sentence"}}"""
-
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-5",
-                "max_tokens": 1024,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        # claude-sonnet-5 may emit a thinking block before the text block —
-        # select the text block instead of assuming content[0].
-        text = next(
-            b["text"] for b in result["content"] if b.get("type") == "text"
-        ).strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0]
-        parsed = json.loads(text)
-        return parsed, None
-    except requests.exceptions.HTTPError as e:
-        return None, f"Anthropic API error: {e.response.status_code} - {e.response.text[:200]}"
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        return None, f"Failed to parse LLM response: {e}"
-    except Exception as e:
-        return None, f"Error calling Anthropic API: {e}"
 
 
 # ── Message queue + worker ──────────────────────────────────────────────────
@@ -1149,13 +1001,6 @@ FACTS_HISTORY_WINDOW = 30
 FACTS_HISTORY_DAYS = 45
 FACTS_HISTORY_MAX = 120
 
-# Parse history is cross-group (host-chat context helps resolve ambiguous
-# replies) so a separate, slightly larger window. Still needs a cap —
-# unbounded archive hits the 50k tokens/min org rate limit.
-PARSE_HISTORY_WINDOW = 50
-PARSE_HISTORY_DAYS = 30
-PARSE_HISTORY_MAX = 150
-
 # Cross-chat facts digest handed to fact extraction. Bounded in both
 # directions: a little history (a date agreed last week may still be being
 # renegotiated) and a long forward horizon (schedules are agreed months out —
@@ -1311,16 +1156,163 @@ def _cross_chat_facts(data, target, now=None):
     return kept
 
 
-def _parse_history(messages, target):
-    tgt_ts = target.get("timestamp") or ""
-    prior = [m for m in messages if (m.get("timestamp") or "") < tgt_ts]
-    return _window_by_count_or_days(
-        prior, PARSE_HISTORY_WINDOW, PARSE_HISTORY_DAYS, PARSE_HISTORY_MAX, target,
-    )
+
+
+# ── Routing: which booking does a message touch? ────────────────────────────
+# Decided in CODE, from the facts the model extracted — never by asking the
+# model to name a booking.
+#
+# Until 2026-08-20 a second Sonnet call was shown a list of candidate cleanings,
+# each tagged with its 56-character uid, and asked to copy one back. On
+# 2026-08-20 Itzel wrote "Yes Sept 10 I can do it at 11:00"; the model returned
+# the right action, the right date, the right cleaner and 0.90 confidence — and
+# the uid without its `@airbnb.com` suffix. `bookings.get()` returned None, the
+# write was refused, and because the branch that EXPLAINS a refusal also needs
+# the booking it is explaining about, the hold was recorded with no reason at
+# all. 79 of 81 uids in the archive resolved; one was truncated and one was
+# invented outright.
+#
+# The uid was never worth asking for. `target_date` is already in the facts, it
+# is human-meaningful, it can be checked against the data, and across the whole
+# two-year archive exactly one date carries two bookings. So resolve the date
+# here: zero matches is not actionable, one match applies, two or more is a
+# question for a human. That is a branch you can unit-test; a transcribed key
+# is not. The model is no longer shown the booking list at all, which is why
+# `upcoming_booking_list` is gone — the 2026-08-06 wrong-row bug (16 of 48
+# auto-applied confirmations landed on the stay that CHECKED IN that day,
+# because 53% of cleanings share a date with the next check-in) is now
+# structurally impossible rather than guarded against.
+
+ROUTE_CONFIDENCE = 0.85
+
+
+def _routable_bookings_by_date(bookings):
+    """{cleaning_date: [uid, ...]} over bookings a cleaner could be sent to."""
+    by_date = {}
+    for uid, b in bookings.items():
+        if b.get("status") != "active" or b.get("type") == "custom_stay":
+            continue
+        d = cleaning_date_for(b)
+        if d:
+            by_date.setdefault(d, []).append(uid)
+    return by_date
+
+
+def _route_from_facts(facts_list, bookings, sender_cleaner, known_cleaners, today_str):
+    """Which bookings may this message write to, and why not for the rest.
+
+    Returns `(decisions, blocks)`.
+      decisions: [{uid, action, target_date, confidence, evidence}]
+      blocks:    ["human-readable reason", ...] for facts that expressed a real
+                 scheduling intent but could not be routed.
+
+    Pure — no data access, no clock — so the rule is testable directly rather
+    than through a copy of itself (the ISC-192 lesson, kept).
+
+    A message may legitimately decide MANY bookings: the dominant real-chat
+    pattern here is a cleaner re-posting a dated list. One call, N decisions.
+    """
+    if not facts_list:
+        return [], []
+    if not sender_cleaner or sender_cleaner not in known_cleaners:
+        # Host messages and unmapped senders never write. The host's own
+        # schedule assertions are the reconciler's business, not the write
+        # path's — he is stating a plan, not accepting one.
+        return [], []
+
+    by_date = _routable_bookings_by_date(bookings)
+    decisions, blocks = [], []
+    seen = {}
+
+    for f in facts_list:
+        kind = (f.get("kind") or "").lower()
+        if kind not in ("confirm", "decline"):
+            continue
+        tgt = f.get("target_date")
+        if not tgt or tgt < today_str:
+            continue
+        if f.get("tentative"):
+            blocks.append(f"{sender_cleaner} was tentative about {tgt}")
+            continue
+        # She speaks for herself. "Itzel told me she's taking the 17th" is
+        # testimony about a third party, and the facts prompt attributes it to
+        # the SUBJECT — so without this check a cleaner could confirm on behalf
+        # of someone who never spoke.
+        if f.get("cleaner") and f["cleaner"] != sender_cleaner:
+            blocks.append(
+                f"message names {f['cleaner']} for {tgt} but was sent by {sender_cleaner}"
+            )
+            continue
+        if float(f.get("confidence") or 0.0) < ROUTE_CONFIDENCE:
+            blocks.append(f"low confidence on {tgt}")
+            continue
+
+        matches = by_date.get(tgt, [])
+        if not matches:
+            blocks.append(f"no active cleaning on {tgt}")
+            continue
+        if len(matches) > 1:
+            blocks.append(
+                f"{len(matches)} cleanings share {tgt} — which one is a question for a human"
+            )
+            continue
+
+        uid = matches[0]
+        prior = seen.get(uid)
+        if prior and prior != kind:
+            # One message that both accepts and declines the same cleaning.
+            # Drop both rather than let ordering decide.
+            decisions[:] = [d for d in decisions if d["uid"] != uid]
+            blocks.append(f"message both confirms and declines {tgt}")
+            seen[uid] = "contradiction"
+            continue
+        if seen.get(uid) == "contradiction":
+            continue
+        seen[uid] = kind
+        decisions.append({
+            "uid": uid,
+            "action": kind,
+            "target_date": tgt,
+            "confidence": float(f.get("confidence") or 0.0),
+            "evidence": f.get("evidence") or "",
+        })
+
+    return decisions, blocks
+
+
+def _synthesize_result(decisions, blocks, sender_cleaner):
+    """A `haiku_result`-shaped record, built from the routed decisions.
+
+    The Review tab, `/review/accept` and `_review_subject_date` all read this
+    field. Keeping its shape means the routing rewrite does not drag the whole
+    UI with it — and every uid in it now came from `_route_from_facts`, so it
+    always resolves.
+    """
+    if not decisions:
+        return {
+            "action": "none",
+            "booking_uid": None,
+            "cleaning_date": None,
+            "cleaner": sender_cleaner,
+            "confidence": 0.0,
+            "reason": blocks[0] if blocks else "no scheduling statement in this message",
+            "source": "facts",
+        }
+    primary = decisions[0]
+    extra = "" if len(decisions) == 1 else f" (+{len(decisions) - 1} more in the same message)"
+    return {
+        "action": primary["action"],
+        "booking_uid": primary["uid"],
+        "cleaning_date": primary["target_date"],
+        "cleaner": sender_cleaner,
+        "confidence": primary["confidence"],
+        "reason": f"{sender_cleaner} {primary['action']}ed {primary['target_date']}{extra}",
+        "source": "facts",
+    }
 
 
 def process_message(msg_id):
-    """Parse one inbound message with Haiku; auto-apply or flag for review."""
+    """Extract facts from one inbound message, then route them to bookings in code."""
     with DATA_LOCK:
         data = load_data()
         msg = _find_message(data, msg_id)
@@ -1331,16 +1323,22 @@ def process_message(msg_id):
         # Snapshot everything we need, then release the lock while we call
         # the API. Re-acquire on write.
         all_messages = [m for m in data["messages"] if m.get("id") != msg_id]
-        bookings = dict(data.get("bookings", {}))
         known = cleaner_names()
         sender_cleaner = lookup_cleaner_by_jid(data, msg.get("sender"))
         labels = dict(data.get("group_labels", {}))
         cross_facts = _cross_chat_facts(data, msg)
         roles = _sender_roles(data)
 
-    result, error = parse_whatsapp_message(msg, _parse_history(all_messages, msg), bookings, known, sender_cleaner, labels)
-    # Facts extraction runs independently of parse routing. An empty facts list
-    # is a valid result (chitchat) — only facts_err means retry via reprocess.
+    # ONE model call. It answers "what did this message say", which is the only
+    # question a language model is better at than code. Routing — "which row
+    # does that touch" — is `_route_from_facts`, below the lock re-acquire.
+    #
+    # There used to be a second call whose job was to pick a booking, and it
+    # was the only one allowed to write. It had no time field, so a revised
+    # hour was extracted correctly by this call and then discarded; it had no
+    # honest bucket for "thank you", so gratitude was rounded to `confirm` and
+    # applied; and it carried a uid it could mistype. An empty facts list is a
+    # valid result (chitchat) — only `facts_err` means retry via reprocess.
     facts_list, facts_err = facts_mod.extract_facts(
         ANTHROPIC_API_KEY, msg, _facts_history(all_messages, msg), known, labels,
         cross_facts=cross_facts, roles=roles, date_header=_date_header(msg),
@@ -1349,14 +1347,14 @@ def process_message(msg_id):
     # Out-of-credit (HTTP 400 "balance too low") is not a per-message failure —
     # it's an account-wide outage. Don't bury it as a pending parse_error;
     # alert + defer so it auto-reprocesses when credits return.
-    if _is_low_balance_error(error) or _is_low_balance_error(facts_err):
+    if _is_low_balance_error(facts_err):
         _flag_credit_exhausted(msg_id)
         with DATA_LOCK:
             data = load_data()
             m = _find_message(data, msg_id)
             if m:
                 m["parsed"] = False  # eligible for recovery requeue
-                m["parse_error"] = error or facts_err
+                m["parse_error"] = facts_err
                 m["review_state"] = "pending"
                 save_data(data)
         return
@@ -1366,95 +1364,58 @@ def process_message(msg_id):
         msg = _find_message(data, msg_id)
         if not msg:
             return
+        # Re-check under the re-acquired lock. The queue does not dedup and
+        # three paths re-enqueue (sender mapping, credit recovery, the
+        # parse-error sweeper), so two workers could both pass the entry guard
+        # above, both spend a call, and both write — on a decline, the second
+        # clearing a cleaner the first just set.
+        if msg.get("parsed"):
+            return
         msg["parsed"] = True
-        msg["parse_error"] = error
-        msg["haiku_result"] = result
+        msg["parse_error"] = facts_err
 
         if facts_list is not None:
             data.setdefault("message_facts", {})[msg_id] = facts_mod.build_record(
                 facts_list, msg.get("sender") or "",
             )
 
-        if error or not result:
+        if facts_err:
+            # Held, and now VISIBLE: `_unread_messages` in reconcile.py turns
+            # this into a finding dated to the cleaning it concerns. Before
+            # 2026-08-20 nothing anywhere watched this field, and 60 un-retried
+            # rate limits sat here unseen.
             msg["review_state"] = "pending"
+            msg["haiku_result"] = None
             save_data(data)
             return
 
-        action = (result.get("action") or "none").lower()
-        booking_uid = result.get("booking_uid")
-        cleaner = result.get("cleaner") or sender_cleaner
-
-        booking = data.get("bookings", {}).get(booking_uid) if booking_uid else None
-        auto, block = _auto_apply_decision(result, booking, sender_cleaner, cleaner, known)
-        if block:
-            msg["auto_block"] = block
+        decisions, blocks = _route_from_facts(
+            facts_list, data.get("bookings", {}), sender_cleaner, known,
+            (_msg_local_day(msg) or date.today()).isoformat(),
+        )
+        msg["haiku_result"] = _synthesize_result(decisions, blocks, sender_cleaner)
+        if blocks and not decisions:
+            msg["auto_block"] = "Held for review: " + "; ".join(blocks[:3])
         else:
             msg.pop("auto_block", None)
 
-        if action == "none":
-            msg["review_state"] = "ignored"
-        elif auto:
-            _apply_booking_change(data, booking_uid, cleaner, action, msg,
-                                  facts_list=facts_list)
+        if decisions:
+            for d in decisions:
+                _apply_booking_change(data, d["uid"], sender_cleaner, d["action"], msg,
+                                      facts_list=facts_list)
             msg["review_state"] = "auto"
-            msg["applied_uid"] = booking_uid
-        else:
+            msg["applied_uid"] = decisions[0]["uid"]
+            # One re-posted list confirms many dates; `applied_uid` is singular
+            # and predates that, so the full set rides alongside it.
+            msg["applied_uids"] = [d["uid"] for d in decisions]
+        elif blocks:
             msg["review_state"] = "pending"
+        else:
+            msg["review_state"] = "ignored"
 
         save_data(data)
 
 
-def _auto_apply_decision(result, booking, sender_cleaner, cleaner, known_cleaners):
-    """May this parse result write to a booking with no human in the loop?
-
-    Returns `(auto, block_reason)`. Pure: no data access, no clock, so the
-    rule can be tested directly instead of through a copy of itself.
-
-    The load-bearing clause is `cleaning_date == booking["end"]`, added
-    2026-08-06. Every other clause was already here, and together they still
-    let a wrong answer through, because confidence does not mean what it looks
-    like it means. It is the model's certainty about its READING of the
-    sentence — and on the message that started this, "Hello guys I'm here",
-    that reading was correct: a known cleaner really was confirming a real
-    cleaning, at 0.90. What the score could not express is whether the uid it
-    attached that reading to was the right row, because nothing in the
-    pipeline had ever compared that uid to anything. A number a model reports
-    about itself can never contradict itself. Two fields that must agree can:
-    the model now names the cleaning day in its own words, and if that day is
-    not the chosen booking's cleaning day, one of the two is wrong and a human
-    looks at it.
-
-    Fails closed on a missing `cleaning_date` — an older cached result, or a
-    model that ignored the schema, is exactly the case not to trust.
-    """
-    action = (result.get("action") or "none").lower()
-    if action not in ("confirm", "decline"):
-        return False, None
-
-    confidence = float(result.get("confidence") or 0.0)
-    claimed_date = (result.get("cleaning_date") or "").strip() or None
-    booking_date = (booking or {}).get("end")
-    date_agrees = booking is not None and claimed_date is not None and claimed_date == booking_date
-
-    auto = (
-        confidence >= AUTO_APPLY_CONFIDENCE
-        and sender_cleaner is not None
-        and booking is not None
-        and date_agrees
-        and cleaner in known_cleaners
-    )
-    if auto:
-        return True, None
-
-    # Only explain the date disagreement — the other gates (unknown sender,
-    # unmapped cleaner, low confidence) are already legible in the review card.
-    if booking is not None and not date_agrees:
-        return False, (
-            f"Held for review: the model said this message is about the "
-            f"{claimed_date or '(unstated)'} cleaning, but picked the booking "
-            f"cleaned {booking_date}. Those must agree to auto-apply."
-        )
-    return False, None
 
 
 def _find_message(data, msg_id):

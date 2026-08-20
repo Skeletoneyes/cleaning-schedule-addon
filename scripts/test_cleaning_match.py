@@ -1,25 +1,45 @@
-"""Unit tests for cleaning-vs-reservation matching and the auto-apply gate.
+"""Unit tests for booking routing — the rule that decides which cleaning a
+message touches, and whether it may write unattended.
 
-Covers the 2026-08-06 fix. On 2026-08-05 Itzel messaged "Hello guys I'm here"
-at 12:12 local, on her way into the cleaning for the stay that CHECKED OUT
-that day. It was auto-applied, at 0.90 confidence, to the stay that CHECKED IN
-that day — marking the Aug 10 cleaning confirmed on the strength of a message
-about Aug 5. An audit of the archive found 16 of 48 auto-applied confirmations
-had done the same thing, because 53% of cleanings here fall on a day that is
-also the next guest's check-in.
+## The history this file carries
 
-Two causes, one test file:
-  A. The candidate list handed the model RESERVATIONS (two dates each,
-     labelled "Aug 05 → Aug 10"), so on a turnover day two rows displayed the
-     same date. It now hands over CLEANINGS — one date per row.
+**2026-08-05.** Itzel messaged "Hello guys I'm here" at 12:12 local, walking
+into the cleaning for the stay that CHECKED OUT that day. It was auto-applied,
+at 0.90 confidence, to the stay that CHECKED IN that day — marking the Aug 10
+cleaning confirmed on the strength of a message about Aug 5. An audit found
+**16 of 48** auto-applied confirmations had done the same thing, because 53% of
+cleanings here fall on a day that is also the next guest's check-in.
+
+Two causes were found, and only the second one has since been closed properly:
+
+  A. The candidate list handed the model RESERVATIONS (two dates each, labelled
+     "Aug 05 → Aug 10"), so on a turnover day two rows displayed the same date.
+     The 1.35.0 fix reshaped it to one date per row.
   B. Nothing checked the answer. `confidence` is the model's certainty about
      its reading of the sentence, not about the row it picked, so a confident
-     wrong answer had nothing to fail against. The model now states the
-     cleaning day separately and the gate requires the two to agree.
+     wrong answer had nothing to fail against.
 
-Same harness as test_parser_context.py: pull the real function source out of
-app.py with `ast` and exec it against injected fakes, so a rename or reshape
-fails loudly here instead of passing against a stale copy.
+**2026-08-20.** Cause A came back in a different costume. Itzel wrote "Yes Sept
+10 I can do it at 11:00"; the model returned the right action, the right date,
+the right cleaner and 0.90 confidence — and the booking uid **without its
+`@airbnb.com` suffix**. The lookup returned None, the write was refused, and
+because the branch that explains a refusal also needed the booking it was
+explaining about, the hold was recorded with no reason at all. 79 of 81 uids in
+the archive resolved; one was truncated, one was invented.
+
+The fix is not a better gate on the uid. It is that **the model is no longer
+asked for a uid, and is no longer shown the booking list at all.** It reports
+what was said; `_route_from_facts` resolves the stated date against the data.
+So cause A is now structurally impossible rather than guarded, and cause B is
+answered by a resolution that either finds exactly one booking or refuses.
+
+That is why `upcoming_booking_list` and `_auto_apply_decision` no longer exist,
+and why this file tests `_route_from_facts` instead. Do not reintroduce a
+model-supplied identifier.
+
+Same harness as before: the real function source is pulled out of app.py with
+`ast` and exec'd against injected fakes, so a rename or reshape fails loudly
+here instead of passing against a stale copy.
 
 Run: python3 scripts/test_cleaning_match.py
 """
@@ -27,7 +47,6 @@ from __future__ import annotations
 
 import ast
 import sys
-import types
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -52,204 +71,180 @@ def _extract(names, ns):
 
 NS = {
     "date": date, "datetime": datetime, "timedelta": timedelta,
-    "AUTO_APPLY_CONFIDENCE": 0.85,
-    # Only LOCAL_TZ is reached for; a stub keeps the test off gcal's imports.
-    "gcal_mod": types.SimpleNamespace(LOCAL_TZ="America/Vancouver"),
+    "ROUTE_CONFIDENCE": 0.85,
 }
-_extract(["_msg_local_day", "_relative_day", "upcoming_booking_list",
-          "_auto_apply_decision", "_date_header"], NS)
+_extract(["cleaning_date_for", "_routable_bookings_by_date", "_route_from_facts",
+          "_synthesize_result"], NS)
+route = NS["_route_from_facts"]
+synth = NS["_synthesize_result"]
 
-msg_local_day = NS["_msg_local_day"]
-booking_list = NS["upcoming_booking_list"]
-decide = NS["_auto_apply_decision"]
-date_header = NS["_date_header"]
+KNOWN = ["Itzel", "Darya"]
+TODAY = "2026-08-20"
 
-# The real shape of the two bookings that collided, from the live snapshot.
+# The real shape of the two bookings that collided on 2026-08-05.
 CHECKING_OUT = "1418fb94e984-out@airbnb.com"   # Aug 03 → Aug 05, cleaned Aug 5
 CHECKING_IN = "1418fb94e984-in@airbnb.com"     # Aug 05 → Aug 10, cleaned Aug 10
 
 TURNOVER = {
-    CHECKING_OUT: {"start": "2026-08-03", "end": "2026-08-05",
-                   "status": "active", "cleaner": "Itzel"},
-    CHECKING_IN: {"start": "2026-08-05", "end": "2026-08-10",
-                  "status": "active", "cleaner": "Itzel"},
+    CHECKING_OUT: {"start": "2026-08-03", "end": "2026-08-05", "status": "active",
+                   "type": "airbnb", "cleaner": "Itzel"},
+    CHECKING_IN: {"start": "2026-08-05", "end": "2026-08-10", "status": "active",
+                  "type": "airbnb", "cleaner": "Itzel"},
+}
+
+SEPT = {
+    "1418fb94e984-sept10@airbnb.com": {"start": "2026-09-08", "end": "2026-09-10",
+                                       "status": "active", "type": "airbnb", "cleaner": None},
+    "1418fb94e984-sept14@airbnb.com": {"start": "2026-09-10", "end": "2026-09-14",
+                                       "status": "active", "type": "airbnb", "cleaner": "Itzel"},
 }
 
 
-class CandidateListTests(unittest.TestCase):
-    """A: the model can only match on a date it is actually shown."""
-
-    def test_a_turnover_day_appears_once_not_twice(self):
-        """The whole bug in one assertion. Aug 5 is a checkout AND a check-in;
-        exactly one row may carry it, and it must be the cleaning."""
-        rows = booking_list(TURNOVER, anchor=date(2026, 8, 5))
-        on_aug5 = [r for r in rows if r["cleaning_date"] == "2026-08-05"]
-        self.assertEqual(len(on_aug5), 1)
-        self.assertEqual(on_aug5[0]["uid"], CHECKING_OUT)
-
-    def test_check_in_dates_are_not_emitted_at_all(self):
-        """Aug 03 and Aug 05 are check-ins. Neither may appear as a value
-        anywhere in a row — not as a field, not inside a label."""
-        rows = booking_list(TURNOVER, anchor=date(2026, 8, 5))
-        for row in rows:
-            self.assertNotIn("checkin", row)
-            self.assertNotIn("checkout", row)
-            self.assertNotIn("label", row)
-            self.assertNotIn("2026-08-03", str(row))
-
-    def test_todays_cleaning_is_labelled_today(self):
-        rows = booking_list(TURNOVER, anchor=date(2026, 8, 5))
-        by_uid = {r["uid"]: r for r in rows}
-        self.assertEqual(by_uid[CHECKING_OUT]["when"], "today")
-        self.assertEqual(by_uid[CHECKING_IN]["when"], "in 5 days")
-
-    def test_relative_wording_across_the_window(self):
-        rel = NS["_relative_day"]
-        self.assertEqual(rel(0), "today")
-        self.assertEqual(rel(1), "tomorrow")
-        self.assertEqual(rel(-1), "yesterday")
-        self.assertEqual(rel(5), "in 5 days")
-        self.assertEqual(rel(-3), "3 days ago")
-
-    def test_the_anchor_moves_the_window_for_backfill(self):
-        """A February message reprocessed in August must see February's
-        candidates. Anchoring on today instead offered it a random summer
-        booking — five archived messages were applied that way."""
-        feb = {"feb": {"start": "2026-02-01", "end": "2026-02-04",
-                       "status": "active", "cleaner": "Itzel"}}
-        self.assertEqual(booking_list(feb, anchor=date(2026, 8, 5)), [])
-        rows = booking_list(feb, anchor=date(2026, 2, 3))
-        self.assertEqual([r["uid"] for r in rows], ["feb"])
-        self.assertEqual(rows[0]["when"], "tomorrow")
-
-    def test_window_bounds_hold_against_the_anchor(self):
-        b = {
-            "old": {"start": "2026-07-25", "end": "2026-08-01",
-                    "status": "active", "cleaner": None},   # 4 days back — out
-            "edge": {"start": "2026-07-25", "end": "2026-08-02",
-                     "status": "active", "cleaner": None},  # 3 days back — in
-            "far": {"start": "2026-10-01", "end": "2026-10-06",
-                    "status": "active", "cleaner": None},   # 62 days on — out
-        }
-        uids = {r["uid"] for r in booking_list(b, anchor=date(2026, 8, 5))}
-        self.assertEqual(uids, {"edge"})
-
-    def test_cancelled_and_complete_bookings_are_never_candidates(self):
-        b = {
-            "gone": {"start": "2026-08-03", "end": "2026-08-05",
-                     "status": "cancelled", "cleaner": "Itzel"},
-            "done": {"start": "2026-08-03", "end": "2026-08-05",
-                     "status": "complete", "cleaner": "Itzel"},
-        }
-        self.assertEqual(booking_list(b, anchor=date(2026, 8, 5)), [])
-
-    def test_malformed_dates_are_skipped_not_raised(self):
-        b = {"bad": {"start": "2026-08-03", "end": "not-a-date",
-                     "status": "active", "cleaner": None},
-             "nodate": {"start": "2026-08-03", "status": "active", "cleaner": None}}
-        self.assertEqual(booking_list(b, anchor=date(2026, 8, 5)), [])
-
-    def test_rows_are_sorted_by_cleaning_day(self):
-        rows = booking_list(TURNOVER, anchor=date(2026, 8, 5))
-        self.assertEqual([r["cleaning_date"] for r in rows],
-                         ["2026-08-05", "2026-08-10"])
+def fact(kind="confirm", d="2026-09-10", cleaner="Itzel", conf=0.95,
+         tentative=False, time=None, ev="Sept 10- 11:00"):
+    return {"kind": kind, "target_date": d, "cleaner": cleaner, "confidence": conf,
+            "tentative": tentative, "target_time": time, "evidence": ev}
 
 
-class LocalDayTests(unittest.TestCase):
-    """The anchor is a LOCAL day. Live timestamps are UTC."""
+class TurnoverDay(unittest.TestCase):
+    """Cause A, the 2026-08-05 wrong-row bug, at its source."""
 
-    def test_the_real_message_resolves_to_its_local_day(self):
-        """19:12Z on Aug 5 is 12:12 PDT on Aug 5 — the actual message."""
-        self.assertEqual(msg_local_day({"timestamp": "2026-08-05T19:12:30.000Z"}),
-                         date(2026, 8, 5))
+    def test_a_turnover_day_resolves_to_the_checkout_not_the_checkin(self):
+        """Aug 5 is both a checkout and a check-in. Only the checkout is a
+        cleaning, so only one booking can ever match — the collision the model
+        used to resolve by guessing no longer reaches it."""
+        d, blocks = route([fact(d="2026-08-05")], TURNOVER, "Itzel", KNOWN, "2026-08-01")
+        self.assertEqual([x["uid"] for x in d], [CHECKING_OUT])
+        self.assertEqual(blocks, [])
 
-    def test_an_evening_message_does_not_roll_into_tomorrow(self):
-        """18:00 PDT is 01:00Z the NEXT day. Slicing ts[:10] would anchor
-        "today" one day late and every relative term with it."""
-        self.assertEqual(msg_local_day({"timestamp": "2026-08-06T01:00:00.000Z"}),
-                         date(2026, 8, 5))
-
-    def test_naive_backfill_timestamps_pass_through_as_local(self):
-        self.assertEqual(msg_local_day({"timestamp": "2026-07-28T14:08:00"}),
-                         date(2026, 7, 28))
-
-    def test_garbage_returns_the_default_not_an_exception(self):
-        for bad in (None, "", "nope", "2026-13-99T00:00:00"):
-            self.assertIsNone(msg_local_day({"timestamp": bad}))
-        self.assertEqual(msg_local_day({}, default=date(2026, 1, 1)), date(2026, 1, 1))
-
-    def test_the_prompt_header_agrees_with_the_candidate_list(self):
-        """Both must call the same day "today" — the gate compares against a
-        date the model derived from the header."""
-        msg = {"timestamp": "2026-08-06T01:00:00.000Z"}   # Aug 5 local
-        header = date_header(msg, today=date(2026, 8, 20))
-        self.assertIn("SENT ON 2026-08-05", header)
+    def test_the_checkin_stay_is_reachable_only_by_its_own_cleaning_date(self):
+        d, _ = route([fact(d="2026-08-10")], TURNOVER, "Itzel", KNOWN, "2026-08-01")
+        self.assertEqual([x["uid"] for x in d], [CHECKING_IN])
 
 
-class AutoApplyGateTests(unittest.TestCase):
-    """B: the answer gets checked, not just scored."""
+class TheSeptTenCase(unittest.TestCase):
+    """The 2026-08-20 regression, end to end."""
 
-    KNOWN = ["Itzel", "Darya"]
+    def test_the_message_that_started_this_now_routes(self):
+        facts = [fact(kind="unclear", d="2026-09-27", conf=0.4),
+                 fact(kind="confirm", d="2026-09-10", conf=0.9,
+                      ev="Yes Sept 10 I can do it at 11:00")]
+        d, blocks = route(facts, SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0]["uid"], "1418fb94e984-sept10@airbnb.com")
+        self.assertEqual(d[0]["action"], "confirm")
 
-    def _result(self, **over):
-        base = {"action": "confirm", "confidence": 0.95, "cleaning_date": "2026-08-05"}
-        base.update(over)
-        return base
+    def test_no_identifier_is_ever_read_from_the_model(self):
+        """The regression guard. If a uid ever reappears in the fact schema it
+        must not be trusted — routing is by date, resolved against the data."""
+        f = fact()
+        f["booking_uid"] = "totally-made-up-uid"
+        d, _ = route([f], SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d[0]["uid"], "1418fb94e984-sept10@airbnb.com")
 
-    def test_the_original_failure_is_now_held(self):
-        """0.90 confidence, known cleaner, real booking — and still wrong,
-        because the day it named is not the day that booking is cleaned."""
-        auto, block = decide(
-            self._result(confidence=0.90, cleaning_date="2026-08-05"),
-            TURNOVER[CHECKING_IN], "Itzel", "Itzel", self.KNOWN)
-        self.assertFalse(auto)
-        self.assertIn("2026-08-05", block)
-        self.assertIn("2026-08-10", block)
 
-    def test_agreement_still_auto_applies(self):
-        auto, block = decide(self._result(), TURNOVER[CHECKING_OUT],
-                             "Itzel", "Itzel", self.KNOWN)
-        self.assertTrue(auto)
-        self.assertIsNone(block)
+class RoutingRules(unittest.TestCase):
+    def test_a_reposted_list_decides_many_bookings_in_one_message(self):
+        """The dominant real-chat pattern. The old one-booking-per-message
+        contract could express only the first of these."""
+        d, _ = route([fact(d="2026-09-10"), fact(d="2026-09-14")],
+                     SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(len(d), 2)
 
-    def test_a_missing_cleaning_date_fails_closed(self):
-        """Old cached results and schema-ignoring replies are exactly the
-        cases not to trust — absence must not read as agreement."""
-        for missing in (None, "", "   "):
-            auto, block = decide(self._result(cleaning_date=missing),
-                                 TURNOVER[CHECKING_OUT], "Itzel", "Itzel", self.KNOWN)
-            self.assertFalse(auto, f"cleaning_date={missing!r} must not auto-apply")
-            self.assertIn("(unstated)", block)
+    def test_past_dates_are_ignored(self):
+        d, blocks = route([fact(d="2026-08-05")], TURNOVER, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertEqual(blocks, [])
 
-    def test_declines_are_gated_the_same_way(self):
-        auto, _ = decide(self._result(action="decline", cleaning_date="2026-08-10"),
-                         TURNOVER[CHECKING_OUT], "Itzel", "Itzel", self.KNOWN)
-        self.assertFalse(auto)
-        auto, _ = decide(self._result(action="decline"),
-                         TURNOVER[CHECKING_OUT], "Itzel", "Itzel", self.KNOWN)
-        self.assertTrue(auto)
+    def test_an_unmapped_sender_never_writes(self):
+        d, blocks = route([fact()], SEPT, None, KNOWN, TODAY)
+        self.assertEqual(d, [])
 
-    def test_every_pre_existing_gate_still_bites(self):
-        ok = (TURNOVER[CHECKING_OUT], "Itzel", "Itzel", self.KNOWN)
-        self.assertFalse(decide(self._result(confidence=0.84), *ok)[0])
-        self.assertFalse(decide(self._result(), TURNOVER[CHECKING_OUT],
-                                None, "Itzel", self.KNOWN)[0])   # unmapped sender
-        self.assertFalse(decide(self._result(), TURNOVER[CHECKING_OUT],
-                                "Itzel", "Nobody", self.KNOWN)[0])  # unknown cleaner
-        self.assertFalse(decide(self._result(), None,
-                                "Itzel", "Itzel", self.KNOWN)[0])   # no such booking
+    def test_the_host_never_writes(self):
+        """Host schedule assertions are the reconciler's business. He is
+        stating a plan, not accepting one."""
+        d, _ = route([{"kind": "schedule_assertion", "target_date": "2026-09-10",
+                       "cleaner": "Itzel", "confidence": 0.95}],
+                     SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
 
-    def test_non_actionable_messages_are_not_blocked_they_are_ignored(self):
-        auto, block = decide({"action": "none"}, None, "Itzel", "Itzel", self.KNOWN)
-        self.assertFalse(auto)
-        self.assertIsNone(block, "chit-chat must not produce a review-tab warning")
+    def test_a_cleaner_cannot_confirm_on_someone_elses_behalf(self):
+        """"Itzel told me she's taking the 17th" is testimony. The facts prompt
+        attributes it to the SUBJECT, so without this check Darya could confirm
+        a booking for Itzel, who never spoke."""
+        d, blocks = route([fact(cleaner="Itzel")], SEPT, "Darya", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertIn("was sent by Darya", blocks[0])
 
-    def test_an_unknown_booking_produces_no_date_complaint(self):
-        """With no booking there is nothing to disagree with — the review card
-        already says the uid was unknown."""
-        auto, block = decide(self._result(), None, "Itzel", "Itzel", self.KNOWN)
-        self.assertFalse(auto)
-        self.assertIsNone(block)
+    def test_tentative_is_held(self):
+        d, blocks = route([fact(tentative=True)], SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertIn("tentative", blocks[0])
+
+    def test_low_confidence_is_held(self):
+        d, blocks = route([fact(conf=0.5)], SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+
+    def test_a_date_with_no_booking_is_held_not_invented(self):
+        d, blocks = route([fact(d="2026-12-25")], SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertIn("no active cleaning on 2026-12-25", blocks)
+
+    def test_an_ambiguous_date_is_a_question_for_a_human(self):
+        """Exactly one date in the two-year archive carries two bookings. When
+        it happens the old design let the model pick one silently."""
+        ambiguous = dict(SEPT)
+        ambiguous["manual-extra"] = {"start": "2026-09-10", "end": "2026-09-10",
+                                     "status": "active", "type": "manual_cleaning",
+                                     "cleaner": None}
+        d, blocks = route([fact(d="2026-09-10")], ambiguous, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertIn("2 cleanings share 2026-09-10", blocks[0])
+
+    def test_cancelled_and_custom_stays_are_not_routable(self):
+        bookings = {"c": {"end": "2026-09-10", "status": "cancelled", "type": "airbnb"},
+                    "s": {"end": "2026-09-10", "status": "active", "type": "custom_stay"}}
+        d, blocks = route([fact()], bookings, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertIn("no active cleaning", blocks[0])
+
+    def test_a_message_that_both_confirms_and_declines_one_date_writes_nothing(self):
+        d, blocks = route([fact(kind="confirm"), fact(kind="decline")],
+                          SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d, [])
+        self.assertIn("both confirms and declines", blocks[-1])
+
+    def test_a_decline_routes(self):
+        d, _ = route([fact(kind="decline", d="2026-09-14")], SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual(d[0]["action"], "decline")
+
+    def test_chitchat_yields_nothing_and_blocks_nothing(self):
+        """"Okay! Thank you!" must produce neither a write nor a review item.
+        The old contract had no honest bucket for it and rounded it to confirm."""
+        d, blocks = route([], SEPT, "Itzel", KNOWN, TODAY)
+        self.assertEqual((d, blocks), ([], []))
+
+
+class SynthesizedResult(unittest.TestCase):
+    """The Review tab, /review/accept and _review_subject_date all read this."""
+
+    def test_uid_always_resolves_because_code_chose_it(self):
+        d, _ = route([fact()], SEPT, "Itzel", KNOWN, TODAY)
+        res = synth(d, [], "Itzel")
+        self.assertIn(res["booking_uid"], SEPT)
+        self.assertEqual(res["cleaning_date"], "2026-09-10")
+        self.assertEqual(res["source"], "facts")
+
+    def test_no_decision_reports_the_reason_rather_than_nothing(self):
+        d, blocks = route([fact(d="2026-12-25")], SEPT, "Itzel", KNOWN, TODAY)
+        res = synth(d, blocks, "Itzel")
+        self.assertEqual(res["action"], "none")
+        self.assertIn("2026-12-25", res["reason"])
+
+    def test_a_multi_date_message_says_so(self):
+        d, _ = route([fact(d="2026-09-10"), fact(d="2026-09-14")],
+                     SEPT, "Itzel", KNOWN, TODAY)
+        self.assertIn("+1 more", synth(d, [], "Itzel")["reason"])
 
 
 if __name__ == "__main__":

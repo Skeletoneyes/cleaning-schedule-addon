@@ -46,7 +46,7 @@ NS = {
     "CROSS_FACTS_BACK_DAYS": 7, "CROSS_FACTS_FWD_DAYS": 150, "CROSS_FACTS_MAX_LINES": 80,
 }
 _extract(["_msg_day", "_window_by_count_or_days", "_facts_history",
-          "_cross_chat_facts", "_parse_history"], NS)
+          "_cross_chat_facts"], NS)
 
 NS2 = _extract(["_sender_roles"], dict(NS))
 
