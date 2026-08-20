@@ -738,8 +738,17 @@ def _merge_ical_events(cal):
         and (b.get("end") or "") >= today.isoformat()
     ]
     to_cancel = [uid for uid in future_active if uid not in seen_uids]
+    # Logged on EVERY poll, not only when it trips: a guard that is silent
+    # until it fires cannot be distinguished from one that never evaluated.
+    print(f"[sync] feed carried {len(seen_uids)} reservation(s); "
+          f"{len(to_cancel)} of {len(future_active)} future booking(s) absent")
     if to_cancel and (
         not seen_uids
+        # A TOTAL wipe is suspicious at any count. Without this clause the
+        # ratio+floor test is inert exactly where this household lives: at
+        # three future bookings, a feed cancelling all three sails under the
+        # >=4 floor and takes the whole schedule with it.
+        or len(to_cancel) == len(future_active)
         or (len(to_cancel) >= MASS_CANCEL_MIN and len(to_cancel) > MASS_CANCEL_RATIO * len(future_active))
     ):
         raise SuspiciousFeed(

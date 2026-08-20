@@ -143,6 +143,22 @@ class MassCancelCase(unittest.TestCase):
         self.assertTrue(all(self.data["bookings"][f"p{i}"]["status"] == "complete"
                             for i in range(6)))
 
+    def test_a_total_wipe_is_refused_at_any_count(self):
+        """The floor+ratio test is inert exactly where this household lives.
+        With three future bookings, a feed cancelling all three is under the
+        >=4 floor — a 100% wipe that would have sailed through."""
+        self.data["bookings"] = {
+            f"u{i}": {"start": _d(i * 5), "end": _d(i * 5 + 3), "status": "active",
+                      "type": "airbnb", "cleaner": "Itzel"}
+            for i in range(1, 4)
+        }
+        # feed returns a PAST reservation, so seen_uids is non-empty
+        self.data["bookings"]["past"] = {"start": _d(-20), "end": _d(-17),
+                                         "status": "active", "type": "airbnb"}
+        with self.assertRaises(self.SuspiciousFeed):
+            self.merge(Cal([_vevent("past", _d(-20), _d(-17))]))
+        self.assertEqual(self.saved, [])
+
     def test_manual_cleanings_are_untouched(self):
         self.data["bookings"]["manual-1"] = {"start": _d(4), "end": _d(4),
                                              "status": "active", "type": "manual_cleaning"}
