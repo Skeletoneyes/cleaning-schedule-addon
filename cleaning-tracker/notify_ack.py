@@ -34,6 +34,72 @@ bug, and this system's whole problem has been things happening (or not) without
 anyone being told why.
 """
 
+from datetime import datetime, timedelta, timezone
+
+
+# The bridge stamps live messages in UTC; everything written on the Pi is naive
+# local. Both land in the same comparison, so one of them has to be converted
+# rather than trusted.
+#
+# A fixed offset would be wrong for half the year — Vancouver is UTC-7 in
+# summer and UTC-8 in winter — and a plausible-looking constant that is wrong
+# seasonally is the same shape as the bug this function exists to fix.
+# `app.py::_msg_local_day` and `gcal.py::_parse_gcal_dt` already resolve the
+# real zone through `zoneinfo`; this matches them.
+LOCAL_TZ_NAME = "America/Vancouver"
+
+# Fallback only if the tz database is unavailable. UTC-8 is deliberate: it
+# places a naive local stamp EARLIER in absolute terms than UTC-7 would, which
+# makes the strictly-after test harder to pass. If this fallback is ever wrong
+# it suppresses an acknowledgement rather than inventing one.
+_FALLBACK_TZ = timezone(timedelta(hours=-8))
+
+
+def _local_tz():
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo(LOCAL_TZ_NAME)
+    except Exception:
+        return _FALLBACK_TZ
+
+
+def _as_instant(ts):
+    """Parse either stored timestamp shape into an aware datetime, or None.
+
+    Two shapes are live in the archive and they are NOT comparable as strings:
+
+        2026-08-20T05:53:19.000Z   UTC, from the WhatsApp bridge   (241 of 724)
+        2026-07-30T12:35:00        naive local, written on the Pi  (483 of 724)
+
+    Every message ingested since 2026-04-21 is the first shape; all 45
+    `communicated_at` values are the second. The old code compared them with
+    `<=` as raw strings, so UTC read seven hours AHEAD of the same instant and
+    a message sent up to seven hours BEFORE a commitment counted as coming
+    after it. The `.000Z` suffix compounded it — `...:19.000Z` > `...:19`
+    lexically, so even identical instants resolved to "after".
+
+    The direction is what makes it serious: it fails OPEN. It manufactures
+    acknowledgements, marking a cleaner as told by a message that predates the
+    thing she is supposed to have been told about, and then the notify queue
+    goes quiet on exactly that booking.
+
+    A naive value is interpreted as local, which is what wrote it.
+    """
+    if not ts:
+        return None
+    t = str(ts).strip()
+    if not t:
+        return None
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        # Unparseable is not "long ago" — fail closed by refusing to use it,
+        # so a malformed stamp can never satisfy the strictly-after test.
+        return None
+    return dt.replace(tzinfo=_local_tz()) if dt.tzinfo is None else dt
+
 
 def _fact_time(msg):
     return (msg or {}).get("timestamp") or ""
@@ -81,6 +147,7 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
     commitment = booking.get("cleaner_commitment") or {}
     displaced = commitment.get("cleaner")
     since = commitment.get("communicated_at") or ""
+    since_dt = _as_instant(since)
     current_cleaner = booking.get("cleaner")
     current_time = booking.get("clean_time")
     target_date = booking.get("end")
@@ -102,10 +169,14 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
             msg = (messages_by_id or {}).get(msg_id) or {}
             if chat and msg.get("group") != chat:
                 continue
-            ts = _fact_time(msg)
             # Strictly after the last recorded communication: a message that
-            # predates the change cannot be telling anyone about it.
-            if not ts or ts <= since:
+            # predates the change cannot be telling anyone about it. Compared
+            # as instants, never as strings — see `_as_instant`. The raw string
+            # is kept separately because it is what `describe()` renders and
+            # what the caller stores; only the comparison needs the instant.
+            ts = _fact_time(msg)
+            ts_at = _as_instant(ts)
+            if ts_at is None or since_dt is None or ts_at <= since_dt:
                 continue
             for f in rec.get("facts") or []:
                 if f.get("target_date") != target_date:
@@ -122,11 +193,11 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
                         and f.get("cleaner") == displaced):
                     cand = {
                         "cleaner": cleaner, "verdict": "declined-herself",
-                        "message_id": msg_id, "timestamp": ts,
+                        "message_id": msg_id, "timestamp": ts, "at": ts_at,
                         "group": msg.get("group"),
                         "quote": (f.get("evidence") or msg.get("text") or "")[:300],
                     }
-                    if best is None or ts > best["timestamp"]:
+                    if best is None or ts_at > best["at"]:
                         best = cand
                     continue
 
@@ -141,10 +212,10 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
                 if verdict in ("told-moved", "told-current"):
                     cand = {
                         "cleaner": cleaner, "verdict": verdict, "message_id": msg_id,
-                        "timestamp": ts, "group": msg.get("group"),
+                        "timestamp": ts, "at": ts_at, "group": msg.get("group"),
                         "quote": (f.get("evidence") or msg.get("text") or "")[:300],
                     }
-                    if best is None or ts > best["timestamp"]:
+                    if best is None or ts_at > best["at"]:
                         best = cand
                 elif verdict == "reaffirms-stale":
                     # Seen and deliberately not used. Recorded so the caller can

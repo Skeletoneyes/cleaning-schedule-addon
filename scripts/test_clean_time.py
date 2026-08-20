@@ -281,16 +281,60 @@ class TimeAgreementDetectorTests(unittest.TestCase):
         self.bookings["u1"]["clean_time"] = "11:00:00"
         self.assertEqual(self.run_det(), [])
 
-    def test_unagreed_time_is_flagged_because_gcal_invents_one(self):
-        """ISC-214: gcal.py substitutes 11:00:00, so absence renders on the
-        shared calendar as an agreed-looking hour."""
+    def test_unagreed_time_is_flagged(self):
+        """ISC-214, restated 2026-08-20.
+
+        The detector's reason for existing is unchanged — an unagreed time is
+        worth raising. Its RATIONALE changed: `gcal.py` no longer substitutes
+        11:00, so the finding must not claim it does. A finding that describes
+        behaviour the code no longer has is a wrong statement sitting in the
+        answering path, which this project's own rule forbids."""
         self.bookings["u1"]["clean_time"] = None
         self.facts = {}
         out = self.run_det()
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["kind"], "time_unagreed")
         self.assertEqual(out[0]["severity"], "suggest")
-        self.assertIn("11:00 AM", out[0]["why"])
+        self.assertNotIn("11:00", out[0]["why"],
+                         "the finding still claims the calendar fabricates a time")
+        self.assertIn("all-day", out[0]["why"])
+
+    def test_gcal_no_longer_fabricates_a_time(self):
+        """The change the finding above now describes. An untimed cleaning must
+        render as all-day, never as a plausible-looking hour on the one surface
+        the cleaners read."""
+        import ast
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent
+               / "cleaning-tracker" / "gcal.py").read_text()
+        tree = ast.parse(src)
+
+        # Check the CODE, not the text. Both previous attempts at this guard
+        # matched the docstring that describes the old bug — a test that fails
+        # on its own explanation of what it prevents.
+        desired = next(n for n in tree.body
+                       if isinstance(n, ast.FunctionDef) and n.name == "_desired_events")
+        body = ast.unparse(desired)
+        self.assertNotIn('"11:00:00"', body,
+                         "_desired_events still hardcodes a cleaning time")
+        self.assertEqual(body.count("_event_window("), 2,
+                         "both cleaning-event sites must go through _event_window")
+
+        ns = {"datetime": datetime, "timedelta": timedelta, "LOCAL_TZ": "America/Vancouver"}
+        for n in ast.parse(src).body:
+            if isinstance(n, ast.FunctionDef) and n.name == "_event_window":
+                exec(compile(ast.Module(body=[n], type_ignores=[]), "gcal.py", "exec"), ns)
+        window = ns["_event_window"]
+
+        start, end = window(date(2026, 9, 10), None)
+        self.assertEqual(start, {"date": "2026-09-10"})
+        self.assertEqual(end, {"date": "2026-09-11"},
+                         "Google treats an all-day end date as exclusive")
+        self.assertNotIn("dateTime", start)
+
+        start, end = window(date(2026, 9, 10), "13:00:00")
+        self.assertEqual(start["dateTime"], "2026-09-10T13:00:00")
+        self.assertEqual(end["dateTime"], "2026-09-10T15:00:00")
 
     def test_unagreed_beyond_the_horizon_is_quiet(self):
         """ISC-215: a booking nine months out is true and unimportant today."""

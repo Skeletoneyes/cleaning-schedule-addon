@@ -848,9 +848,14 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
                 "booking_uid": uid,
                 "cleaner": cleaner,
                 "date": d,
-                "why": (f"No agreed time for the {d} cleaning ({cleaner}); the "
-                        f"shared calendar is showing 11:00 AM as a default, "
-                        f"which nobody actually agreed to"),
+                # Wording changed 2026-08-20 with the gcal fix. It used to say
+                # the calendar "is showing 11:00 AM as a default" — true then,
+                # false the moment `_event_window` started rendering untimed
+                # cleanings as all-day. A finding that describes a behaviour the
+                # code no longer has is a wrong statement in the answering path.
+                "why": (f"No agreed time for the {d} cleaning ({cleaner}); it "
+                        f"shows on the shared calendar as all-day, so she has "
+                        f"no hour to plan around"),
                 "evidence": [],
             })
 

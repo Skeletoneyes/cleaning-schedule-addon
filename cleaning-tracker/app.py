@@ -471,6 +471,25 @@ def load_data():
     for uid, b in data.get("bookings", {}).items():
         if "type" not in b:
             b["type"] = "manual_cleaning" if uid.startswith("manual-") else "airbnb"
+        # Lazy backfill of a time that only ever reached free text.
+        #
+        # `_parse_clean_time` was written for exactly this and then never
+        # called — 17 live bookings carry `clean_time: null` beside a notes
+        # string like "Time: 5:00 PM" that it parses cleanly. That is what a
+        # nullable scalar does to the humans around it: when the typed slot
+        # cannot hold the answer, the answer goes into the untyped one, and
+        # the recovery function gets written and never wired up.
+        #
+        # Done here rather than as a migration script because a one-shot
+        # rewrite of completed bookings changes nothing anyone reads, while a
+        # reader on the load path also heals whatever arrives next. All 17
+        # current cases are `complete`; the value is the guarantee, not the
+        # backfill. Only fills when the typed field is empty — a real
+        # `clean_time` always wins over prose.
+        if not b.get("clean_time"):
+            recovered = _parse_clean_time(b.get("notes") or "")
+            if recovered:
+                b["clean_time"] = recovered
     data.setdefault("messages", [])
     data.setdefault("cleaner_jids", {})
     data.setdefault("host_jids", [])

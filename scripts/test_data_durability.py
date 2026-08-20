@@ -54,7 +54,8 @@ class DataLayerCase(unittest.TestCase):
             "threading": None,
             "print": lambda *a, **k: None,
         }
-        _extract(["DataVanished", "load_data", "save_data"], self.ns)
+        self.ns["re"] = __import__("re")
+        _extract(["DataVanished", "_parse_clean_time", "load_data", "save_data"], self.ns)
         self.load = self.ns["load_data"]
         self.save = self.ns["save_data"]
         self.DataVanished = self.ns["DataVanished"]
@@ -120,6 +121,66 @@ class DataLayerCase(unittest.TestCase):
         self.DATA_FILE.write_text('{"bookings": {"u1"')
         with self.assertRaises(json.JSONDecodeError):
             self.load()
+
+
+
+
+class LazyCleanTimeBackfill(unittest.TestCase):
+    """A time that only ever reached free text must be recovered on read.
+
+    `_parse_clean_time` existed for exactly this and had ZERO callers, while 17
+    live bookings carried `clean_time: null` beside a notes string it parses
+    cleanly. Wired into load_data's existing lazy backfill 2026-08-20.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ns = {
+            "json": json, "os": os, "datetime": datetime, "Path": Path,
+            "re": __import__("re"),
+            "DATA_FILE": self.tmp / "data.json",
+            "INIT_MARKER": self.tmp / ".data-initialized",
+            "GCAL_ENABLED": False,
+            "needs_notify": lambda b: False, "threading": None,
+            "print": lambda *a, **k: None,
+        }
+        _extract(["DataVanished", "_parse_clean_time", "load_data", "save_data"], self.ns)
+        self.load, self.save = self.ns["load_data"], self.ns["save_data"]
+
+    def _with(self, booking):
+        self.save({"bookings": {"u1": booking}})
+        return self.load()["bookings"]["u1"]
+
+    def test_a_time_in_notes_is_recovered(self):
+        b = self._with({"end": "2026-05-19", "clean_time": None,
+                        "notes": "Time: 5:00 PM"})
+        self.assertEqual(b["clean_time"], "17:00:00")
+
+    def test_a_real_clean_time_always_wins_over_prose(self):
+        """The typed field is authoritative. Prose never overwrites it."""
+        b = self._with({"end": "2026-08-03", "clean_time": "12:00:00",
+                        "notes": "Confirmed 5:00 PM by Itzel"})
+        self.assertEqual(b["clean_time"], "12:00:00")
+
+    def test_notes_without_a_time_change_nothing(self):
+        b = self._with({"end": "2026-09-10", "clean_time": None,
+                        "notes": "Unassigned — Itzel declined"})
+        self.assertIsNone(b["clean_time"])
+
+    def test_the_24h_form_parses_too(self):
+        b = self._with({"end": "2026-04-05", "clean_time": None,
+                        "notes": "Time: 11:00 | Matches April 5 checkout date"})
+        self.assertEqual(b["clean_time"], "11:00:00")
+
+    def test_the_function_is_actually_called(self):
+        """It had zero callers for months. Guard the wiring, not just the parse."""
+        src = (Path(__file__).resolve().parent.parent
+               / "cleaning-tracker" / "app.py").read_text()
+        import ast as _ast
+        load = next(n for n in _ast.parse(src).body
+                    if isinstance(n, _ast.FunctionDef) and n.name == "load_data")
+        self.assertIn("_parse_clean_time", _ast.unparse(load),
+                      "_parse_clean_time is orphaned again")
 
 
 if __name__ == "__main__":

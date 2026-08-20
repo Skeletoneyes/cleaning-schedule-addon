@@ -107,10 +107,7 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
                 clean_date = date.fromisoformat(b["end"])
             except (ValueError, TypeError, KeyError):
                 continue
-            committed_time = commitment.get("clean_time") or "11:00:00"
-            ev_start = {"dateTime": f"{clean_date.isoformat()}T{committed_time}", "timeZone": LOCAL_TZ}
-            end_dt = datetime.strptime(f"{clean_date.isoformat()} {committed_time}", "%Y-%m-%d %H:%M:%S") + timedelta(hours=2)
-            ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
+            ev_start, ev_end = _event_window(clean_date, commitment.get("clean_time"))
             desired[clean_uid] = {
                 "summary": f"❌ Cleaning Cancelled · Notify {cleaner}",
                 "start": ev_start,
@@ -185,10 +182,7 @@ def _desired_events(data, window_days_back=30, window_days_fwd=365):
         if conflict:
             title = "⚠️ " + title
 
-        start_time = clean_time or "11:00:00"
-        ev_start = {"dateTime": f"{clean_date.isoformat()}T{start_time}", "timeZone": LOCAL_TZ}
-        end_dt = datetime.strptime(f"{clean_date.isoformat()} {start_time}", "%Y-%m-%d %H:%M:%S") + timedelta(hours=2)
-        ev_end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
+        ev_start, ev_end = _event_window(clean_date, clean_time)
 
         if conflict or not cleaner:
             color_id = _COLOR_CONFLICT if conflict else _COLOR_UNASSIGNED
@@ -266,6 +260,34 @@ def _parse_gcal_dt(s, tz_name):
         except Exception:
             pass
     return dt
+
+
+def _event_window(clean_date, clean_time):
+    """(start, end) for a cleaning event — timed when a time was agreed,
+    ALL-DAY when one was not.
+
+    Until 2026-08-20 both call sites did `clean_time or "11:00:00"`, so a
+    cleaning with no agreed time was rendered as a confident one-hour-past-ten
+    appointment on the calendar the cleaners actually read. 13 of 24 future
+    cleanings carry no time, and the fabrication was camouflaged: 11:00 is also
+    the Airbnb checkout hour written literally onto the stay block, so an
+    invented start and a real one looked identical.
+
+    The event title already omitted the time when it was unset — so the record
+    was honest in its text and lying in its position, which is the worse half.
+    An all-day event says "this day, hour not agreed" in the one vocabulary a
+    calendar has for it.
+
+    Google treats an all-day `end.date` as EXCLUSIVE, hence the +1 day.
+    """
+    if clean_time:
+        start = {"dateTime": f"{clean_date.isoformat()}T{clean_time}", "timeZone": LOCAL_TZ}
+        end_dt = datetime.strptime(
+            f"{clean_date.isoformat()} {clean_time}", "%Y-%m-%d %H:%M:%S"
+        ) + timedelta(hours=2)
+        return start, {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": LOCAL_TZ}
+    return ({"date": clean_date.isoformat()},
+            {"date": (clean_date + timedelta(days=1)).isoformat()})
 
 
 def _events_equal(existing, desired):
