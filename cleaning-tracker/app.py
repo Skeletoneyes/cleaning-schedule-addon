@@ -3980,6 +3980,16 @@ def _run_full_reconcile():
                 # filter_and_sort() re-derives from on every dismiss, refilter
                 # and digest run. Merging into `findings` alone would let the
                 # next filter pass silently delete these again.
+                # Stamp the decision here. Findings merged AFTER
+                # `reconcile.run()` never pass through `resolve_subjects`, so
+                # without this they reach the digest and the VPS payload with
+                # `decision: null` — the one field the bot's triage prompt now
+                # reasons from. Caught on the 1.37.1 deploy: 19 of 20 findings
+                # carried a decision and the bridge one did not.
+                wd_findings = [
+                    dict(f, decision=reconcile_mod._decision_of(f["kind"]))
+                    for f in wd_findings
+                ]
                 prior_raw = list(result.get("findings_raw") or result.get("findings") or [])
                 result["findings_raw"] = wd_findings + prior_raw
                 result["findings"] = wd_findings + list(result.get("findings") or [])

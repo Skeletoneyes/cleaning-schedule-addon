@@ -158,5 +158,76 @@ class Ranking(unittest.TestCase):
         self.assertEqual(reconcile._decision_of("something_new_nobody_mapped"), "investigate")
 
 
+
+
+class SupersededStatements(unittest.TestCase):
+    """A cleaner's LATEST word wins. Found on the 1.37.1 deploy.
+
+    Itzel declined Sept 10 on May 5, then confirmed it on Aug 15 and Aug 20.
+    The moment the booking was assigned to her, `_facts_vs_bookings` raised
+    `decline_still_assigned` at needs-attention from the May fact — while
+    `_fact_timeline`, one detector over, correctly reported "latest is
+    confirm". The reconciler contradicting itself is the failure it exists to
+    catch. `dismissed_findings` carries a hand-written note about this exact
+    shape from 2026-08-03.
+    """
+
+    BOOKINGS = {UID: {"end": "2026-09-10", "status": "active", "type": "airbnb",
+                      "cleaner": "Itzel"}}
+
+    def _facts(self):
+        return {
+            "old": {"facts": [{"kind": "decline", "target_date": "2026-09-10",
+                               "cleaner": "Itzel", "confidence": 0.95,
+                               "evidence": "Sept 10 - I'm full"}]},
+            "new": {"facts": [{"kind": "confirm", "target_date": "2026-09-10",
+                               "cleaner": "Itzel", "confidence": 0.9,
+                               "evidence": "Yes Sept 10 I can do it at 11:00"}]},
+        }
+
+    MSGS = {"old": {"timestamp": "2026-05-05T20:54:00"},
+            "new": {"timestamp": "2026-08-20T05:01:37.000Z"}}
+
+    def test_a_superseded_decline_does_not_fire(self):
+        out = reconcile._facts_vs_bookings(
+            self.BOOKINGS, self._facts(), "2026-08-20", self.MSGS)
+        self.assertEqual([f["kind"] for f in out], [],
+                         "a decline superseded by a later confirm still fired")
+
+    def test_a_standing_decline_still_fires(self):
+        """The detector must keep working when the decline IS the latest word."""
+        facts = self._facts()
+        msgs = {"old": {"timestamp": "2026-08-20T05:01:37.000Z"},
+                "new": {"timestamp": "2026-05-05T20:54:00"}}
+        out = reconcile._facts_vs_bookings(self.BOOKINGS, facts, "2026-08-20", msgs)
+        self.assertEqual([f["kind"] for f in out], ["decline_still_assigned"])
+
+    def test_a_tentative_statement_is_never_the_latest_word(self):
+        facts = self._facts()
+        facts["new"]["facts"][0]["tentative"] = True
+        out = reconcile._facts_vs_bookings(
+            self.BOOKINGS, facts, "2026-08-20", self.MSGS)
+        self.assertEqual([f["kind"] for f in out], ["decline_still_assigned"],
+                         "a tentative confirm was allowed to supersede a decline")
+
+
+class EveryFindingCarriesADecision(unittest.TestCase):
+    def test_watchdog_kinds_are_mapped_explicitly(self):
+        """Findings merged after run() never pass through resolve_subjects, so
+        app.py stamps them. The mapping must be explicit for both paths."""
+        for kind in ("bridge_down", "bridge_blind_window", "bridge_watchdog_error"):
+            self.assertIn(kind, reconcile._KIND_DECISION, f"{kind} unmapped")
+
+    def test_app_stamps_merged_findings(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent
+               / "cleaning-tracker" / "app.py").read_text()
+        self.assertIn("decision=reconcile_mod._decision_of(f[\"kind\"])", src,
+                      "watchdog findings reach the digest without a decision")
+
+    def test_a_contradiction_about_time_is_adjudicate_not_investigate(self):
+        self.assertEqual(reconcile._decision_of("time_mismatch"), "adjudicate")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

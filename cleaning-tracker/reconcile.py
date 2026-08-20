@@ -45,7 +45,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     findings.extend(_drift(drift_items))
     findings.extend(_unread_messages(data.get("messages", []), facts_records, today_str))
     findings.extend(_channel_silence(silence, today_str))
-    findings.extend(_facts_vs_bookings(bookings, facts_records, today_str))
+    findings.extend(_facts_vs_bookings(bookings, facts_records, today_str, messages_by_id))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
     findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id))
     # Inside run() and before filter_and_sort, so counts derive from findings
@@ -137,6 +137,10 @@ _KIND_DECISION = {
     # raises the genuinely contested cases separately.
     "changed_mind": "approve",
     "time_ambiguous": "adjudicate",
+    # She named two different times for one cleaning — a contradiction to
+    # settle, not a gap to go and fill. The remaining unmapped kinds (calendar
+    # drift, iCal mismatches) correctly take the `investigate` default.
+    "time_mismatch": "adjudicate",
     "decline_still_assigned": "adjudicate",
     "schedule_mismatch": "adjudicate",
     "ical_date_mismatch": "adjudicate",
@@ -150,6 +154,21 @@ _KIND_DECISION = {
     "drift_cancelled": "investigate",
     "time_unagreed": "investigate",
     "confirm_no_booking": "observe",
+    # Bridge/watchdog kinds. Merged into the result AFTER run() by app.py — the
+    # mapping lives here so both paths agree, and so `investigate` is a stated
+    # choice rather than the default nobody wrote down. All three mean "the
+    # pipe may be broken, go look", which is exactly investigate.
+    "bridge_down": "investigate",
+    "bridge_blind_window": "investigate",
+    "bridge_watchdog_error": "investigate",
+    # Health kinds from _gcal_push_health and _channel_silence.
+    "stale_push": "investigate",
+    "gcal_push_failed": "investigate",
+    "gcal_push_timeout": "investigate",
+    "gcal_read_failed": "investigate",
+    "bridge_silent": "investigate",
+    "channel_silent": "investigate",
+    "pipeline": "investigate",
 }
 
 
@@ -862,7 +881,44 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
     return out
 
 
-def _facts_vs_bookings(bookings, facts_records, today_str):
+def _latest_by_cleaner_date(facts_records, messages_by_id, kinds, today_str):
+    """The LAST thing each cleaner said about each date, by message time.
+
+    `_schedule_vs_bookings` has done this for host assertions since 1.17.1;
+    `_facts_vs_bookings` never did, so every confirm and decline a cleaner had
+    ever made was live simultaneously and the oldest could outrank the newest.
+
+    Live consequence, 2026-08-20: Itzel declined Sept 10 on May 5 and confirmed
+    it on Aug 15 and again on Aug 20. The moment the booking was assigned to
+    her, the May decline produced `decline_still_assigned` at needs-attention —
+    "Itzel declined 2026-09-10 but is still assigned to it" — while
+    `_fact_timeline`, one detector over, correctly reported "latest is confirm".
+    The same contradiction the reconciler was built to catch, produced by the
+    reconciler. `dismissed_findings` already carries a hand-written note about
+    this shape from 2026-08-03: "Detector keyed on Itzel without checking
+    current assignee."
+
+    Ties on timestamp keep the first seen, which is stable across re-runs.
+    """
+    latest = {}
+    for msg_id, rec in (facts_records or {}).items():
+        ts = ((messages_by_id or {}).get(msg_id) or {}).get("timestamp") or ""
+        for f in rec.get("facts", []):
+            if f.get("kind") not in kinds:
+                continue
+            tgt, cleaner = f.get("target_date"), f.get("cleaner")
+            if not tgt or not cleaner or tgt < today_str:
+                continue
+            if f.get("tentative"):
+                continue
+            key = (cleaner, tgt)
+            prev = latest.get(key)
+            if prev is None or ts > prev[0]:
+                latest[key] = (ts, msg_id, f)
+    return latest
+
+
+def _facts_vs_bookings(bookings, facts_records, today_str, messages_by_id=None):
     by_date = {}
     for uid, b in bookings.items():
         if b.get("status") == "cancelled" or b.get("type") == "custom_stay":
@@ -872,82 +928,79 @@ def _facts_vs_bookings(bookings, facts_records, today_str):
             by_date.setdefault(d, []).append((uid, b))
 
     out = []
-    for msg_id, rec in facts_records.items():
-        for f in rec.get("facts", []):
-            kind = f.get("kind")
-            tgt = f.get("target_date")
-            cleaner = f.get("cleaner")
-            if not tgt or not cleaner or tgt < today_str:
-                continue
-            # A statement the speaker herself flagged as provisional is not a
-            # commitment. `tentative` was extracted, stored and read by exactly
-            # one detector (_time_agreement) until 2026-08-20.
-            if f.get("tentative"):
-                continue
-            conf = f.get("confidence") or 0.0
-            quote = f.get("evidence") or ""
-            matches = by_date.get(tgt, [])
+    # One statement per (cleaner, date) — her latest. A superseded decline must
+    # not outrank the confirm that replaced it. `tentative` is filtered inside:
+    # a statement the speaker flagged as provisional is not a commitment, and
+    # it was extracted, stored and read by exactly one detector until
+    # 2026-08-20.
+    for (cleaner, tgt), (_ts, msg_id, f) in _latest_by_cleaner_date(
+        facts_records, messages_by_id, ("confirm", "decline"), today_str
+    ).items():
+        kind = f.get("kind")
+        conf = f.get("confidence") or 0.0
+        quote = f.get("evidence") or ""
+        matches = by_date.get(tgt, [])
 
-            if kind == "confirm" and conf >= CONFIRM_THRESHOLD:
-                if not matches:
+        if kind == "confirm" and conf >= CONFIRM_THRESHOLD:
+            if not matches:
+                out.append({
+                    "id": f"confirm_no_booking:{cleaner}:{tgt}:{msg_id}",
+                    "detector": "facts_vs_bookings",
+                    "kind": "confirm_no_booking",
+                    "severity": "informational",
+                    "booking_uid": None,
+                    "cleaner": cleaner,
+                    "date": tgt,
+                    "why": f"{cleaner} confirmed for {tgt} but no booking exists on that date",
+                    "evidence": [msg_id],
+                    "quote": quote,
+                })
+                continue
+            for uid, b in matches:
+                current = b.get("cleaner")
+                if current is None:
                     out.append({
-                        "id": f"confirm_no_booking:{cleaner}:{tgt}:{msg_id}",
+                        "id": f"unrecorded_confirmation:{uid}:{cleaner}",
                         "detector": "facts_vs_bookings",
-                        "kind": "confirm_no_booking",
-                        "severity": "informational",
-                        "booking_uid": None,
+                        "kind": "unrecorded_confirmation",
+                        "severity": "suggest",
+                        "booking_uid": uid,
                         "cleaner": cleaner,
                         "date": tgt,
-                        "why": f"{cleaner} confirmed for {tgt} but no booking exists on that date",
+                        "why": f"{cleaner} confirmed for {tgt} but booking is unassigned",
                         "evidence": [msg_id],
                         "quote": quote,
                     })
-                    continue
-                for uid, b in matches:
-                    current = b.get("cleaner")
-                    if current is None:
-                        out.append({
-                            "id": f"unrecorded_confirmation:{uid}:{cleaner}",
-                            "detector": "facts_vs_bookings",
-                            "kind": "unrecorded_confirmation",
-                            "severity": "suggest",
-                            "booking_uid": uid,
-                            "cleaner": cleaner,
-                            "date": tgt,
-                            "why": f"{cleaner} confirmed for {tgt} but booking is unassigned",
-                            "evidence": [msg_id],
-                            "quote": quote,
-                        })
-                    elif current != cleaner:
-                        out.append({
-                            "id": f"contested_cleaner:{uid}:{cleaner}",
-                            "detector": "facts_vs_bookings",
-                            "kind": "contested_cleaner",
-                            "severity": "needs-attention",
-                            "booking_uid": uid,
-                            "cleaner": cleaner,
-                            "date": tgt,
-                            "why": f"{cleaner} confirmed for {tgt} but booking is assigned to {current}",
-                            "evidence": [msg_id],
-                            "quote": quote,
-                        })
-                    # else: current == cleaner — exactly what we expect.
+                elif current != cleaner:
+                    out.append({
+                        "id": f"contested_cleaner:{uid}:{cleaner}",
+                        "detector": "facts_vs_bookings",
+                        "kind": "contested_cleaner",
+                        "severity": "needs-attention",
+                        "booking_uid": uid,
+                        "cleaner": cleaner,
+                        "date": tgt,
+                        "why": f"{cleaner} confirmed for {tgt} but booking is assigned to {current}",
+                        "evidence": [msg_id],
+                        "quote": quote,
+                    })
+                # else: current == cleaner — exactly what we expect.
 
-            elif kind == "decline":
-                for uid, b in matches:
-                    if b.get("cleaner") == cleaner:
-                        out.append({
-                            "id": f"decline_still_assigned:{uid}:{cleaner}",
-                            "detector": "facts_vs_bookings",
-                            "kind": "decline_still_assigned",
-                            "severity": "needs-attention",
-                            "booking_uid": uid,
-                            "cleaner": cleaner,
-                            "date": tgt,
-                            "why": f"{cleaner} declined {tgt} but is still assigned to it",
-                            "evidence": [msg_id],
-                            "quote": quote,
-                        })
+        elif kind == "decline":
+            for uid, b in matches:
+                if b.get("cleaner") == cleaner:
+                    out.append({
+                        "id": f"decline_still_assigned:{uid}:{cleaner}",
+                        "detector": "facts_vs_bookings",
+                        "kind": "decline_still_assigned",
+                        "severity": "needs-attention",
+                        "booking_uid": uid,
+                        "cleaner": cleaner,
+                        "date": tgt,
+                        "why": f"{cleaner} declined {tgt} but is still assigned to it",
+                        "evidence": [msg_id],
+                        "quote": quote,
+                    })
     return out
 
 
