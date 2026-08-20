@@ -108,6 +108,32 @@ class Resolution(unittest.TestCase):
         self.assertIn("stale_push", [x["id"] for x in out],
                       "a health finding was absorbed into a cleaning")
 
+    def test_an_unread_message_joins_its_cleaning(self):
+        """`unread_messages` names a date but no cleaner. It is in
+        MERGEABLE_DETECTORS and must actually merge — a redundant
+        cleaner-is-not-null guard blocked it, so Sept 10 rendered as two lines
+        live on 2026-08-20 when the entire point is one line per cleaning."""
+        unread = {"id": "unread:m9", "detector": "unread_messages",
+                  "kind": "undecided_message", "severity": "suggest",
+                  "booking_uid": None, "cleaner": None, "date": "2026-09-10",
+                  "why": "a message about the 2026-09-10 cleaning is waiting",
+                  "evidence": ["m9"]}
+        out = reconcile.resolve_subjects(SEPT10 + [unread], BOOKINGS)
+        self.assertEqual(len([x for x in out if x.get("booking_uid") == UID]), 1)
+        primary = next(x for x in out if x.get("booking_uid") == UID)
+        self.assertIn("unread:m9", primary["absorbed"] + [primary["id"]])
+
+    def test_health_findings_stay_out_by_DETECTOR_not_by_cleaner(self):
+        """The durable test. A health finding is health regardless of which
+        fields happen to be null, so the allowlist must be what excludes it."""
+        health = {"id": "stale_push", "detector": "gcal_push_health",
+                  "kind": "stale_push", "severity": "needs-attention",
+                  "booking_uid": None, "cleaner": "Itzel",   # cleaner SET
+                  "date": "2026-09-10", "why": "no push in 26h", "evidence": []}
+        out = reconcile.resolve_subjects(SEPT10 + [health], BOOKINGS)
+        self.assertIn("stale_push", [x["id"] for x in out],
+                      "a health finding merged because it happened to name a cleaner")
+
     def test_calendar_projection_findings_are_not_merged_away(self):
         """A stale calendar event has a different repair from an unassigned
         booking. Folding it in would hide a broken calendar behind a solved one."""

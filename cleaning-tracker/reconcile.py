@@ -207,15 +207,17 @@ def _subject_of(f, date_to_uid):
     uid = f.get("booking_uid")
     if uid:
         return uid
-    # Join by date ONLY when the finding names a cleaner. Health findings —
-    # stale push, bridge silent, blind window — carry no booking and no
-    # cleaner, and they are stamped with TODAY's date so the staleness filter
-    # cannot drop them. Today is eventually some cleaning's date, and without
-    # this guard "the calendar has not been written in 26h" would be folded
-    # into "Itzel confirmed Sept 10" and disappear. A health finding describes
-    # how much of the list to believe; it is not a member of it.
-    if not f.get("cleaner"):
-        return None
+    # Keeping health findings out of a cleaning's group is `MERGEABLE_DETECTORS`'
+    # job, and it does it by detector — which is the durable test, because a
+    # health finding is health regardless of which fields happen to be null.
+    #
+    # A `cleaner is not None` check used to live here as a second guard for the
+    # same thing. It was redundant against the allowlist and it was wrong: it
+    # blocked the one mergeable detector that legitimately names no cleaner.
+    # Live on 2026-08-20, Sept 10 rendered as two lines — "host scheduled Darya
+    # … but assigned to Itzel" and "a message about the 2026-09-10 cleaning is
+    # waiting for a decision" — when the whole point of resolution is one line
+    # per cleaning. Two guards for one job, disagreeing.
     d = f.get("date")
     if d:
         return date_to_uid.get(d)
