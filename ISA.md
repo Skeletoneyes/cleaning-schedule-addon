@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-20T11:55:00-07:00
-progress: 268/286
+updated: 2026-08-20T16:40:00-07:00
+progress: 302/317
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -695,14 +695,83 @@ rows once measured against live data instead of a stale repo snapshot — see De
 - [x] ISC-278: The bot accepts a payload from an add-on that omits `decision`, so the two deploy independently.
 - [x] ISC-279: The triage prompt groups by subject, not by kind.
 - [x] ISC-280: Live: the Sept 10 booking reads Itzel / 11:00:00; Nov 24 reads Itzel / 13:00:00.
-- [ ] ISC-281: Live: add-on 1.37.0 is installed and `started` on the Pi. [BLOCKED — deploy commands refused by the session's command classifier; Josh runs them]
-- [ ] ISC-282: Live: post-deploy snapshot returns 200 with booking count 67, unchanged from the pre-deploy baseline.
-- [ ] ISC-283: Live: `/data` holds zero `data.json.tmp*` files after a save.
-- [ ] ISC-284: Live: the first real inbound message makes one model call and routes correctly.
-- [ ] ISC-285: Live: the next nightly digest arrives and leads Sept 10 with the confirmation rather than the gap.
-- [ ] ISC-286: The bot is redeployed to the VPS with the subject-grouping triage prompt.
+- [x] ISC-281: Live: add-on 1.37.0 is installed and `started` on the Pi. [BLOCKED — deploy commands refused by the session's command classifier; Josh runs them]
+- [x] ISC-282: Live: post-deploy snapshot returns 200 with booking count 67, unchanged from the pre-deploy baseline.
+- [x] ISC-283: Live: `/data` holds zero `data.json.tmp*` files after a save.
+- [x] ISC-284: Live: the first real inbound message makes one model call and routes correctly.
+- [x] ISC-285: Live: the next nightly digest arrives and leads Sept 10 with the confirmation rather than the gap.
+- [x] ISC-286: The bot is redeployed to the VPS with the subject-grouping triage prompt.
+- [x] ISC-287: `notify_ack` compares acknowledgement evidence as aware instants, never as raw strings.
+- [x] ISC-288: Both stored timestamp shapes parse — UTC-`Z` (241 of 724) and naive local (483).
+- [x] ISC-289: A naive stamp resolves through `zoneinfo`, so it is correct in PDT and PST alike.
+- [x] ISC-290: Anti: an unparseable stamp returns `None` rather than sorting as long-ago.
+- [x] ISC-291: Anti: identical instants do not resolve to "strictly after" via the `.000Z` suffix.
+- [x] ISC-292: The candidate's `timestamp` stays a string for display; the instant rides in a separate key.
+- [x] ISC-293: An untimed cleaning renders on GCal as an all-day event, not a fabricated hour.
+- [x] ISC-294: Anti: `gcal.py`'s stay-block `T11:00:00` — the real Airbnb checkout — is untouched.
+- [x] ISC-295: `_desired_events` contains no hardcoded cleaning time; both sites go through `_event_window`.
+- [x] ISC-296: The `time_unagreed` finding text no longer asserts a default the code no longer applies.
+- [x] ISC-297: `_parse_clean_time` is called from `load_data`'s lazy backfill — it had zero callers.
+- [x] ISC-298: Anti: a real `clean_time` is never overwritten by a time parsed from prose.
+- [x] ISC-299: Live: recoverable-but-unfilled cleaning times went 17 → 0 on the first load after deploy.
+- [x] ISC-300: `_facts_vs_bookings` collapses to the cleaner's LATEST statement per (cleaner, date).
+- [x] ISC-301: Anti: a decline superseded by a later confirm does not emit `decline_still_assigned`.
+- [x] ISC-302: A standing decline — where the decline IS the latest word — still fires.
+- [x] ISC-303: Anti: a `tentative` confirm never supersedes a standing decline.
+- [x] ISC-304: Findings merged after `reconcile.run()` carry a `decision`; `app.py` stamps them.
+- [x] ISC-305: Watchdog and health kinds are mapped explicitly, so `investigate` is a stated choice.
+- [x] ISC-306: `time_mismatch` ranks `adjudicate` — two times for one cleaning is a contradiction.
+- [x] ISC-307: Health findings are excluded from subject resolution by DETECTOR, not by a null cleaner.
+- [x] ISC-308: An `unread_messages` finding joins its cleaning, though it names no cleaner.
+- [x] ISC-309: `schedule_mismatch` is no longer emitted by `_schedule_vs_bookings`.
+- [x] ISC-310: `schedule_unassigned` still fires — the half that surfaces a real gap.
+- [x] ISC-311: Anti: the `schedule_mismatch` kind stays mapped, so 13 live dismissal ids still resolve.
+- [x] ISC-312: Live: a fresh reconcile returns 17 findings, 0 without a decision, 0 `schedule_mismatch`.
+- [x] ISC-313: Live: 2026-09-10 resolves to ONE finding, `approve`, leading with "latest is confirm".
+- [ ] ISC-314: Live: a nightly digest is observed arriving on Josh's phone with the new ranking.
 
 ## Changelog
+
+### 2026-08-20 (second pass) — three refutations from deploying, not testing
+
+- **conjectured:** a required `polarity` field on every fact was the right fix for
+  `schedule_assertion` having no negative and no interrogative — the council reached it
+  from first principles and from the iCalendar precedent.
+  **refuted by:** the dismissal record, which nobody had counted before proposing the fix.
+  `schedule_mismatch` is the most-dismissed kind in the system — **13 of 30** — and every
+  dismissal carrying a written reason condemns it: four *"redundant: contested_cleaner for
+  same booking+cleaner already dismissed"*, one *"mis-extraction: Josh's 'do we have you
+  booked for July 24?' QUESTION was read as a host schedule assertion"*. Josh: *"the
+  polarity field feels over complex."*
+  **learned:** structurally correct and proportionate are different tests, and the second
+  one is answered by what the defect has already cost, not by what the fix would buy. 624
+  records, a prompt bump and a full reprocess to patch an asymmetry in one kind — when
+  deleting the one finding that consumed it costs ten lines and the cleaner-side detector
+  already catches the real cases.
+  **criterion now:** ISC-309, ISC-310 — delete the finding, keep the useful half.
+
+- **conjectured:** the 2026-08-18 message *"I can come tomorrow 7:00am"* proved the model
+  resolves "tomorrow" to the send date, and a facts-prompt fix was a prerequisite for any
+  `date_proposal` work.
+  **refuted by:** `_msg_local_day`. The message was sent `2026-08-18T02:38:50Z` — 19:38 on
+  **August 17** in Vancouver — so "tomorrow" IS August 18 and the extraction was right. The
+  comparison had been made against the raw UTC date slice instead of the local send day.
+  **learned:** this is the trap `_msg_local_day` exists to prevent, walked into while
+  auditing for exactly this class of thing. Compare against the local day the codebase
+  itself computes, never against `ts[:10]`.
+  **criterion now:** no change — the behaviour was already correct, and the audit item was
+  withdrawn rather than fixed.
+
+- **conjectured:** requiring a non-null `cleaner` in `_subject_of` was what kept health
+  findings out of a cleaning's group.
+  **refuted by:** the live 1.37.2 deploy, where Sept 10 rendered as two lines — the schedule
+  finding and *"a message about the 2026-09-10 cleaning is waiting for a decision"* — because
+  `unread_messages` is in `MERGEABLE_DETECTORS` and names no cleaner. Two guards for one job,
+  disagreeing.
+  **learned:** exclusion belongs to the detector allowlist, which is durable — a health
+  finding is health regardless of which fields happen to be null. A second guard on a
+  correlated-but-different property will eventually disagree with the first.
+  **criterion now:** ISC-307, ISC-308.
 
 ### 2026-08-20 — the model was reading correctly and the pipeline discarded it
 
