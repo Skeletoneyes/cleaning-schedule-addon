@@ -351,7 +351,21 @@ idempotent.
 - `_fact_timeline` — `changed_mind` when a cleaner said both confirm and
   decline on the same date (latest wins).
 - `_schedule_vs_bookings` — host `schedule_assertion` ⇄ booking cleaner
-  (emits `schedule_mismatch` / `schedule_unassigned`).
+  (emits `schedule_unassigned` only).
+  ⚠️ **`schedule_mismatch` was DELETED 2026-08-20 — do not reinstate it.** It
+  fired when a host assertion disagreed with an assigned booking, and it was
+  the most-dismissed kind in the system: 13 of 30 dismissals, with every
+  written reason condemning it (four *"redundant: contested_cleaner for same
+  booking+cleaner already dismissed"*, one *"mis-extraction: Josh's 'do we
+  have you booked for July 24?' QUESTION was read as a host schedule
+  assertion"*). It cannot be fixed by tuning: it reports the host's own words
+  back to him, and `schedule_assertion` is the only fact kind with no negative
+  and no interrogative, so a question and a negation both collapse into an
+  affirmative claim. Real conflicts arrive from the cleaner's side, where the
+  vocabulary does carry a negative — `contested_cleaner` from her own confirm.
+  A `polarity` field on every fact was considered and rejected as
+  disproportionate (624 records, a prompt bump and a full reprocess, to patch
+  an asymmetry in one kind).
 - `_channel_silence` — WhatsApp "going dark" detection (1.22.0). Catches
   **absence of signal**, which the bridge's error-burst health alarms
   structurally cannot: a quiet per-group mute (the Daria failure — 3 months

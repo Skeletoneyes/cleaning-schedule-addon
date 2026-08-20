@@ -255,5 +255,60 @@ class EveryFindingCarriesADecision(unittest.TestCase):
         self.assertEqual(reconcile._decision_of("time_mismatch"), "adjudicate")
 
 
+
+
+class HostAssertionsDoNotContradict(unittest.TestCase):
+    """`schedule_mismatch` is deleted; `schedule_unassigned` is kept.
+
+    It was the most-dismissed kind in the system — 13 of 30 — and every
+    dismissal with a written reason condemned it: four "redundant:
+    contested_cleaner for same booking+cleaner already dismissed", one
+    "mis-extraction: Josh's 'do we have you booked for July 24?' QUESTION was
+    read as a host schedule assertion". It reported the host's own words back
+    to him, through the one fact kind with no negative and no interrogative.
+    """
+
+    MSGS = {"m1": {"timestamp": "2026-08-13T22:56:39.000Z"}}
+
+    def _facts(self):
+        return {"m1": {"facts": [{"kind": "schedule_assertion",
+                                  "target_date": "2026-09-10", "cleaner": "Darya",
+                                  "confidence": 0.9, "tentative": False,
+                                  "evidence": "only Sept 10 you cannot do"}]}}
+
+    def test_a_host_assertion_against_an_assigned_booking_is_silent(self):
+        """The live 2026-09-10 false positive: the host CONFIRMING Darya's
+        decline, read as scheduling her, against a booking held by Itzel."""
+        bookings = {UID: {"end": "2026-09-10", "status": "active",
+                          "type": "airbnb", "cleaner": "Itzel"}}
+        out = reconcile._schedule_vs_bookings(
+            bookings, self._facts(), "2026-08-20", self.MSGS)
+        self.assertEqual(out, [], "schedule_mismatch fired again")
+
+    def test_the_useful_half_still_fires(self):
+        """A host naming someone for a booking with nobody on it is a proposal
+        to accept. That is what surfaces Oct 1 and Nov 24 today."""
+        bookings = {UID: {"end": "2026-09-10", "status": "active",
+                          "type": "airbnb", "cleaner": None}}
+        out = reconcile._schedule_vs_bookings(
+            bookings, self._facts(), "2026-08-20", self.MSGS)
+        self.assertEqual([f["kind"] for f in out], ["schedule_unassigned"])
+        self.assertEqual(out[0]["decision"] if "decision" in out[0]
+                         else reconcile._decision_of(out[0]["kind"]), "approve")
+
+    def test_nothing_emits_the_deleted_kind(self):
+        from pathlib import Path
+        import ast as _ast
+        src = (Path(__file__).resolve().parent.parent
+               / "cleaning-tracker" / "reconcile.py").read_text()
+        det = next(n for n in _ast.parse(src).body
+                   if isinstance(n, _ast.FunctionDef) and n.name == "_schedule_vs_bookings")
+        self.assertNotIn("schedule_mismatch", _ast.unparse(det))
+
+    def test_the_kind_stays_mapped_as_a_tombstone(self):
+        """Cached findings and 13 live dismissal ids still reference it."""
+        self.assertIn("schedule_mismatch", reconcile._KIND_DECISION)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

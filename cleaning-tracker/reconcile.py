@@ -142,6 +142,9 @@ _KIND_DECISION = {
     # drift, iCal mismatches) correctly take the `investigate` default.
     "time_mismatch": "adjudicate",
     "decline_still_assigned": "adjudicate",
+    # Tombstone: `schedule_mismatch` is no longer emitted (see
+    # _schedule_vs_bookings). The mapping stays so a cached finding or an old
+    # dismissal id still resolves rather than falling to the default.
     "schedule_mismatch": "adjudicate",
     "ical_date_mismatch": "adjudicate",
     "unrecorded_confirmation": "approve",
@@ -1121,24 +1124,40 @@ def _schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id=Non
                     "evidence": [msg_id],
                     "quote": quote,
                 })
-            else:
-                out.append({
-                    "id": f"schedule_mismatch:{uid}:{cleaner}",
-                    "detector": "schedule_vs_bookings",
-                    "kind": "schedule_mismatch",
-                    # Demoted from needs-attention 2026-08-20. This is the host
-                    # contradicting the record — a data-entry question, not a
-                    # cleaner-coordination emergency. When the cleaner has also
-                    # spoken about the date, `_facts_vs_bookings` says so at
-                    # the severity that judgement deserves.
-                    "severity": "suggest",
-                    "booking_uid": uid,
-                    "cleaner": cleaner,
-                    "date": tgt,
-                    "why": f"host scheduled {cleaner} for {tgt} but booking is assigned to {current}",
-                    "evidence": [msg_id],
-                    "quote": quote,
-                })
+            # DELETED 2026-08-20: `schedule_mismatch`, the finding that fired
+            # when a host assertion disagreed with an assigned booking.
+            #
+            # It was the most-dismissed finding kind in the system — 13 of 30
+            # — and every dismissal carrying a written reason condemned it.
+            # Four say "redundant: contested_cleaner for same booking+cleaner
+            # already dismissed". One says "mis-extraction: Josh's 'do we have
+            # you booked for July 24?' QUESTION was read as a host schedule
+            # assertion". None says it was real.
+            #
+            # The reason it cannot be fixed by tuning: it reports the HOST's
+            # own words back to him. He typed the sentence; he knows what he
+            # meant. And `schedule_assertion` is the only kind with no negative
+            # and no interrogative in the vocabulary, so a question ("are you
+            # available Sept 10?") and a negation ("only Sept 10 you cannot
+            # do") both collapse into an affirmative claim that he scheduled
+            # her. Both of those are live on 2026-09-10 right now, both above
+            # the confidence gate.
+            #
+            # The real conflicts arrive from the CLEANER's side, where the
+            # vocabulary does carry a negative: `_facts_vs_bookings` emits
+            # `contested_cleaner` from her own confirm, and Darya's decline for
+            # Sept 10 extracted correctly at 0.9. That is what those four
+            # "redundant" dismissals were saying.
+            #
+            # `schedule_unassigned` above is kept: a host naming someone for a
+            # booking with nobody on it is a proposal to accept, not a
+            # contradiction to adjudicate, and it is what surfaces Oct 1 and
+            # Nov 24 today.
+            #
+            # The alternative considered and rejected was a `polarity` field on
+            # every fact — 624 records changed, a prompt bump and a full
+            # reprocess, to fix an asymmetry in one kind. Josh: "the polarity
+            # field feels over complex."
     return out
 
 
