@@ -1289,6 +1289,33 @@ def _route_from_facts(facts_list, bookings, sender_cleaner, known_cleaners, toda
     return decisions, blocks
 
 
+def _hold_destructive_on_blocks(decisions, blocks):
+    """A decline auto-applies only when the whole message was understood.
+
+    Pure, so the rule is testable directly rather than through a copy of itself.
+
+    A decline is the only destructive decision in this pipeline — it clears a
+    booked cleaner. Without this, "can't do Sept 8, can I come Sept 9?"
+    half-lands: Sept 9 is not a checkout, so the confirm is held, while the
+    decline sails through and strips the cleaner off a booking nobody has
+    replaced. Ending in a worse state than doing nothing is the one outcome a
+    partial apply must never produce.
+
+    Confirms stay additive and still apply, so a nine-date re-posted list
+    carrying one unrecognised date still books the eight it resolved.
+    """
+    if not blocks or not any(d["action"] == "decline" for d in decisions):
+        return decisions, blocks
+    held = [d for d in decisions if d["action"] == "decline"]
+    kept = [d for d in decisions if d["action"] != "decline"]
+    return kept, list(blocks) + [
+        "held the cancellation of "
+        + ", ".join(d["target_date"] for d in held)
+        + " because the rest of this message could not be routed"
+    ]
+
+
+
 def _synthesize_result(decisions, blocks, sender_cleaner):
     """A `haiku_result`-shaped record, built from the routed decisions.
 
@@ -1407,6 +1434,8 @@ def process_message(msg_id):
             msg["auto_block"] = "Held for review: " + "; ".join(blocks[:3])
         else:
             msg.pop("auto_block", None)
+
+        decisions, blocks = _hold_destructive_on_blocks(decisions, blocks)
 
         if decisions:
             for d in decisions:

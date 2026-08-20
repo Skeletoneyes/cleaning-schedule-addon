@@ -74,8 +74,9 @@ NS = {
     "ROUTE_CONFIDENCE": 0.85,
 }
 _extract(["cleaning_date_for", "_routable_bookings_by_date", "_route_from_facts",
-          "_synthesize_result"], NS)
+          "_hold_destructive_on_blocks", "_synthesize_result"], NS)
 route = NS["_route_from_facts"]
+hold = NS["_hold_destructive_on_blocks"]
 synth = NS["_synthesize_result"]
 
 KNOWN = ["Itzel", "Darya"]
@@ -245,6 +246,68 @@ class SynthesizedResult(unittest.TestCase):
         d, _ = route([fact(d="2026-09-10"), fact(d="2026-09-14")],
                      SEPT, "Itzel", KNOWN, TODAY)
         self.assertIn("+1 more", synth(d, [], "Itzel")["reason"])
+
+
+
+
+class MultiChangeMessages(unittest.TestCase):
+    """One message that changes several things at once.
+
+    Added 2026-08-20 after Josh asked whether the new flow handles a message
+    that cancels one cleaning and creates another, or moves one day to another.
+    Two of these cases were broken.
+    """
+
+    def setUp(self):
+        self.bookings = {
+            "b-sep08@airbnb.com": {"start": "2026-09-05", "end": "2026-09-08",
+                                   "status": "active", "type": "airbnb", "cleaner": "Itzel"},
+            "b-sep10@airbnb.com": {"start": "2026-09-08", "end": "2026-09-10",
+                                   "status": "active", "type": "airbnb", "cleaner": None},
+        }
+
+    def test_one_message_can_decline_one_date_and_confirm_another(self):
+        """The capability the old one-booking-per-message contract could not express."""
+        d, blocks = route([fact(kind="decline", d="2026-09-08"),
+                           fact(kind="confirm", d="2026-09-10", time="11:00")],
+                          self.bookings, "Itzel", KNOWN, "2026-09-01")
+        self.assertEqual({(x["action"], x["target_date"]) for x in d},
+                         {("decline", "2026-09-08"), ("confirm", "2026-09-10")})
+        self.assertEqual(blocks, [])
+
+    def test_a_half_landed_move_is_prevented(self):
+        """The bug this class was written for. The decline must NOT apply when
+        its compensating confirm could not be routed — ending unassigned with
+        nothing booked is worse than ending unchanged."""
+        d, blocks = route([fact(kind="decline", d="2026-09-08"),
+                           fact(kind="confirm", d="2026-09-09", time="11:00")],
+                          self.bookings, "Itzel", KNOWN, "2026-09-01")
+        applied, reasons = hold(d, blocks)
+        self.assertEqual(applied, [], "a destructive decline applied on a half-understood message")
+        self.assertTrue(any("held the cancellation" in r for r in reasons))
+
+    def test_a_clean_decline_still_applies(self):
+        d, blocks = route([fact(kind="decline", d="2026-09-08")],
+                          self.bookings, "Itzel", KNOWN, "2026-09-01")
+        applied, _ = hold(d, blocks)
+        self.assertEqual([x["target_date"] for x in applied], ["2026-09-08"])
+
+    def test_confirms_still_apply_alongside_an_unroutable_date(self):
+        """A re-posted list with one unknown date must still book the rest."""
+        d, blocks = route([fact(kind="confirm", d="2026-09-10", time="11:00"),
+                           fact(kind="confirm", d="2026-12-25")],
+                          self.bookings, "Itzel", KNOWN, "2026-09-01")
+        applied, _ = hold(d, blocks)
+        self.assertEqual([x["target_date"] for x in applied], ["2026-09-10"])
+
+    def test_a_move_to_a_non_checkout_day_holds_the_confirm(self):
+        """Sept 9 is not a checkout, so there is no cleaning to confirm."""
+        d, blocks = route([fact(kind="decline", d="2026-09-08"),
+                           fact(kind="confirm", d="2026-09-09", time="11:00")],
+                          self.bookings, "Itzel", KNOWN, "2026-09-01")
+        self.assertIn("no active cleaning on 2026-09-09", blocks)
+        self.assertEqual([x["target_date"] for x in d], ["2026-09-08"],
+                         "the router itself still reports the decline")
 
 
 if __name__ == "__main__":

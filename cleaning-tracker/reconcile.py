@@ -436,6 +436,24 @@ def _drift(items):
         "cancelled": "booking cancelled — cleaner still has prior commitment",
         "unassigned": "booking needs a cleaner",
     }
+    def _what_changed(it):
+        """Name the change, not just its existence.
+
+        `review_item` already computes `was` (what the cleaner was last told)
+        and `now` (current truth) as (cleaner, date, clean_time) tuples, and
+        `_drift` discarded both — so a guest extending their stay produced
+        "assignment changed since last notified" while the system held
+        "Itzel was told Sept 8 1:00 PM, it is now Sept 9". Same shape as the
+        Sept 10 failure: the informative half was computed and dropped.
+        """
+        was, now = it.get("was"), it.get("now")
+        if not was or not now:
+            return ""
+        labels = ("cleaner", "date", "time")
+        diffs = [f"{lab} {a or '—'} → {b or '—'}"
+                 for lab, a, b in zip(labels, was, now) if a != b]
+        return f" ({'; '.join(diffs)})" if diffs else ""
+
     out = []
     for it in items:
         k = it["kind"]
@@ -449,7 +467,7 @@ def _drift(items):
             "booking_uid": it["uid"],
             "cleaner": cleaner,
             "date": it.get("date"),
-            "why": lead + why_map.get(k, k),
+            "why": lead + why_map.get(k, k) + _what_changed(it),
             "evidence": [],
         })
     return out
