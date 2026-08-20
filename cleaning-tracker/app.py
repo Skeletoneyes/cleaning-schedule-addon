@@ -46,6 +46,8 @@ ICAL_URL = OPTIONS.get("ical_url", os.environ.get("ICAL_URL", ""))
 ANTHROPIC_API_KEY = OPTIONS.get("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
 CLEANERS = OPTIONS.get("cleaners", [])
 DATA_FILE = DATA_DIR / "data.json"
+# Presence means "this install has written data at least once" — see load_data().
+INIT_MARKER = DATA_DIR / ".data-initialized"
 RECONCILER_LAST_FILE = DATA_DIR / "reconciler_last.json"
 
 GCAL_ENABLED = bool(OPTIONS.get("gcal_enabled", False))
@@ -432,10 +434,38 @@ def ingress_prefix():
 
 # ── Data persistence ─────────────────────────────────────────────────────────
 
+class DataVanished(RuntimeError):
+    """`data.json` is gone but this install has written it before.
+
+    The default-empty branch below is correct exactly once, on a fresh install.
+    Every other time it is a catastrophe wearing a fresh install's clothes: an
+    fsck that moved the file to lost+found, a failed volume mount, a botched
+    restore. Returning `{}` there is not a degraded read — the very next
+    `save_data` writes that emptiness back as authoritative, and `sync_ical`
+    then repopulates every booking from the feed, so the dashboard returns
+    looking healthy with every cleaning present, every one unassigned, and
+    every `cleaner_commitment` gone. Nothing downstream can tell that state
+    apart from a genuine first boot.
+
+    `INIT_MARKER` is what distinguishes them. It is written next to the data on
+    the first successful save and never removed, so its presence means "this
+    install has had data" — and if the data is missing while the marker is not,
+    we refuse to serve emptiness and fail loudly instead.
+    """
+
+
 def load_data():
     if DATA_FILE.exists():
         with open(DATA_FILE) as f:
             data = json.load(f)
+    elif INIT_MARKER.exists():
+        raise DataVanished(
+            f"{DATA_FILE} is missing but {INIT_MARKER.name} exists — this install "
+            "has written data before. Refusing to initialise an empty store, which "
+            "would be committed on the next save. Restore via POST /internal/restore "
+            f"(a snapshot may exist at {DATA_FILE}.bak), or delete "
+            f"{INIT_MARKER} to force a genuine fresh start."
+        )
     else:
         data = {"bookings": {}, "last_sync": None}
     for uid, b in data.get("bookings", {}).items():
@@ -450,8 +480,39 @@ def load_data():
 
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+    # Write-to-temp-then-rename, with an fsync the sidecars skip.
+    #
+    # `open(DATA_FILE, "w")` is O_TRUNC: the old content is destroyed the
+    # instant the call opens, before a byte of the new content exists, and
+    # nothing is on disk until writeback (up to ~30s later on ext4). Add-on
+    # restarts are routine here and this is a Raspberry Pi, so power loss is
+    # routine too — the exposure is every save, not a theoretical window.
+    #
+    # Every sidecar in this add-on (ops log, gcal status, sync status, watchdog
+    # state) already writes this way; `bridge_watchdog.save_state` carries the
+    # docstring explaining why. That reasoning was applied to a restart counter
+    # and not to the one file holding every booking, message and commitment.
+    # `os.replace` is atomic, and under ext4's default data=ordered the temp
+    # file's data is forced out before the rename metadata commits — so a
+    # reader sees old-or-new, never neither.
+    tmp = DATA_FILE.with_name(f"{DATA_FILE.name}.tmp{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, DATA_FILE)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    if not INIT_MARKER.exists():
+        try:
+            INIT_MARKER.write_text(datetime.now().isoformat(timespec="seconds"))
+        except OSError as e:
+            print(f"[data] could not write init marker: {e}")
     if GCAL_ENABLED:
         # Snapshot the data so the worker thread doesn't race with further
         # mutations by the caller. Annotate bookings with drift state so gcal
@@ -585,9 +646,37 @@ def sync_ical():
         with DATA_LOCK:
             return load_data(), str(e)
 
-    cal = __import__("icalendar").Calendar.from_ical(resp.text)
-    with DATA_LOCK:
-        return _merge_ical_events(cal)
+    # Parse and merge are inside the status handler: a crash in either used to
+    # leave the PREVIOUS success standing in sync_status.json, so a broken feed
+    # read as a healthy sync for up to 26h.
+    try:
+        cal = __import__("icalendar").Calendar.from_ical(resp.text)
+        with DATA_LOCK:
+            return _merge_ical_events(cal)
+    except SuspiciousFeed as e:
+        _write_sync_status(False, e)
+        _post_ha_notification(
+            "Airbnb sync refused a suspicious feed",
+            f"{e} The schedule on the Pi is unchanged.",
+            notification_id="cleaning_suspicious_feed",
+            to_phone=True,
+        )
+        with DATA_LOCK:
+            return load_data(), str(e)
+    except Exception as e:
+        _write_sync_status(False, e)
+        with DATA_LOCK:
+            return load_data(), str(e)
+
+
+# A feed that would cancel this many future bookings at once, and more than
+# this fraction of them, is treated as broken rather than believed.
+MASS_CANCEL_MIN = 4
+MASS_CANCEL_RATIO = 0.5
+
+
+class SuspiciousFeed(RuntimeError):
+    """The iCal feed parsed cleanly but describes an implausible world."""
 
 
 def _merge_ical_events(cal):
@@ -625,6 +714,40 @@ def _merge_ical_events(cal):
             }
 
     today = date.today()
+
+    # ── Mass-cancellation guard (2026-08-20) ────────────────────────────────
+    # The sweep below marks any airbnb booking absent from the feed as
+    # cancelled. There was no floor on how many, so a 200 response containing
+    # zero `Reserved` events — listing snoozed, feed URL rotated, export
+    # toggled off, an Airbnb-side hiccup — cancelled the entire forward
+    # schedule in one pass. Everything downstream then agreed it was a good
+    # night: the GCal push deleted the events, `last_sync` advanced,
+    # `sync_status` recorded success, the >26h freshness sentinel stayed quiet,
+    # and the digest reported the vanished findings as "N previously flagged
+    # finding(s) resolved." Total loss of the schedule, delivered as good news.
+    #
+    # A cancellation is a normal event; four at once on future dates is not.
+    # Bail BEFORE `save_data` so a suspicious feed writes nothing at all —
+    # including its additions. Failing closed costs one stale sync, which the
+    # freshness sentinel already alarms on; failing open costs the schedule.
+    future_active = [
+        uid for uid, b in data["bookings"].items()
+        if b.get("type", "airbnb") == "airbnb"
+        and b.get("status") == "active"
+        and (b.get("end") or "") >= today.isoformat()
+    ]
+    to_cancel = [uid for uid in future_active if uid not in seen_uids]
+    if to_cancel and (
+        not seen_uids
+        or (len(to_cancel) >= MASS_CANCEL_MIN and len(to_cancel) > MASS_CANCEL_RATIO * len(future_active))
+    ):
+        raise SuspiciousFeed(
+            f"iCal feed returned {len(seen_uids)} reservation(s) and would cancel "
+            f"{len(to_cancel)} of {len(future_active)} future active booking(s). "
+            "Refusing to apply — nothing was written. Check the Airbnb export URL "
+            "and listing status, then re-run the sync."
+        )
+
     for uid, b in data["bookings"].items():
         if b.get("type", "airbnb") != "airbnb":
             continue
