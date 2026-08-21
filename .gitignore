@@ -16,3 +16,11 @@ scripts/client_secret*.json
 scripts/_*.py
 scripts/_*.png
 scripts/_*.html
+
+# Scrubbed 2026-08-21 — NEVER re-add (raw WhatsApp text / full data snapshots)
+transcripts/
+_live.json
+_live_snap.json
+_snap.json
+_recon_run.json
+=

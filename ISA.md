@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-21T16:20:00-07:00
-progress: 329/364
+updated: 2026-08-21T16:45:00-07:00
+progress: 330/364
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -580,7 +580,7 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 
 - [x] ISC-358: Every nightly push appends its outgoing payload to `/data/digest_archive.jsonl` (30-day trailing retention, same pattern as `bridge_checks.jsonl`). Probe: two consecutive nights → two lines. Without this no replay of causality claims is possible — nothing currently retains past payloads.
 - [ ] ISC-359: A 14-night ledger classifies every digest item Josh flags as wrong or already-resolved by cause: `pi-defect | projection-poverty | write-back-gap | tooling-asymmetry`. Lives beside this ISA; ≥14 nights covered before any verdict.
-- [ ] ISC-361: The public GitHub repo — including its full git history — contains no WhatsApp transcripts, contact cards, or any raw message text. Found by code review 2026-08-21 (confirmed via unauthenticated API): `transcripts/` holds 7 tracked files of real chat history and .vcf cards, committed June 2026. Remediation needs a history scrub (git filter-repo + force push), not just deletion — and it is gated on Josh's decision, because it rewrites a public repo's history and touches the Supervisor deploy path.
+- [x] ISC-361: The public GitHub repo — including its full git history — contains no WhatsApp transcripts, contact cards, or any raw message text. Found by code review 2026-08-21 (confirmed via unauthenticated API): `transcripts/` holds 7 tracked files of real chat history and .vcf cards, committed June 2026. Remediation needs a history scrub (git filter-repo + force push), not just deletion — and it is gated on Josh's decision, because it rewrites a public repo's history and touches the Supervisor deploy path.
 - [ ] ISC-360: Anti: no triage-relocation implementation begins before ISC-359's verdict is recorded as a Decision in this file. If relocation happens: prepaid API credits (never subscription OAuth in the add-on), stage flags retained in the payload so the VPS attestation counter survives.
 
 ## Test Strategy
@@ -1303,3 +1303,10 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - NOT fixed, held for Josh: ISC-361 (public-repo transcript exposure — history scrub is his call).
 - Review also refuted four suspected defects (uid regex truncation, string-vs-instant comparison, merged-evidence understatement, silent-assignee coherence) — all four were sound as shipped.
 - Suites after fixes: add-on 20/20, bot 230/230. Deployed: add-on 1.40.1 on the Pi, bot restarted on the VPS, both verified active.
+
+### ISC-361 — history scrub executed (2026-08-21, Josh-authorized)
+
+- Scope widened by pre-scrub audit: beyond `transcripts/` (7 files), four snapshot JSONs (`_live.json` — 1,053 messages with raw text — `_live_snap.json`, `_snap.json`, `_recon_run.json`) were CURRENTLY TRACKED, plus a stray `=`. Checked before scrubbing: no secrets in the snapshots (options stripped, no ical token, no API key), `.secrets/`/`GCalOauth/` never tracked, zero forks, docs/HTML/PDF clean of raw text.
+- Procedure: full all-refs bundle to `F:/dev/HomeAssistant/cleaning-addon-prescrub-20260821.bundle` (verified) → files preserved in gitignored `.secrets/scrubbed/` → official `git-filter-repo` v2.47.0 (single-file, no pip on this box) `--invert-paths` over the six paths → Josh force-pushed master and deleted the three stale June branches (Calendar-Redo, Full-LLM-Control, G-Cal-Redo) by hand — the harness correctly refused to let the session force-push a public repo itself.
+- Verified: local history clean two ways (ls-files + all-refs log); GitHub API 404 on all three probe paths; only `master` remains; Supervisor still resolves the add-on post-rewrite (1.40.1, started). `.gitignore` now lists all six paths under a NEVER re-add banner.
+- Residual, stated honestly: GitHub may retain unreachable objects server-side for a time (old commit-sha URLs from caches); with zero forks and no PRs referencing them, exposure via the UI/API/clone is closed. A GitHub Support purge request is the belt-and-braces option if Josh wants the unreachable objects dropped early.
