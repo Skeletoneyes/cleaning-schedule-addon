@@ -34,8 +34,12 @@ def d(offset):
 
 
 def msg(mid, state="pending", err=None, parsed=True, ts=None, sender="Itzel"):
+    # 18:00Z = 11:00 America/Vancouver — the SAME local calendar day as the
+    # date in `ts`. The old fixture used 04:00Z, which is the previous local
+    # evening; that only "worked" while the fallback subject sliced the UTC
+    # date (the bug the FallbackSubjectDate test below pins).
     m = {"id": mid, "review_state": state, "parsed": parsed,
-         "timestamp": (ts or d(0)) + "T04:00:00.000Z", "sender_name_raw": sender}
+         "timestamp": (ts or d(0)) + "T18:00:00.000Z", "sender_name_raw": sender}
     if err:
         m["parse_error"] = err
     return m
@@ -132,6 +136,22 @@ class UnreadMessages(unittest.TestCase):
         res = reconcile.run(data, [], today=TODAY)
         kinds = {f["kind"] for f in res["findings"]}
         self.assertIn("undecided_message", kinds)
+
+
+
+class FallbackSubjectDate(unittest.TestCase):
+    def test_evening_local_message_is_not_dated_to_tomorrow(self):
+        """Code-review 2026-08-21: the factless fallback sliced the raw UTC
+        timestamp, so a Vancouver-evening message (e.g. 02:43Z = 19:43 the
+        PREVIOUS local day) was dated to the wrong cleaning."""
+        m = {"id": "m1", "review_state": "pending", "parsed": True,
+             "parse_error": "boom",
+             "timestamp": (TODAY + timedelta(days=1)).isoformat() + "T02:43:18.000Z",
+             "sender_name_raw": "Itzel"}
+        out = reconcile._unread_messages([m], {}, T)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["date"], T,
+                         "UTC 02:43 on day+1 is 19:43 local on day 0")
 
 
 if __name__ == "__main__":

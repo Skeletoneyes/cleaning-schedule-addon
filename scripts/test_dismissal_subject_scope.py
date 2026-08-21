@@ -245,5 +245,49 @@ class RegressionDirectAndAllAbsorbedDismissal(unittest.TestCase):
         self.assertEqual([x["id"] for x in out["findings"]], ["primary-id-2"])
 
 
+
+
+class ReviewQueueExemption(unittest.TestCase):
+    """Code-review 2026-08-21, confirmed by live repro: a pending message's
+    finding has the message's own arrival as its only evidence, so a message
+    sitting unprocessed since BEFORE an unrelated dismissal on the same
+    booking was muted forever by the subject rule — the row-stuck-in-pending
+    failure the unread detector exists to end. undecided_message and
+    unread_message are exempt: their repair is accept/ignore, not
+    adjudication. An explicit id dismissal still silences them."""
+
+    DISMISSED = {"contested_cleaner:b-aug21@airbnb.com:Darya": {
+        "booking_uid": UID, "dismissed_at": DISMISSED_AT, "reason": "adjudicated"}}
+
+    def _msg_finding(self, kind):
+        return finding(f"unread:m-old", kind=kind, detector="unread_messages",
+                       severity="needs-attention",
+                       evidence=["m-old"], evidence_latest="2026-08-15T04:00:07.000Z")
+
+    def test_undecided_message_predating_the_cutoff_still_surfaces(self):
+        out = reconcile.filter_and_sort(
+            {"findings_raw": [self._msg_finding("undecided_message")]}, self.DISMISSED)
+        self.assertEqual(len(out["findings"]), 1)
+
+    def test_unread_message_predating_the_cutoff_still_surfaces(self):
+        out = reconcile.filter_and_sort(
+            {"findings_raw": [self._msg_finding("unread_message")]}, self.DISMISSED)
+        self.assertEqual(len(out["findings"]), 1)
+
+    def test_explicit_id_dismissal_still_silences_a_message_finding(self):
+        d = dict(self.DISMISSED)
+        d["unread:m-old"] = {"dismissed_at": DISMISSED_AT, "reason": "handled"}
+        out = reconcile.filter_and_sort(
+            {"findings_raw": [self._msg_finding("undecided_message")]}, d)
+        self.assertEqual(out["findings"], [])
+
+    def test_non_message_kinds_remain_subject_to_the_cutoff(self):
+        """The exemption is surgical — changed_mind on old evidence stays dismissed."""
+        f = finding("changed_mind:Itzel:2026-08-21",
+                    evidence=["m1"], evidence_latest="2026-08-15T04:00:07.000Z")
+        out = reconcile.filter_and_sort({"findings_raw": [f]}, self.DISMISSED)
+        self.assertEqual(out["findings"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

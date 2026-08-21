@@ -45,6 +45,7 @@ NOW = datetime(2026, 8, 21, 20, 0, 0)
 
 
 def make_fn():
+    import threading
     ns = {
         "datetime": datetime,
         "timedelta": timedelta,
@@ -52,6 +53,7 @@ def make_fn():
         "Path": Path,
         "print": lambda *a, **k: None,
         "DIGEST_ARCHIVE_RETENTION_DAYS": 30,
+        "_ARCHIVE_LOCK": threading.Lock(),
     }
     _extract(["_archive_digest_payload"], ns)
     return ns["_archive_digest_payload"]
@@ -136,6 +138,15 @@ class DigestArchive(unittest.TestCase):
         body = src[i:src.index("def _digest_scheduler")]
         self.assertIn("finally:", body)
         self.assertIn("_archive_digest_payload(DIGEST_ARCHIVE_FILE", body)
+
+    def test_archive_serializes_via_lock(self):
+        """Manual /digest/run (Flask thread) and the scheduler can push
+        concurrently; unlocked rewrites through one tmp name lose a line
+        (code-review 2026-08-21)."""
+        src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+        i = src.index("def _archive_digest_payload")
+        body = src[i:src.index("def _push_digest_to_vps")]
+        self.assertIn("with _ARCHIVE_LOCK:", body)
 
 
 if __name__ == "__main__":

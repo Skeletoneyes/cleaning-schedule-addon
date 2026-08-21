@@ -548,6 +548,16 @@ def filter_and_sort(result, dismissed):
         absorbed = f.get("absorbed") or []
         if bool(absorbed) and all(a in dismissed for a in absorbed):
             return True
+        # Review-queue findings are EXEMPT from the subject rule (code-review
+        # 2026-08-21, confirmed by live repro): a pending message's finding
+        # has the message's own arrival as its only evidence, so a message
+        # sitting unprocessed since before an unrelated dismissal on the same
+        # booking would be muted FOREVER — the row-stuck-in-pending failure
+        # this detector exists to end. Their repair is accept/ignore in the
+        # queue, not adjudication; only an explicit id dismissal (above)
+        # silences them.
+        if f.get("kind") in ("undecided_message", "unread_message"):
+            return False
         cut = subject_cutoffs.get(f.get("booking_uid"))
         latest = as_instant(f.get("evidence_latest"))
         return bool(cut and latest and latest <= cut)
@@ -624,7 +634,14 @@ def _unread_messages(messages, facts_records, today_str, horizon_days=UNREAD_URG
             for f in (facts_records.get(msg_id) or {}).get("facts", [])
             if f.get("target_date") and f["target_date"] >= today_str
         ]
-        subject = min(dates) if dates else (m.get("timestamp") or "")[:10]
+        # Fallback subject = the message's LOCAL calendar day. Slicing the raw
+        # timestamp took the UTC date, so an evening message in Vancouver was
+        # dated to tomorrow's cleaning (code-review 2026-08-21).
+        if dates:
+            subject = min(dates)
+        else:
+            inst = as_instant(m.get("timestamp"))
+            subject = inst.astimezone(_local_tz()).date().isoformat() if inst else ""
         if not subject or subject < today_str:
             continue
 

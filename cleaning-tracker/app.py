@@ -96,6 +96,11 @@ DIGEST_LAST_FILE = DATA_DIR / "digest_last.json"
 # claim about the digest could ever be checked against what actually crossed.
 DIGEST_ARCHIVE_FILE = DATA_DIR / "digest_archive.jsonl"
 DIGEST_ARCHIVE_RETENTION_DAYS = 30
+# Serializes the archive's read-filter-rewrite: the manual /digest/run route
+# (Flask thread) and the scheduler thread can push concurrently, and two
+# unlocked rewrites through the same tmp name would silently drop a line from
+# the replay record (code-review 2026-08-21).
+_ARCHIVE_LOCK = threading.Lock()
 DIGEST_ENABLED = bool(OPTIONS.get("digest_enabled", False))
 DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 
@@ -4243,7 +4248,11 @@ def reconcile_dismiss():
         if RECONCILER_LAST_FILE.exists():
             cached = json.loads(RECONCILER_LAST_FILE.read_text())
             for f in cached.get("findings_raw") or []:
-                if f.get("id") == finding_id:
+                # Match absorbed ids too (code-review 2026-08-21): the id Josh
+                # read in a digest may since have been absorbed under a
+                # different primary, and a changed_mind:* id embeds no uid for
+                # the regex fallback to find.
+                if f.get("id") == finding_id or finding_id in (f.get("absorbed") or []):
                     booking_uid = f.get("booking_uid")
                     break
     except Exception:
@@ -4847,23 +4856,24 @@ def _archive_digest_payload(path, payload, delivered, now=None, retention_days=D
     }
     kept, dropped = [], 0
     try:
-        path = Path(path)
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    old = json.loads(line)
-                except ValueError:
-                    dropped += 1
-                    continue
-                if (old.get("archived_at") or "") >= cutoff:
-                    kept.append(line)
-        kept.append(json.dumps(entry))
-        tmp = path.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        with _ARCHIVE_LOCK:
+            path = Path(path)
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        old = json.loads(line)
+                    except ValueError:
+                        dropped += 1
+                        continue
+                    if (old.get("archived_at") or "") >= cutoff:
+                        kept.append(line)
+            kept.append(json.dumps(entry))
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            tmp.replace(path)
         return {"kept": len(kept), "dropped_corrupt": dropped, "ok": True}
     except Exception as e:
         print(f"[digest-archive] FAILED (non-fatal): {e}")
