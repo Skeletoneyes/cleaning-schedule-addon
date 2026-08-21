@@ -319,6 +319,20 @@ proposals) was removed 2026-07-21 at Josh's request — superseded by
   with exponential backoff honouring `retry-after`. Bulk ingest paces
   at 0.8s/call.
 
+### ⚠️ Write-back is the mandatory closing step of ANY session that resolves a conflict (ISC-354)
+
+A conflict resolved in chat and not written back to the Pi **will be re-reported by
+tonight's digest — correctly**, because the pipeline can only see `data.json`. This was
+the largest single source of "the digest keeps telling me things I already dealt with"
+(council finding, 2026-08-21). Before ending a session: pending message that should
+apply → `POST /review/accept/<msg_id>` (or re-queue via `/review/map` when routing was
+starved); chitchat → `POST /review/ignore/<msg_id>`; resolved out-of-band with no data
+change → `POST /reconcile/dismiss` with a **dated reason** (it lands in `ops_log` as the
+audit trail). Dismissals are subject-scoped with an evidence cutoff since 1.38.0 — a new
+message about the same booking re-opens it, so dismissing cannot mute future signal.
+**Anti (ISC-355): these routes are desktop/LAN-only. Nothing on the VPS or Telegram path
+ever calls them — the projection boundary holds in both directions.**
+
 ### Reconciler (`reconcile.py`, `/reconcile/*`)
 Pure-function detectors that join `data.json` + `message_facts` into a
 ranked list of findings with `{id, detector, kind, severity, booking_uid,

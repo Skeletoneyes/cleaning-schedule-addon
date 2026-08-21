@@ -51,6 +51,31 @@ hand is wasted work.
    `data.dismissed_findings`: the user already handled those
    out-of-band.
 
+## ⚠️ Write-back — the MANDATORY closing step (ISC-354)
+
+**A conflict resolved in this session that leaves no record on the Pi will be
+re-reported by tonight's digest — correctly, because nothing told the Pi.**
+The chat is not the system of record; `data.json` is. Before ending any
+session that resolved, adjudicated, or explained away a finding, write the
+resolution back through the route that matches what actually happened:
+
+| What the session concluded | Write-back |
+|---|---|
+| A pending message's content should apply | `POST /review/accept/<msg_id>` (or re-queue via `POST /review/map` when routing was starved by an unmapped sender/stale error) |
+| A pending message is chitchat / needs no action | `POST /review/ignore/<msg_id>` |
+| A finding is resolved out-of-band, no data change needed | `POST /reconcile/dismiss` with `{"finding_id": ..., "reason": "<dated reason naming this session>"}` |
+| A booking's cleaner/time is wrong | `POST /assign` |
+
+Dismissal reasons must carry the date and enough context that a cold reader
+understands the adjudication — they land in `ops_log` and are the audit trail.
+Dismissals are subject-scoped with an evidence cutoff (1.38.0): new messages
+about the same booking re-open it, so dismiss without fear of muting the future.
+
+**Anti (ISC-355): write-back is desktop/LAN-only.** These routes are called
+with the shared secret from inside the LAN. Nothing on the VPS or the
+Telegram path may ever call them — the projection boundary holds in both
+directions.
+
 ## Setup (one-time)
 
 - Copy `.secrets/urls.json.example` to `.secrets/urls.json` and fill in:

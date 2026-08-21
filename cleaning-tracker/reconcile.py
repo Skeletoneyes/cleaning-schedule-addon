@@ -366,7 +366,16 @@ def resolve_subjects(findings, bookings, dismissed=None):
     out = [dict(f, decision=_decision_for(f)) for f in loose]
     for subj, members in groups.items():
         if len(members) == 1:
-            out.append(dict(members[0], decision=_decision_for(members[0])))
+            only = dict(members[0], decision=_decision_for(members[0]))
+            # Backfill the resolved booking even for a single-member group —
+            # a loose changed_mind carries booking_uid None, and a dismissal
+            # recorded against it then has no subject for ISC-349's
+            # subject-scoped rule to key on (found live, 2026-08-21: the
+            # Sep-10 dismissal stored booking_uid null while the merged
+            # Aug-21 one captured its uid).
+            if not only.get("booking_uid"):
+                only["booking_uid"] = subj
+            out.append(only)
             continue
         # The primary is the live member demanding the most of the reader;
         # dismissed members sort last (ISC-335), then ties go to the one
