@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-21T14:50:00-07:00
-progress: 328/363
+updated: 2026-08-21T15:35:00-07:00
+progress: 329/363
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -578,7 +578,7 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 
 **W4 — Measurement + relocation gate**
 
-- [ ] ISC-358: Every nightly push appends its outgoing payload to `/data/digest_archive.jsonl` (30-day trailing retention, same pattern as `bridge_checks.jsonl`). Probe: two consecutive nights → two lines. Without this no replay of causality claims is possible — nothing currently retains past payloads.
+- [x] ISC-358: Every nightly push appends its outgoing payload to `/data/digest_archive.jsonl` (30-day trailing retention, same pattern as `bridge_checks.jsonl`). Probe: two consecutive nights → two lines. Without this no replay of causality claims is possible — nothing currently retains past payloads.
 - [ ] ISC-359: A 14-night ledger classifies every digest item Josh flags as wrong or already-resolved by cause: `pi-defect | projection-poverty | write-back-gap | tooling-asymmetry`. Lives beside this ISA; ≥14 nights covered before any verdict.
 - [ ] ISC-360: Anti: no triage-relocation implementation begins before ISC-359's verdict is recorded as a Decision in this file. If relocation happens: prepaid API credits (never subscription OAuth in the add-on), stage flags retained in the payload so the VPS attestation counter survives.
 
@@ -1282,3 +1282,9 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - ISC-356: live capture on the VPS. Allowlist extracted to `reconcile.project_finding_for_vps` (pure; `VPS_FINDING_FIELDS` is the single enumeration); `booking_status` derived from the booking at projection time, `absorbed` passed through. Bot (`cleaning.ts`) accepts both — validated shapes, null on malformed, absent valid for an older Pi — and the triage prompt is taught what they mean (a "cancelled" subject is usually settled; absorbed is countable corroboration). Live `/digest/run` at 14:45: VPS state file shows keys exactly `absorbed, booking_status, cleaner, date, decision, detector, id, kind, severity, why`, `booking_status: "active"` populated on all 9 findings. Telegram delivered: "Actions needed — none / Unresolved conflicts — none / Changes applied — Itzel auto-confirmed via WhatsApp for 9 cleanings", the first digest with a populated changes channel and empty alarm buckets.
 - ISC-357: `scripts/test_projection_allowlist.py` (7 tests, OK) — key set equals the declared allowlist, quote/evidence/evidence_latest/booking_uid absent, raw text appears in no value, plus a source-level guard that app.py still routes through the pure function. Live payload confirmed: `any quote/evidence? False`. Bot suite 227/227 after the parser change; add-on suite 19/19.
 - Deploy note, recorded because it almost bit: `/opt/pai-telegram-bot` is NOT a git checkout — the first deploy attempt ran `git pull` there, failed, and restarted the service on old code while reporting `active`. Correct mechanism per RUNBOOK: scp the changed src file + chown paibot + restart. The repo push to the Pi remote is the source of truth; the scp is the delivery.
+
+### W4 archive + ledger scaffold — 1.40.0 (2026-08-21)
+
+- ISC-358: unit + live. `_archive_digest_payload` in app.py — one JSON line per outgoing payload with `delivered` outcome, 30-day trailing retention, tmp-file+rename rewrite (a torn write costs at most one record), corrupt lines dropped-and-counted, never raises; called in `finally` on `_push_digest_to_vps` so no delivery outcome skips it. `scripts/test_digest_archive.py` (9 tests, OK — includes the two-consecutive-runs probe verbatim, the retention boundary, and a source-level guard that the call sits in `finally`). Live: manual quiet run on 1.40.0 logged `[digest-archive] ok — 1 line(s) retained`; line 2 lands with the 2026-08-22 08:00 scheduled run.
+- ISC-359: ledger scaffolded at `DIGEST_LEDGER.md` (protocol, four cause tags, 14 dated night rows starting 2026-08-22, verdict due ≥2026-09-05). Open until 14 nights accrue.
+- ISC-360: standing gate, deliberately unchecked — it verifies at the verdict moment (no relocation work before the ISC-359 Decision exists). Currently holds: no relocation branch or commit exists.
