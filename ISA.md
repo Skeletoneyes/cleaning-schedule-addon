@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-21T15:35:00-07:00
-progress: 329/363
+updated: 2026-08-21T16:20:00-07:00
+progress: 329/364
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -560,7 +560,7 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 
 **W1 — Reconciler defect fixes**
 
-- [x] ISC-349: Dismissals are subject-scoped with an evidence cutoff. Dismissing a finding records `booking_uid` + `dismissed_at`; a later finding about the same booking whose evidence is *entirely older* than `dismissed_at` is filtered, while any post-dismissal message re-opens the subject. Probe: unit replay of the Aug-16-dismissal / Aug-21-refinding sequence — suppressed on old evidence, surfaced when the Aug-18 messages are included.
+- [x] ISC-349: Dismissals are subject-scoped with an evidence cutoff. Dismissing a finding records `booking_uid` + `dismissed_at`; a later finding about the same booking whose evidence is *entirely older* than `dismissed_at` is filtered, while any post-dismissal message re-opens the subject. Review-queue kinds (`undecided_message`/`unread_message`) are exempt — their repair is accept/ignore, not adjudication; only an explicit id dismissal silences them. (revised 2026-08-21, see Changelog) Probe: unit replay of the Aug-16-dismissal / Aug-21-refinding sequence — suppressed on old evidence, surfaced when the Aug-18 messages are included.
 - [x] ISC-350: Acceptance replay on the live corpus: with the 2026-08-21 data and the Aug 16 dismissal records, the rendered digest carries no bullet re-reporting the adjudicated Darya/Itzel contest, and the two Aug 18 unread messages still surface (they are genuinely new). Probe: reconcile → render → grep.
 - [x] ISC-351: A failed re-extraction never falsifies a successful one. When a message already holds facts at the current prompt version, a later extraction error leaves it classified as *waiting for a decision*; `unread_messages` says "extraction failed" only when no facts exist. Probe: unit test forcing an API error on a message with stored facts. (Fixes the Sep 8 "extraction failed" lie — 3 of 4 queued messages were in this state on 2026-08-21.)
 - [x] ISC-352: A coherent schedule story is not a conflict. When every cleaner's *latest* statement about a date is consistent with current booking state (assignee's latest = confirm, non-assignees' latest = decline, booking active), the merged finding takes `decision: observe` and severity informational. Probe: fixture mirroring Aug 21 → observe; fixture where the *assignee's* latest is decline → still adjudicate.
@@ -580,6 +580,7 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 
 - [x] ISC-358: Every nightly push appends its outgoing payload to `/data/digest_archive.jsonl` (30-day trailing retention, same pattern as `bridge_checks.jsonl`). Probe: two consecutive nights → two lines. Without this no replay of causality claims is possible — nothing currently retains past payloads.
 - [ ] ISC-359: A 14-night ledger classifies every digest item Josh flags as wrong or already-resolved by cause: `pi-defect | projection-poverty | write-back-gap | tooling-asymmetry`. Lives beside this ISA; ≥14 nights covered before any verdict.
+- [ ] ISC-361: The public GitHub repo — including its full git history — contains no WhatsApp transcripts, contact cards, or any raw message text. Found by code review 2026-08-21 (confirmed via unauthenticated API): `transcripts/` holds 7 tracked files of real chat history and .vcf cards, committed June 2026. Remediation needs a history scrub (git filter-repo + force push), not just deletion — and it is gated on Josh's decision, because it rewrites a public repo's history and touches the Supervisor deploy path.
 - [ ] ISC-360: Anti: no triage-relocation implementation begins before ISC-359's verdict is recorded as a Decision in this file. If relocation happens: prepaid API credits (never subscription OAuth in the add-on), stage flags retained in the payload so the VPS attestation counter survives.
 
 ## Test Strategy
@@ -838,6 +839,13 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - 2026-08-03 13:10: Left ISC-184 **failing on purpose** rather than backfilling 110 Test Strategy rows at wrap-up. Writing a `check | threshold | tool` line for ISC-86..155 today would mean inventing probes for work verified in earlier sessions whose actual evidence I did not observe — a table full of plausible retroactive entries is strictly worse than a gap that is visible and counted, because it converts a known unknown into a confident wrong. The honest remediation is per-increment: when a run touches an old ISC, give it a row then, from real evidence. The counter is the backlog. Rejected alternative: mark ISC-184 `[x]` on the grounds that the *gate* now exists and today's rows are complete — that is completion-by-format bias, the failure GPT-5.5 named on the financial ISA, and the criterion says every ISC has a row, not that a checker exists.
 
 ## Changelog
+
+### 2026-08-21 — the subject rule swallowed the review queue
+
+- 2026-08-21 | conjectured: a dismissal on a booking safely covers every finding about that booking whose evidence predates it — "an adjudication covers everything known at the moment it was made" (ISC-349 as designed this morning).
+  refuted by: code review (high), confirmed by live repro — a message pending since Aug 15 about a Sep-10 cleaning was silently and PERMANENTLY muted by an unrelated Aug-16 contested-cleaner dismissal on the same booking: the message's arrival is its finding's only evidence, so `evidence_latest <= cutoff` holds forever and the queue rots.
+  learned: "evidence predates the adjudication" conflates two kinds of finding. A schedule-claim finding's evidence is testimony about a question the human answered — old testimony is covered. A review-queue finding's evidence IS the unfinished work item itself — a dismissal about the schedule says nothing about whether the message was ever processed. The cutoff rule is sound only for findings whose repair is adjudication.
+  criterion now: ISC-349 revised (review-queue kinds exempt from the subject rule; explicit id dismissal still silences them) + 4 regression tests in test_dismissal_subject_scope.py.
 
 ### 2026-08-20 (third pass) — two refutations from reviewing what shipped
 
@@ -1288,3 +1296,10 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - ISC-358: unit + live. `_archive_digest_payload` in app.py — one JSON line per outgoing payload with `delivered` outcome, 30-day trailing retention, tmp-file+rename rewrite (a torn write costs at most one record), corrupt lines dropped-and-counted, never raises; called in `finally` on `_push_digest_to_vps` so no delivery outcome skips it. `scripts/test_digest_archive.py` (9 tests, OK — includes the two-consecutive-runs probe verbatim, the retention boundary, and a source-level guard that the call sits in `finally`). Live: manual quiet run on 1.40.0 logged `[digest-archive] ok — 1 line(s) retained`; line 2 lands with the 2026-08-22 08:00 scheduled run.
 - ISC-359: ledger scaffolded at `DIGEST_LEDGER.md` (protocol, four cause tags, 14 dated night rows starting 2026-08-22, verdict due ≥2026-09-05). Open until 14 nights accrue.
 - ISC-360: standing gate, deliberately unchecked — it verifies at the verdict moment (no relocation work before the ISC-359 Decision exists). Currently holds: no relocation branch or commit exists.
+
+### Code review of the full day (2026-08-21, high effort) — 7 findings, 6 fixed as 1.40.1 + bot redeploy
+
+- Fixed: (2) subject-scoped dismissal permanently muted a pending message predating an unrelated dismissal on the same booking — CONFIRMED by live repro; review-queue kinds now exempt (4 new tests). (3) `booking_status` now validated against the closed vocabulary on the bot, mirroring `asDecision`. (4) absorbed ids accepted as aliases in the coverage gate + prompt forbids citing them — a dutiful model can no longer blow the digest into fallback on merged-findings nights (3 new tests). (5) dismiss route resolves `booking_uid` through `absorbed` lists too. (6) archive rewrite serialized behind `_ARCHIVE_LOCK` (manual run vs scheduler race). (7) factless fallback subject now the LOCAL calendar day — the UTC slice dated Vancouver-evening messages to tomorrow's cleaning; test fixtures' 04:00Z timestamps were themselves leaning on the bug and were corrected to same-local-day times.
+- NOT fixed, held for Josh: ISC-361 (public-repo transcript exposure — history scrub is his call).
+- Review also refuted four suspected defects (uid regex truncation, string-vs-instant comparison, merged-evidence understatement, silent-assignee coherence) — all four were sound as shipped.
+- Suites after fixes: add-on 20/20, bot 230/230. Deployed: add-on 1.40.1 on the Pi, bot restarted on the VPS, both verified active.
