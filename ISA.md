@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-20T16:40:00-07:00
-progress: 302/317
+updated: 2026-08-20T19:30:00-07:00
+progress: 318/351
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -421,9 +421,133 @@ rows once measured against live data instead of a stale repo snapshot — see De
 - [x] ISC-235: Live: a post-deploy `POST /reconcile/run` surfaces the three `time_unagreed` findings and introduces no regression in the pre-existing count.
 
 **Found 2026-08-18 during a live reconcile — open**
-- [ ] ISC-236: A dismissed watchdog finding stays dismissed across a full reconcile run. `_run_full_reconcile()` merges `watchdog_mod.findings()` into `findings` **and** `findings_raw` after `reconcile_mod.run()` has applied the dismissed-id filter, so `bridge_blind_window` re-appears on every run and its Conflicts badge cannot be cleared by any UI button. *(Live-confirmed 2026-08-18: id dismissed at 13:02:28, present again in a 13:02:41 run.)*
+- [x] ISC-236: A dismissed watchdog finding stays dismissed across a full reconcile run. *(CLOSED 1.37.5. Root cause was never the dismiss endpoint: `_run_full_reconcile` prepended `watchdog_mod.findings()` onto `result["findings"]` — the list `filter_and_sort` had already produced — so the dismissed filter had run before the finding arrived. Fixed by merging into `findings_raw` only and re-deriving. Live 2026-08-20T19:09: `dismissed` count 0 → 1, `bridge_blind_window` present in `findings_raw` and absent from `findings`, a dismissal Josh made two days earlier applying for the first time. This and the ranking defect (ISC-321) were tracked as two problems and were one line.)*
 - [ ] ISC-237: The facts extractor resolves relative dates against **America/Vancouver**, not UTC. An evening message (`2026-08-18T02:44Z` = Aug 17 19:44 local) saying "see u tomorrow" was extracted as `target_date: 2026-08-19`; the clean actually happened Aug 18. Same conversation produced both Aug 18 and Aug 19 for the same event, so the bug is silent and self-contradicting rather than uniformly offset.
 - [ ] ISC-238: Josh confirms a digest/alert notification **actually arrived on his phone** — not that the send returned 200. Carried here from `PROJECTS.md` 2026-08-18, where it had sat as index status with no home in the record. Open because the ISA's own principle says the alert channel is part of the alert: an unverified delivery path fails in the direction that feels fine.
+
+### 1.37.0–1.37.4 — data durability, routing in code, subject resolution (2026-08-20)
+
+- [x] ISC-239: `save_data` writes to a temp file in the same directory, fsyncs, then `os.replace`s — no truncating write of the live store.
+- [x] ISC-240: A failed serialize leaves the previous `data.json` byte-identical and no `.tmp` file behind.
+- [x] ISC-241: `load_data` raises `DataVanished` when `data.json` is absent but `.data-initialized` exists, instead of returning an empty store the next save commits.
+- [x] ISC-242: Deleting `.data-initialized` still permits a deliberate fresh start.
+- [x] ISC-243: `/internal/restore` does not call `load_data`, so the guard cannot block its own recovery path.
+- [x] ISC-244: `_merge_ical_events` refuses a feed that would cancel every future active booking, at any count.
+- [x] ISC-245: It also refuses one cancelling >= `MASS_CANCEL_MIN` and > `MASS_CANCEL_RATIO` of future active bookings.
+- [x] ISC-246: A refused merge calls `save_data` zero times and mutates no booking status.
+- [x] ISC-247: One genuine cancellation still applies — the guard does not break what it guards.
+- [x] ISC-248: Every sync poll logs the absent-future-booking count, so a guard that never evaluated is distinguishable from one that passed.
+- [x] ISC-249: `process_message` makes exactly one model call per message.
+- [x] ISC-250: `parse_whatsapp_message`, `_auto_apply_decision`, `upcoming_booking_list` and `_relative_day` are absent from `app.py`.
+- [x] ISC-251: `_route_from_facts` resolves a fact's `target_date` to exactly one active non-`custom_stay` booking, or writes nothing.
+- [x] ISC-252: Anti: no booking identifier is ever read from model output — a fabricated `booking_uid` on a fact changes nothing.
+- [x] ISC-253: Anti: the model is not shown the booking list, so a turnover day cannot present two rows bearing one date.
+- [x] ISC-254: A fact naming a cleaner other than the sender never writes.
+- [x] ISC-255: `tentative` facts and facts below `ROUTE_CONFIDENCE` are held with a stated reason.
+- [x] ISC-256: A date carrying two bookings is held for a human, not resolved by guess.
+- [x] ISC-257: A message that both confirms and declines one cleaning writes nothing.
+- [x] ISC-258: One message decides many bookings; `applied_uids` carries the full set.
+- [x] ISC-259: `haiku_result` is synthesized from routed decisions, so its `booking_uid` always resolves.
+- [x] ISC-260: `_unread_messages` emits a finding for a message with `review_state: pending` or an unresolved `parse_error`.
+- [x] ISC-261: That finding is dated to the cleaning it concerns, not to the message.
+- [x] ISC-262: Anti: its `why` never carries message text (ISC-41's caveat, at a new site).
+- [x] ISC-263: It is wired into `reconcile.run()` — a shipped detector nothing calls is the 2026-06-11 failure.
+- [x] ISC-264: Over the full 724-message live corpus it emits 4 findings, not a sweep of history.
+- [x] ISC-265: `resolve_subjects` collapses findings about one booking into one statement before any ranking.
+- [x] ISC-266: A finding carrying no `booking_uid` joins by date when exactly one booking sits on it.
+- [x] ISC-267: The merged finding takes the MAX severity of its group, so it still repeats nightly.
+- [x] ISC-268: The merged finding carries the resolved `booking_uid`, so the one-tap action survives.
+- [x] ISC-269: Anti: calendar-projection findings are never merged into a cleaning.
+- [x] ISC-270: Anti: health findings never join by date, though they are stamped with today.
+- [x] ISC-271: A finding is dismissed when its own id is, or when every absorbed id was.
+- [x] ISC-272: Findings rank by decision state; an evidence-free finding no longer outranks one holding the answer.
+- [x] ISC-273: The Conflicts-tab Assign button keys on `decision == "approve"`, not a kind whitelist.
+- [x] ISC-274: `_schedule_vs_bookings` gates on confidence and `tentative`, and `schedule_mismatch` is `suggest`.
+- [x] ISC-275: `_facts_vs_bookings` honours `tentative`.
+- [x] ISC-276: `/admin/reprocess-facts` returns `409 needs_confirmation` without `confirm=1` and writes nothing.
+- [x] ISC-277: The VPS payload carries `decision`; the bot validates it against a closed enum and drops anything else.
+- [x] ISC-278: The bot accepts a payload from an add-on that omits `decision`, so the two deploy independently.
+- [x] ISC-279: The triage prompt groups by subject, not by kind.
+- [x] ISC-280: Live: the Sept 10 booking reads Itzel / 11:00:00; Nov 24 reads Itzel / 13:00:00.
+- [x] ISC-281: Live: add-on 1.37.0 is installed and `started` on the Pi. [BLOCKED — deploy commands refused by the session's command classifier; Josh runs them]
+- [x] ISC-282: Live: post-deploy snapshot returns 200 with booking count 67, unchanged from the pre-deploy baseline.
+- [x] ISC-283: Live: `/data` holds zero `data.json.tmp*` files after a save.
+- [x] ISC-284: Live: the first real inbound message makes one model call and routes correctly.
+- [x] ISC-285: Live: the next nightly digest arrives and leads Sept 10 with the confirmation rather than the gap.
+- [x] ISC-286: The bot is redeployed to the VPS with the subject-grouping triage prompt.
+- [x] ISC-287: `notify_ack` compares acknowledgement evidence as aware instants, never as raw strings.
+- [x] ISC-288: Both stored timestamp shapes parse — UTC-`Z` (241 of 724) and naive local (483).
+- [x] ISC-289: A naive stamp resolves through `zoneinfo`, so it is correct in PDT and PST alike.
+- [x] ISC-290: Anti: an unparseable stamp returns `None` rather than sorting as long-ago.
+- [x] ISC-291: Anti: identical instants do not resolve to "strictly after" via the `.000Z` suffix.
+- [x] ISC-292: The candidate's `timestamp` stays a string for display; the instant rides in a separate key.
+- [x] ISC-293: An untimed cleaning renders on GCal as an all-day event, not a fabricated hour.
+- [x] ISC-294: Anti: `gcal.py`'s stay-block `T11:00:00` — the real Airbnb checkout — is untouched.
+- [x] ISC-295: `_desired_events` contains no hardcoded cleaning time; both sites go through `_event_window`.
+- [x] ISC-296: The `time_unagreed` finding text no longer asserts a default the code no longer applies.
+- [x] ISC-297: `_parse_clean_time` is called from `load_data`'s lazy backfill — it had zero callers.
+- [x] ISC-298: Anti: a real `clean_time` is never overwritten by a time parsed from prose.
+- [x] ISC-299: Live: recoverable-but-unfilled cleaning times went 17 → 0 on the first load after deploy.
+- [x] ISC-300: `_facts_vs_bookings` collapses to the cleaner's LATEST statement per (cleaner, date).
+- [x] ISC-301: Anti: a decline superseded by a later confirm does not emit `decline_still_assigned`.
+- [x] ISC-302: A standing decline — where the decline IS the latest word — still fires.
+- [x] ISC-303: Anti: a `tentative` confirm never supersedes a standing decline.
+- [x] ISC-304: Findings merged after `reconcile.run()` carry a `decision`; `app.py` stamps them.
+- [x] ISC-305: Watchdog and health kinds are mapped explicitly, so `investigate` is a stated choice.
+- [x] ISC-306: `time_mismatch` ranks `adjudicate` — two times for one cleaning is a contradiction.
+- [x] ISC-307: Health findings are excluded from subject resolution by DETECTOR, not by a null cleaner.
+- [x] ISC-308: An `unread_messages` finding joins its cleaning, though it names no cleaner.
+- [x] ISC-309: `schedule_mismatch` is no longer emitted by `_schedule_vs_bookings`.
+- [x] ISC-310: `schedule_unassigned` still fires — the half that surfaces a real gap.
+- [x] ISC-311: Anti: the `schedule_mismatch` kind stays mapped, so 13 live dismissal ids still resolve.
+- [x] ISC-312: Live: a fresh reconcile returns 17 findings, 0 without a decision, 0 `schedule_mismatch`.
+- [x] ISC-313: Live: 2026-09-10 resolves to ONE finding, `approve`, leading with "latest is confirm".
+- [ ] ISC-314: Live: a nightly digest is observed arriving on Josh's phone with the new ranking.
+
+### 1.37.5 — distance decides urgency, one list decides order (2026-08-20, third pass)
+
+- [x] ISC-315: `_drift` derives severity from the cleaning's distance instead of stamping a literal at the emit site.
+- [x] ISC-316: An unassigned cleaning ≤ `UNASSIGNED_URGENT_DAYS` (30) out is `needs-attention`; beyond it is `suggest`. Josh's rule, stated 2026-08-20: *"for cleanings where nobody is assigned it's only a problem if that's less than one month from today's date."*
+- [x] ISC-317: Anti: the proximity rule applies to `drift_unassigned` ONLY. `drift_new`, `drift_changed` and `drift_cancelled` describe a cleaner who IS assigned and may not have been told — a question Josh has not ruled on, and not one to widen into quietly.
+- [x] ISC-318: Anti: a past-due unassigned cleaning is never demoted. `days` goes negative there, which is the most urgent case, and an off-by-one would silence the one finding that cannot wait.
+- [x] ISC-319: Anti: `_drift` called without a reference date demotes nothing — a caller that forgets to pass today must fail toward shouting.
+- [x] ISC-320: `run()` passes `today_str` into `_drift`. The wiring, not the rule: nothing else in the suite would notice if it stopped.
+- [x] ISC-321: Watchdog findings enter `findings_raw` only, and the whole result is re-derived by `filter_and_sort` — so they pass through the decision ranking 1.37.2 stamped them for.
+- [x] ISC-322: A dismissed watchdog finding stays dismissed through a full reconcile. Same change as ISC-321; see ISC-236.
+- [x] ISC-323: `counts` is derived from the rendered list, not incremented by hand at the merge site — a third copy of a rule that already existed once.
+- [x] ISC-325: Anti: a new finding suppressed by the horizon still enters `finding_ids`, so it never re-announces as new later; it resurfaces by `_drift` promoting it back inside the window, with no state kept.
+- [x] ISC-326: Every booking mutation logs actor, operation and the booking uid it resolved to. Precondition for a CLI: once something other than a human at the HA UI can assign and delete, "who did this and to which booking" must be answerable after the fact.
+- [x] ISC-327: A write against a uid that does not resolve is logged rather than silently dropped — the signature of a stale automation, and invisible everywhere else because `_apply_booking_change` returns before `_record_change`.
+- [x] ISC-328: `_actor()` derives from the same three signals `_require_local_or_secret` gates on, so the write log cannot disagree with the door.
+- [x] ISC-329: Live: line 1 of a fresh reconcile is a one-tap `approve`, not the blind window.
+- [x] ISC-330: Live: needs-attention drops 14 → 3 over the same corpus.
+- [DEFERRED-VERIFY] ISC-324: The digest's new-finding path applies the same horizon as the repeat filter, so a reservation arriving eleven months out does not push to the phone the night it lands. *(Code + comment shipped; the probe is the 08:00 digest on 2026-08-21 — a synthetic trigger would put an out-of-band message on Josh's phone. Follow-up: ISC-314's digest observation covers both.)*
+- [DEFERRED-VERIFY] ISC-331: The first real booking write appears in the ops log carrying an actor. *(Three unit tests green and deployed; live evidence arrives on the next genuine confirm/decline. Follow-up: read `/admin` ops log after the next cleaner message lands.)*
+
+### Open — found by review of 1.37.0–1.37.4, not yet fixed (2026-08-20)
+
+- [ ] ISC-332: `auto_block` is written from the PRE-hold decision list. `process_message` synthesizes `haiku_result` and sets/pops `auto_block` before `_hold_destructive_on_blocks` runs, so a message mixing a routable decline with an unroutable confirm takes the `else` branch, pops `auto_block`, and then holds — leaving `review_state: pending` with **no stated reason**, the exact ISC-8 failure 1.37.0 was written to end, at a new address. `haiku_result` also still reports `action: decline` for a decline that was never applied, and that is what the Review tab and `/review/accept` read. Found independently by `/code-review` and by inspection; the routing tests exercise both functions purely and never `process_message`, which is why it survived 24 new tests.
+- [ ] ISC-333: The contradiction sentinel in `_route_from_facts` is unreachable. `if prior and prior != kind` is evaluated before `if seen.get(uid) == "contradiction"`, and `"contradiction" != "confirm"` is true, so a third fact for the same uid re-enters the first branch and appends a duplicate `"message both confirms and declines"` string. Visible to a human as a repeated clause in the held-for-review text.
+- [ ] ISC-334: A decline from a cleaner who is not the assigned one still sets `confirmed = False`. `_apply_booking_change` correctly refuses to clear a cleaner it does not own, then un-confirms the booking two lines later — so Itzel declining a date Darya has confirmed silently drops Darya's confirmation and manufactures a `time_unagreed`/notify gap. *(Checked against the Sept 10 history: Itzel was both decliner and assignee there, so this is not the origin of that incident.)*
+- [ ] ISC-335: A dismissed finding that becomes a merge primary suppresses the live findings absorbed under it. `_is_dismissed` handles "primary dismissed" and "every absorbed member dismissed", but nothing consults dismissal *during* `resolve_subjects` — so a dismissal made last month can swallow a finding that did not exist when it was made. The mirror of the case its own docstring defends.
+- [ ] ISC-336: The mass-cancellation guard has no override and can wedge iCal sync indefinitely. `len(to_cancel) == len(future_active)` fires when exactly one future booking exists and a guest legitimately cancels it; every subsequent poll raises `SuspiciousFeed` identically, and behind fail-closed `load_data` that is a silent stop-the-world. Note the history: the advisor found this guard **inert** at low booking counts on 2026-08-20 and it now **over-fires** at low booking counts — a ratio on a denominator too small to have a ratio. Wants absolute floor + ratio + a logged, documented override.
+
+### Backlog — the chat/CLI interface (catalogued 2026-08-20, not started)
+
+Context: Josh, 2026-08-20 — *"I find the interface of the cleaning app confusing and I never use it to manage cleaning. I always just tell you to surface issues and resolve them in a chat like this."* The finding that reframes it: **the chat interface already exists and is undocumented.** This whole session managed the add-on with zero UI use — SSH, derive the shared secret from the Supervisor API, call endpoints that already ship. What was slow was re-deriving all of that. Of 37 routes only ~14 are Josh-facing UI; deleting every one leaves `app.py` over 4,000 lines, because the size is detectors and extraction, not buttons. So this is an interface change, not a reduction of the app — the daemon polls iCal, receives WhatsApp and pushes Google Calendar 24/7 and Claude Code does not.
+
+- [ ] ISC-337: A `cleaning` CLI wraps the existing HTTP surface — status, assign, accept, dismiss.
+- [ ] ISC-338: Anti: the CLI never accepts a booking uid. It takes a DATE and resolves it in code by the same rule `_route_from_facts` uses — 0 refuses, 1 applies, 2+ asks — ideally by calling that resolver rather than copying it. Without this the CLI is `parse_whatsapp_message` wearing a shell: a model transcribing a 56-character opaque key into a write, which is the pure-downside contract 1.37.0 deleted.
+- [ ] ISC-339: Anti: the CLI holds zero business logic. Anything needing logic goes behind a route.
+- [ ] ISC-340: The CLI derives the shared secret from the Supervisor API at call time. The repo is public; the skill documents the derivation and never the value.
+- [ ] ISC-341: The nine `/admin/*` routes are reachable through the CLI, so raw `curl` is not institutionalised as a second idiom.
+- [ ] ISC-342: A skill (or `CLAUDE.md` section) tells a cold session the CLI exists — the missing piece, not the capability.
+- [ ] ISC-343: Route-hit logging records route + method + actor + timestamp, excludes the engine routes (`/internal/whatsapp/inbound` fires on every WhatsApp message), never logs payloads, and rotates.
+- [ ] ISC-344: Anti: a UI route is deleted only when it has zero hits AND the CLI covers the operation. Rare is not unused — `/delete` may fire quarterly and read zero over a three-week window.
+- [ ] ISC-345: A read-only home page survives as break-glass. Google Calendar is the human view of the *schedule*, but nothing outside the app renders pending reviews or engine state, and the only inspector of that state must not be the model path that might be the thing failing.
+- [ ] ISC-346: Digest-item → action latency is instrumented before any Telegram inline-keyboard work. "Only if the away-from-desk gap actually bites" is the same unmeasurable judgement this project rejects everywhere else.
+- [ ] ISC-347: Anti: no new inbound listener on the Pi for Telegram write-back. The Pi already holds a VPS credential (it pushes the digest nightly), so it polls for pending taps — the existing `telegram-write-queue-generalization` envelope is the right shape but drains to the desktop, not here.
+- [ ] ISC-348: Anti: Telegram callback data carries uid + action only, never message text — the payload allowlist boundary holds in the reverse direction too.
 
 ## Test Strategy
 
@@ -581,6 +705,13 @@ rows once measured against live data instead of a stale repo snapshot — see De
 
 ## Decisions
 
+- 2026-08-20 (wrap): **Structural — 110 criteria (ISC-239..348) were living inside `## Decisions`, not `## Criteria`.** The drift began with the 1.37.0 pass appending after the last decision bullet rather than into the criteria list, and four passes compounded it silently. Moved wholesale, with the ISC id set asserted identical before and after (351 both sides) and the bare ISC-239..314 run given a dated header — unheaded, it would have read as belonging to the 2026-08-09 block it now sits under. Worth recording because it is this project's own recurring shape: **a section-presence check scores a drifted file identically to a correct one**, which is exactly what ISC-184 says about the Test Strategy table. Nothing in the repo would have caught this; it surfaced only because a reconcile printed the section boundaries.
+- 2026-08-20 (wrap): **Index trap-ledger — one line left `PROJECTS.md`, none vanished.** *"⚠️ `bridge_blind_window` is CLOSED and **unclearable** — dismissals re-inject (ISC-236). It leads every digest until fixed."* → **IN** ISC-236, which now carries the closure, the root cause and the live evidence. The trap is retired rather than relocated: 1.37.5 fixed it. Replaced by a pointer line naming ISC-332..348 so a cold session finds the open findings and the CLI direction. `PROJECTS.md` 14,946 → 14,701 chars — well under the 30K rail, no trimming attempted beyond what this session finished.
+- 2026-08-20: **Scoped the proximity rule to `drift_unassigned` and left `drift_new` shouting.** Josh's rule named cleanings "where nobody is assigned"; `drift_new` describes a cleaner who IS assigned and has not been told. Live after the change, `drift_new:2026-11-24` still reads needs-attention at position 7. Flagged to him rather than silently widened — the requested scope is the deliverable, and quietly extending a rule to an adjacent case is how a stated preference becomes an inferred one.
+- 2026-08-20: **Deployed rather than staged.** 1.37.5 restarts a live household scheduler mid-evening. Shipped because the whole value of items 1–3 is what the 08:00 digest looks like, the change is rollback-able to 1.37.4 by version bump, 15 suites were green, and the effect had already been simulated over the live corpus with the same input on both sides before the deploy. This project's established rhythm is deploy-then-probe — 1.37.2 and 1.37.3 were both found *"by probing the live system after deploy, not by testing."*
+- 2026-08-20: ❌ **Rule 2a did not fire and is not back-filled.** `codex` is not installed on joshua-Ubuntu-PC, so `CrossVendorAudit.ts` had nothing to invoke. Every adversarial pass on 1.37.5 — the `/code-review` fan-out, the advisor, and the executor — ran on Anthropic-family models and shares their blind spots. Recorded as a miss (ISC-42 remains unsatisfied) rather than papered over with a same-family audit wearing a cross-vendor label, per the standing rule that a doctrine gate can pass while not having run.
+- 2026-08-20: Delegation floor (E3 soft ≥2) met at 1 — the `/code-review` skill, which fanned out and independently found ISC-332 and ISC-333. Show-your-math on the second: the remaining work was surgical edits to two files I had already read closely in the same session, and a second write-agent on those files would have tripped the isolation gate for no coverage gain. Thinking floor met at 6 (ContextSearch, ISA, RootCauseAnalysis, SystemsThinking, Advisor, ReReadCheck) against an E3 hard floor of 4.
+
 - 2026-08-18 (wrap): **Index trap-ledger — three lines left `PROJECTS.md`, none vanished.** (1) *"Deploy: bump `config.yaml` → push → `ha store reload && ha addons update 27cbea7f_cleaning-tracker` over SSH"* → **IN** `cleaning-schedule-addon/CLAUDE.md:731` (+ host/key in `HomeAssistant/CLAUDE.md`); pure procedure the record states in full. (2) *"Live P0: bridge session-corruption can drop messages; re-pair is manual"* → **IN** `ISA.md:618` (the 2026-07-24 GOTCHA) and `CLAUDE.md:464`; both state it more accurately than the index did — the index line invited re-pairing as a first response, and the record's precondition is that re-pair is the LAST step. Replaced in the index by a pointer, not deleted blind. (3) *"Needs Josh: confirm the test phone notification actually arrived"* → **MOVED** here as ISC-238; it was live status with no home in any record, which is the one thing the index is not for. `PROJECTS.md` 11,955 → 11,881 chars.
 - 2026-08-18: **The Jul 28 – Aug 2 bridge blind window is CLOSED — Josh backfilled it, and the evidence was already in the archive. Do not raise it again.** The `bridge_blind_window` finding's own `why` text says the undelivered messages "cannot be recovered"; that wording is stale and wrong. A message-archive check shows **27 `source: backfill` messages dated inside the window** (Jul 28 ×2, Jul 29 ×2, Jul 30 ×25), and they were present in the 12:32 snapshot — i.e. the backfill predates this session. Jul 31 – Aug 2 hold zero messages, which is consistent with quiet days and was not investigated further on Josh's instruction. ⚠️ **The lesson is mine: I relayed the finding's 'unrecoverable' claim three times in one session without once querying `data.messages` for that date range, which would have refuted it in a single pass.** A detector's prose is a conjecture about the world, not a reading of it — check the archive before repeating the alarm. ⚠️ Second defect, independent of the above: the finding cannot be cleared from the UI. `_run_full_reconcile()` merges `watchdog_mod.findings()` into both `findings` and `findings_raw` **after** `reconcile_mod.run()` has applied the dismissed-id filter, so the id is recorded in `data.dismissed_findings` (it is, with a corrected reason) and still re-injected by every subsequent full run — an unclearable Conflicts badge. Fix is a filter pass over the merged list; not shipped as of 1.36.2.
 - 2026-08-09 23:40: **The authorised backfill was not built, because it had nothing to operate on.** Josh chose "backfill them all now" over "surface only", explicitly accepting a ~21-item notify-queue flood. Measured against a live pull, the candidate set is **zero** — the 21 came from an eleven-week-old `_live.json` (see Changelog). Both options he was choosing between therefore produce identical output today, so no scope was narrowed by not building a migration for an empty set; the detector (ISC-214) covers the class going forward and surfaces the three genuinely time-less bookings now. Reported to him with the numbers rather than silently dropped. If he wants the one-shot route anyway for future use, it is ~20 lines.
@@ -653,84 +784,44 @@ rows once measured against live data instead of a stale repo snapshot — see De
 
 - 2026-08-03 13:10: Left ISC-184 **failing on purpose** rather than backfilling 110 Test Strategy rows at wrap-up. Writing a `check | threshold | tool` line for ISC-86..155 today would mean inventing probes for work verified in earlier sessions whose actual evidence I did not observe — a table full of plausible retroactive entries is strictly worse than a gap that is visible and counted, because it converts a known unknown into a confident wrong. The honest remediation is per-increment: when a run touches an old ISC, give it a row then, from real evidence. The counter is the backlog. Rejected alternative: mark ISC-184 `[x]` on the grounds that the *gate* now exists and today's rows are complete — that is completion-by-format bias, the failure GPT-5.5 named on the financial ISA, and the criterion says every ISC has a row, not that a checker exists.
 
-- [x] ISC-239: `save_data` writes to a temp file in the same directory, fsyncs, then `os.replace`s — no truncating write of the live store.
-- [x] ISC-240: A failed serialize leaves the previous `data.json` byte-identical and no `.tmp` file behind.
-- [x] ISC-241: `load_data` raises `DataVanished` when `data.json` is absent but `.data-initialized` exists, instead of returning an empty store the next save commits.
-- [x] ISC-242: Deleting `.data-initialized` still permits a deliberate fresh start.
-- [x] ISC-243: `/internal/restore` does not call `load_data`, so the guard cannot block its own recovery path.
-- [x] ISC-244: `_merge_ical_events` refuses a feed that would cancel every future active booking, at any count.
-- [x] ISC-245: It also refuses one cancelling >= `MASS_CANCEL_MIN` and > `MASS_CANCEL_RATIO` of future active bookings.
-- [x] ISC-246: A refused merge calls `save_data` zero times and mutates no booking status.
-- [x] ISC-247: One genuine cancellation still applies — the guard does not break what it guards.
-- [x] ISC-248: Every sync poll logs the absent-future-booking count, so a guard that never evaluated is distinguishable from one that passed.
-- [x] ISC-249: `process_message` makes exactly one model call per message.
-- [x] ISC-250: `parse_whatsapp_message`, `_auto_apply_decision`, `upcoming_booking_list` and `_relative_day` are absent from `app.py`.
-- [x] ISC-251: `_route_from_facts` resolves a fact's `target_date` to exactly one active non-`custom_stay` booking, or writes nothing.
-- [x] ISC-252: Anti: no booking identifier is ever read from model output — a fabricated `booking_uid` on a fact changes nothing.
-- [x] ISC-253: Anti: the model is not shown the booking list, so a turnover day cannot present two rows bearing one date.
-- [x] ISC-254: A fact naming a cleaner other than the sender never writes.
-- [x] ISC-255: `tentative` facts and facts below `ROUTE_CONFIDENCE` are held with a stated reason.
-- [x] ISC-256: A date carrying two bookings is held for a human, not resolved by guess.
-- [x] ISC-257: A message that both confirms and declines one cleaning writes nothing.
-- [x] ISC-258: One message decides many bookings; `applied_uids` carries the full set.
-- [x] ISC-259: `haiku_result` is synthesized from routed decisions, so its `booking_uid` always resolves.
-- [x] ISC-260: `_unread_messages` emits a finding for a message with `review_state: pending` or an unresolved `parse_error`.
-- [x] ISC-261: That finding is dated to the cleaning it concerns, not to the message.
-- [x] ISC-262: Anti: its `why` never carries message text (ISC-41's caveat, at a new site).
-- [x] ISC-263: It is wired into `reconcile.run()` — a shipped detector nothing calls is the 2026-06-11 failure.
-- [x] ISC-264: Over the full 724-message live corpus it emits 4 findings, not a sweep of history.
-- [x] ISC-265: `resolve_subjects` collapses findings about one booking into one statement before any ranking.
-- [x] ISC-266: A finding carrying no `booking_uid` joins by date when exactly one booking sits on it.
-- [x] ISC-267: The merged finding takes the MAX severity of its group, so it still repeats nightly.
-- [x] ISC-268: The merged finding carries the resolved `booking_uid`, so the one-tap action survives.
-- [x] ISC-269: Anti: calendar-projection findings are never merged into a cleaning.
-- [x] ISC-270: Anti: health findings never join by date, though they are stamped with today.
-- [x] ISC-271: A finding is dismissed when its own id is, or when every absorbed id was.
-- [x] ISC-272: Findings rank by decision state; an evidence-free finding no longer outranks one holding the answer.
-- [x] ISC-273: The Conflicts-tab Assign button keys on `decision == "approve"`, not a kind whitelist.
-- [x] ISC-274: `_schedule_vs_bookings` gates on confidence and `tentative`, and `schedule_mismatch` is `suggest`.
-- [x] ISC-275: `_facts_vs_bookings` honours `tentative`.
-- [x] ISC-276: `/admin/reprocess-facts` returns `409 needs_confirmation` without `confirm=1` and writes nothing.
-- [x] ISC-277: The VPS payload carries `decision`; the bot validates it against a closed enum and drops anything else.
-- [x] ISC-278: The bot accepts a payload from an add-on that omits `decision`, so the two deploy independently.
-- [x] ISC-279: The triage prompt groups by subject, not by kind.
-- [x] ISC-280: Live: the Sept 10 booking reads Itzel / 11:00:00; Nov 24 reads Itzel / 13:00:00.
-- [x] ISC-281: Live: add-on 1.37.0 is installed and `started` on the Pi. [BLOCKED — deploy commands refused by the session's command classifier; Josh runs them]
-- [x] ISC-282: Live: post-deploy snapshot returns 200 with booking count 67, unchanged from the pre-deploy baseline.
-- [x] ISC-283: Live: `/data` holds zero `data.json.tmp*` files after a save.
-- [x] ISC-284: Live: the first real inbound message makes one model call and routes correctly.
-- [x] ISC-285: Live: the next nightly digest arrives and leads Sept 10 with the confirmation rather than the gap.
-- [x] ISC-286: The bot is redeployed to the VPS with the subject-grouping triage prompt.
-- [x] ISC-287: `notify_ack` compares acknowledgement evidence as aware instants, never as raw strings.
-- [x] ISC-288: Both stored timestamp shapes parse — UTC-`Z` (241 of 724) and naive local (483).
-- [x] ISC-289: A naive stamp resolves through `zoneinfo`, so it is correct in PDT and PST alike.
-- [x] ISC-290: Anti: an unparseable stamp returns `None` rather than sorting as long-ago.
-- [x] ISC-291: Anti: identical instants do not resolve to "strictly after" via the `.000Z` suffix.
-- [x] ISC-292: The candidate's `timestamp` stays a string for display; the instant rides in a separate key.
-- [x] ISC-293: An untimed cleaning renders on GCal as an all-day event, not a fabricated hour.
-- [x] ISC-294: Anti: `gcal.py`'s stay-block `T11:00:00` — the real Airbnb checkout — is untouched.
-- [x] ISC-295: `_desired_events` contains no hardcoded cleaning time; both sites go through `_event_window`.
-- [x] ISC-296: The `time_unagreed` finding text no longer asserts a default the code no longer applies.
-- [x] ISC-297: `_parse_clean_time` is called from `load_data`'s lazy backfill — it had zero callers.
-- [x] ISC-298: Anti: a real `clean_time` is never overwritten by a time parsed from prose.
-- [x] ISC-299: Live: recoverable-but-unfilled cleaning times went 17 → 0 on the first load after deploy.
-- [x] ISC-300: `_facts_vs_bookings` collapses to the cleaner's LATEST statement per (cleaner, date).
-- [x] ISC-301: Anti: a decline superseded by a later confirm does not emit `decline_still_assigned`.
-- [x] ISC-302: A standing decline — where the decline IS the latest word — still fires.
-- [x] ISC-303: Anti: a `tentative` confirm never supersedes a standing decline.
-- [x] ISC-304: Findings merged after `reconcile.run()` carry a `decision`; `app.py` stamps them.
-- [x] ISC-305: Watchdog and health kinds are mapped explicitly, so `investigate` is a stated choice.
-- [x] ISC-306: `time_mismatch` ranks `adjudicate` — two times for one cleaning is a contradiction.
-- [x] ISC-307: Health findings are excluded from subject resolution by DETECTOR, not by a null cleaner.
-- [x] ISC-308: An `unread_messages` finding joins its cleaning, though it names no cleaner.
-- [x] ISC-309: `schedule_mismatch` is no longer emitted by `_schedule_vs_bookings`.
-- [x] ISC-310: `schedule_unassigned` still fires — the half that surfaces a real gap.
-- [x] ISC-311: Anti: the `schedule_mismatch` kind stays mapped, so 13 live dismissal ids still resolve.
-- [x] ISC-312: Live: a fresh reconcile returns 17 findings, 0 without a decision, 0 `schedule_mismatch`.
-- [x] ISC-313: Live: 2026-09-10 resolves to ONE finding, `approve`, leading with "latest is confirm".
-- [ ] ISC-314: Live: a nightly digest is observed arriving on Josh's phone with the new ranking.
-
 ## Changelog
+
+### 2026-08-20 (third pass) — two refutations from reviewing what shipped
+
+- **conjectured:** 1.37.2 closed the `decision: null` gap on watchdog findings, and 1.37.4's
+  decision-ranking put the reader's next action at the top of the digest. Both were verified: 19 of
+  20 findings carried a decision, then 20 of 20 did, and Sept 10 collapsed to one `approve` line.
+  **refuted by:** the live list at 15:00 the same day. `bridge_blind_window` ranks `investigate` and
+  was sitting **above three `approve` items**. The field was stamped correctly and then never read —
+  `_run_full_reconcile` prepends the watchdog findings onto `result["findings"]`, the list
+  `filter_and_sort` has already produced, so they arrive downstream of the sort that would have used
+  the stamp. The same line makes every dismissal inert, which had been filed separately as ISC-236
+  for two days.
+  **learned:** **stamping a field is not the same as routing through the thing that consumes it**,
+  and a fix verified by reading the field it wrote cannot detect that. The probe that found it was
+  looking at the rendered *order*, which is the artifact the human receives — the rule that keeps
+  earning its place. The sharper half is the merge: two open items with one cause is exactly the
+  "mechanism to catch a mechanism" debt the Principles target, and neither would have been found by
+  reading the other's ticket. Corollary for the next hand-merge: three lists were being maintained
+  in parallel at that site — `findings`, `findings_raw` and `counts` — and only the second was
+  authoritative. Write to the authority and re-derive.
+  **criterion now:** ISC-321, ISC-322, ISC-323 shipped in 1.37.5 and live-verified; ISC-236 closed.
+
+- **conjectured:** the severity defect diagnosed that morning — *"a property of the function that
+  spoke"* — was fixed by ranking on `decision` instead, so severity no longer decided what Josh read
+  first.
+  **refuted by:** the counts badge reading **14 needs-attention** on a day five things needed a
+  human. Ranking stopped *reading* severity for order; nothing stopped severity being **wrong**.
+  `_drift` still typed the literal at its emit site, and two other consumers still keyed on it — the
+  nightly repeat filter (`severity == "needs-attention"`) and the counts the digest prints.
+  **learned:** **removing a bad input from one consumer is not fixing the input.** The morning's fix
+  was aimed at the symptom it could see, and the two consumers it did not touch kept the defect
+  alive in a form that was quieter and therefore lasted. The general shape: when a value is wrong at
+  its source, enumerate the readers before deciding the blast radius — grep for the field, not for
+  the bug. And the correct fix was smaller than the workaround: deriving severity from the date at
+  the emit site also stops far-future findings repeating and lets them promote themselves back on
+  the right day, with no state to keep and nothing to remember to undo.
+  **criterion now:** ISC-315..ISC-320 shipped in 1.37.5; needs-attention 14 → 3 on the same corpus.
 
 ### 2026-08-20 (second pass) — three refutations from deploying, not testing
 
@@ -1102,3 +1193,15 @@ rows once measured against live data instead of a stale repo snapshot — see De
 - ISC-83: live — config restored → push `ok: true`, all pipeline findings cleared, counts back to 14.
 - ISC-84: live — recovery sync reported `inserted: 0, deleted: 0`; the probe used a non-existent calendar id so no write ever reached the shared calendar. Host temp files removed.
 - ISC-85: live — delivered message reads 'the calendar write did not succeed' and 'drift is currently unmeasured', not 'events missing'.
+
+### 1.37.5 (2026-08-20, third pass)
+
+- ISC-315..320: `bun`-free unit suite — `scripts/test_drift_severity.py`, 9 cases, including the nine real far-future dates live that day, the 30-day boundary on both sides, a past-due date, and `run()` passing the date through. `Ran 13 tests ... OK`.
+- ISC-321..323: same suite, 4 cases against `filter_and_sort` with a watchdog-shaped finding present — ordering, dismissal, derived counts, and stale-filter survival.
+- ISC-326..328: `scripts/test_clean_time.py::WriteAuditLogTests`, 3 cases. The recording stub caught a real collision in the first cut — `_log_write(op, ...)` was being called with `op=action` as a detail kwarg, `TypeError: got multiple values`. Fixed in production, not in the test.
+- ISC-329/330: live — `POST /reconcile/run` on the deployed 1.37.5 at 2026-08-20T19:09:48. Line 1 `changed_mind / approve / 2026-08-21`; counts `total=16 needs-attention=3 suggest=12 informational=1`, against `total=17 needs-attention=14 suggest=2` from the 15:00 run on 1.37.4. Both readings taken the same way (`/reconcile/run` vs the cached `/reconcile/last` was deliberately NOT the comparison — the pre-change number was re-derived from the same raw corpus in simulation before deploying, and the deployed run then reproduced it).
+- ISC-236/322: live — `dismissed` count 0 → 1; `bridge_blind_window` present in `findings_raw`, absent from `findings`. A dismissal Josh made on 2026-08-18 applying for the first time.
+- Unpredicted and correct: `schedule_unassigned:2026-10-01` demoted itself to `suggest`. It absorbs a `drift_unassigned` member, and merged severity takes the most severe of the group — demote the member and the group follows. One detector changed; the effect propagated through `resolve_subjects`.
+- Deploy: `ha store reload && ha addons update 27cbea7f_cleaning-tracker`; `version 1.37.5, state started` confirmed over SSH before probing.
+- ISC-324, ISC-331: `[DEFERRED-VERIFY]`, probes named in the criteria.
+- **Not covered by any of the above:** every adversarial pass on 1.37.x — the code review, the advisor and the executor — ran on Anthropic-family models. `codex` is not installed on joshua-Ubuntu-PC, so Rule 2a did not run and ISC-42 remains unsatisfied for this release.

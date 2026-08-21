@@ -806,6 +806,22 @@ over SSH.
 Updates: bump `version` in `config.yaml`, push to GitHub, then
 `ha store reload && ha addons update 27cbea7f_cleaning-tracker`.
 
+⚠️ **The `origin` remote is HTTPS and some machines only hold SSH credentials for
+GitHub.** On `joshua-Ubuntu-PC` a plain `git push` dies with `could not read
+Username for 'https://github.com'` even though `gh auth status` reports a healthy
+login — `gh` is configured for the SSH protocol and git has no credential helper.
+The add-on updates by pulling from GitHub, so a failed push means a deploy that
+silently installs the OLD version. Either push by naming the SSH URL for that one
+push:
+```bash
+GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_github" \
+  git push git@github.com:Skeletoneyes/cleaning-schedule-addon.git master
+```
+or fix it once per machine with `git remote set-url origin
+git@github.com:Skeletoneyes/cleaning-schedule-addon.git`. **Confirm the push
+landed before running `ha addons update`** — check the version the Supervisor
+reports afterwards, not the command's exit code.
+
 ## Important notes
 
 - **Always bump `config.yaml` version when pushing changes.** The Supervisor
