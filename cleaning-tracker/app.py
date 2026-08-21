@@ -90,6 +90,12 @@ WHATSAPP_SHARED_SECRET = OPTIONS.get(
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 DIGEST_LAST_FILE = DATA_DIR / "digest_last.json"
+# ISC-358: every outgoing VPS payload, one JSON line each, 30-day trailing
+# retention. This is the replay record the 14-night measurement (ISC-359)
+# reads — before it existed, nothing retained past payloads and no causality
+# claim about the digest could ever be checked against what actually crossed.
+DIGEST_ARCHIVE_FILE = DATA_DIR / "digest_archive.jsonl"
+DIGEST_ARCHIVE_RETENTION_DAYS = 30
 DIGEST_ENABLED = bool(OPTIONS.get("digest_enabled", False))
 DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 
@@ -4818,6 +4824,52 @@ def _probe_bot_health():
         return False, str(e)[:160]
 
 
+def _archive_digest_payload(path, payload, delivered, now=None, retention_days=DIGEST_ARCHIVE_RETENTION_DAYS):
+    """Append one archive line for an outgoing VPS payload (ISC-358).
+
+    Read-filter-rewrite on every call, deliberately: at one payload a day the
+    file is ~30 small lines, and rewriting through a tmp file + rename means a
+    torn write can never destroy the history (the lesson `_log_check` learned
+    the O(1)-append way). Lines older than `retention_days` age out here, so
+    the file needs no separate pruner. A corrupt line is dropped, counted,
+    and reported in the return rather than silently — a replay record that
+    can quietly lose nights would undermine the very measurement (ISC-359)
+    it exists to serve. Never raises: archiving must not take the push down.
+
+    Returns {"kept": N, "dropped_corrupt": N, "ok": bool} for logging.
+    """
+    now = now or datetime.now()
+    cutoff = (now - timedelta(days=retention_days)).isoformat()
+    entry = {
+        "archived_at": now.isoformat(timespec="seconds"),
+        "delivered": bool(delivered),
+        "payload": payload,
+    }
+    kept, dropped = [], 0
+    try:
+        path = Path(path)
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    old = json.loads(line)
+                except ValueError:
+                    dropped += 1
+                    continue
+                if (old.get("archived_at") or "") >= cutoff:
+                    kept.append(line)
+        kept.append(json.dumps(entry))
+        tmp = path.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return {"kept": len(kept), "dropped_corrupt": dropped, "ok": True}
+    except Exception as e:
+        print(f"[digest-archive] FAILED (non-fatal): {e}")
+        return {"kept": len(kept), "dropped_corrupt": dropped, "ok": False}
+
+
 def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True, extra_findings=None):
     """POST the nightly digest to the VPS Telegram bot (allowlist-built payload).
 
@@ -4895,6 +4947,7 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
             for f in outgoing
         ],
     }
+    delivered = False
     try:
         resp = requests.post(
             VPS_PUSH_URL,
@@ -4904,6 +4957,7 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
         )
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        delivered = True
         print(f"[vps-push] ok — {len(new_findings)} new, "
               f"{len(outgoing) - len(new_findings)} carried, heartbeat sent")
         return True
@@ -4921,6 +4975,14 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
             to_phone=True,
         )
         return False
+    finally:
+        # ISC-358: archive AFTER the attempt so the line records whether it
+        # was delivered — a failed push is a night the measurement most needs
+        # to see. In `finally`, so neither outcome can skip it; the archiver
+        # itself never raises.
+        rep = _archive_digest_payload(DIGEST_ARCHIVE_FILE, payload, delivered)
+        print(f"[digest-archive] {'ok' if rep['ok'] else 'FAILED'} — "
+              f"{rep['kept']} line(s) retained, {rep['dropped_corrupt']} corrupt dropped")
 
 
 def _digest_scheduler():
