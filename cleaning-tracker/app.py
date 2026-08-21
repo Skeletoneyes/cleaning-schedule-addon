@@ -4835,8 +4835,14 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
     # window on the VPS, so one missed sync alarms exactly once.
     new_findings = list(new_findings)
     counts = dict(counts)
+    # Bookings for `booking_status` derivation in the projection (ISC-356).
+    # Loaded once alongside last_sync; empty on any failure — the projection
+    # then sends booking_status: null rather than blocking the heartbeat.
+    bookings_for_status = {}
     try:
-        last_sync = load_data().get("last_sync")
+        _push_data = load_data()
+        bookings_for_status = _push_data.get("bookings") or {}
+        last_sync = _push_data.get("last_sync")
         age_h = None
         if last_sync:
             age_h = (datetime.now() - datetime.fromisoformat(last_sync)).total_seconds() / 3600
@@ -4878,23 +4884,14 @@ def _push_digest_to_vps(new_findings, resolved_count, counts, reconcile_ok=True,
         # unchanged in kind, so this widens nothing.
         "attestation": _build_attestation(reconcile_ok),
         # Allowlist projection — NEVER pass findings through whole. `quote` and
-        # `evidence` (raw WhatsApp text) must not cross to the VPS.
+        # `evidence` (raw WhatsApp text) must not cross to the VPS. The
+        # allowlist itself lives in reconcile.project_finding_for_vps
+        # (ISC-356) so it is pure and unit-tested: 8 identity fields plus
+        # `booking_status` (derived here from the booking, closed vocabulary)
+        # and `absorbed` (merged finding ids — corroboration the prose can
+        # count).
         "findings": [
-            {
-                "id": f.get("id"),
-                "detector": f.get("detector"),
-                "kind": f.get("kind"),
-                "severity": f.get("severity"),
-                # What the reader must supply — adjudicate / approve /
-                # investigate / observe. Derived from the finding's content, so
-                # the bot can lead with the answer instead of the gap. A closed
-                # enum of four literals: it widens the crossing surface by
-                # nothing, unlike a free-text field would.
-                "decision": f.get("decision"),
-                "date": f.get("date"),
-                "cleaner": f.get("cleaner"),
-                "why": f.get("why"),
-            }
+            reconcile_mod.project_finding_for_vps(f, bookings_for_status)
             for f in outgoing
         ],
     }

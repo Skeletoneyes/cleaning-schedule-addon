@@ -445,6 +445,46 @@ def resolve_subjects(findings, bookings, dismissed=None):
 
 STALE_DAYS = 5  # findings whose date is older than this are auto-suppressed
 
+# ── VPS projection allowlist (ISC-356) ──────────────────────────────────────
+# The ONLY fields a finding may carry across to the VPS Telegram bot, and the
+# one place they are enumerated. The payload is CONSTRUCTED field-by-field —
+# a finding is never passed through whole, so `quote` and `evidence` (raw
+# WhatsApp text and message ids' content) cannot leak by omission of a strip.
+# ISC-41's standing caveat still applies: this protects keys, not values —
+# every `why` must stay an f-string over structured fields.
+VPS_FINDING_FIELDS = (
+    "id", "detector", "kind", "severity", "decision", "date", "cleaner",
+    "why", "booking_status", "absorbed",
+)
+
+
+def project_finding_for_vps(f, bookings=None):
+    """One finding's allowlisted projection for the VPS push.
+
+    `booking_status` (ISC-356) is DERIVED here, at projection time, from the
+    booking the finding is about — findings do not carry it natively. It is a
+    closed vocabulary (active | cancelled | complete | None) and it exists
+    because the 2026-08-21 digest called a settled date "conflicting signals":
+    the decline in that contest belonged to a cancelled duplicate booking,
+    which the VPS triager had no way to see. `absorbed` carries the ids of
+    findings merged under this one — corroboration the prose can count.
+    Both are None-safe for older cached findings.
+    """
+    uid = f.get("booking_uid")
+    booking = (bookings or {}).get(uid) if uid else None
+    return {
+        "id": f.get("id"),
+        "detector": f.get("detector"),
+        "kind": f.get("kind"),
+        "severity": f.get("severity"),
+        "decision": f.get("decision"),
+        "date": f.get("date"),
+        "cleaner": f.get("cleaner"),
+        "why": f.get("why"),
+        "booking_status": (booking or {}).get("status"),
+        "absorbed": list(f.get("absorbed") or []) or None,
+    }
+
 # Booking uids as they appear embedded in finding ids
 # (e.g. "contested_cleaner:<uid>:Darya").
 _UID_IN_ID_RE = re.compile(r"[0-9a-f]+-[0-9a-f]+@airbnb\.com")
