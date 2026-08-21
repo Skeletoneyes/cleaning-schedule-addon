@@ -4226,11 +4226,28 @@ def reconcile_dismiss():
     reason = payload.get("reason") or ""
     if not finding_id:
         return jsonify({"error": "missing finding_id"}), 400
+    # ISC-349: record WHICH BOOKING this dismissal adjudicates, so a later
+    # finding about the same booking built entirely from evidence that
+    # predates this moment is filtered even when detectors mint it a new id.
+    # Resolved from the cached findings, not parsed from the id — changed_mind
+    # ids carry no uid. Best-effort: a miss stores null and the legacy
+    # parse-from-id fallback in reconcile._dismissal_subject still applies.
+    booking_uid = None
+    try:
+        if RECONCILER_LAST_FILE.exists():
+            cached = json.loads(RECONCILER_LAST_FILE.read_text())
+            for f in cached.get("findings_raw") or []:
+                if f.get("id") == finding_id:
+                    booking_uid = f.get("booking_uid")
+                    break
+    except Exception:
+        booking_uid = None
     with DATA_LOCK:
         data = load_data()
         data.setdefault("dismissed_findings", {})[finding_id] = {
             "dismissed_at": datetime.now().isoformat(timespec="seconds"),
             "reason": reason,
+            "booking_uid": booking_uid,
         }
         save_data(data)
     _log_op("finding_dismissed", finding_id=finding_id, reason=reason or None)

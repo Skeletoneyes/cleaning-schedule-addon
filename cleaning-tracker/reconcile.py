@@ -151,8 +151,38 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
         seen.setdefault(f["id"], f)
     findings = list(seen.values())
 
-    # One statement per cleaning, before anything is ranked.
-    findings = resolve_subjects(findings, bookings)
+    # ISC-352: a coherent schedule story is not a conflict. When every
+    # cleaner's LATEST statement about a date agrees with current booking
+    # state (assignee's latest = confirm, non-assignees' latest = decline,
+    # booking active), a changed_mind on that date is history, not a question
+    # — it demands nothing of the reader. Downgrade its DECISION only; its
+    # severity is already informational at emit, and the severities of any
+    # unread/undecided members it merges with are untouched (ISC-353), so a
+    # message still waiting to be read keeps its own urgency.
+    coherent = _coherent_dates(bookings, facts_records, messages_by_id, today_str)
+    for f in findings:
+        if f.get("kind") == "changed_mind" and f.get("date") in coherent:
+            f["decision_override"] = "observe"
+
+    # One statement per cleaning, before anything is ranked. Dismissals are
+    # consulted DURING primary selection (ISC-335): a member a human already
+    # dismissed must not become the mouthpiece for live findings absorbed
+    # under it.
+    findings = resolve_subjects(findings, bookings, dismissed)
+
+    # ISC-349: stamp each finding with the instant of its newest evidence,
+    # so filter_and_sort can honour subject-scoped dismissals with an
+    # evidence cutoff. Only stamped when EVERY evidence id resolves to a
+    # message — a partial view could understate the latest signal and let an
+    # old dismissal swallow evidence it never saw. Findings with no evidence
+    # (drift) are never subject-dismissed: they restate current booking
+    # state, which carries no timestamp to compare.
+    for f in findings:
+        ev = f.get("evidence") or []
+        stamps = [(messages_by_id.get(e) or {}).get("timestamp") for e in ev]
+        stamps = [s for s in stamps if s]
+        if ev and len(stamps) == len(ev):
+            f["evidence_latest"] = max(stamps, key=_order_key)
 
     return filter_and_sort({
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -238,6 +268,17 @@ def _decision_of(kind):
     return _KIND_DECISION.get(kind, "investigate")
 
 
+def _decision_for(f):
+    """A finding's decision: an explicit override wins, else the kind map.
+
+    The override exists for ISC-352: a `changed_mind` on a date whose schedule
+    story is coherent (see `_coherent_dates`) demands nothing of the reader,
+    whatever its kind's default says. Overrides are set inside run() before
+    resolution, so cached findings carry them and re-filter paths agree.
+    """
+    return f.get("decision_override") or _decision_of(f.get("kind"))
+
+
 # Only findings about SCHEDULE STATE — who cleans when, and whether they were
 # told — resolve into one statement. Deliberately an allowlist, so a detector
 # added later shows up on its own rather than silently vanishing into a merge.
@@ -286,12 +327,20 @@ def _subject_of(f, date_to_uid):
     return None
 
 
-def resolve_subjects(findings, bookings):
+def resolve_subjects(findings, bookings, dismissed=None):
     """Collapse findings about one booking into one statement each.
 
     Health findings — no booking, no cleaner — are left alone: they describe
     how much of the list to believe rather than belonging to it.
+
+    `dismissed` (ISC-335): ids a human has dismissed are deprioritized in
+    primary selection, so a dismissal made last month can never become the
+    mouthpiece for — and thereby suppress, via `_is_dismissed`'s primary rule
+    — live findings that did not exist when it was made. When every member is
+    dismissed the primary is dismissed too, and the merged finding filters
+    out exactly as before.
     """
+    dismissed = dismissed or {}
     date_to_uid = {}
     for uid, b in (bookings or {}).items():
         if b.get("status") != "active" or b.get("type") == "custom_stay":
@@ -314,22 +363,24 @@ def resolve_subjects(findings, bookings):
     # how much of the rest of the list to believe, so they are never merged —
     # but they do get an explicit decision rather than falling through to a
     # default nobody wrote down.
-    out = [dict(f, decision=_decision_of(f["kind"])) for f in loose]
+    out = [dict(f, decision=_decision_for(f)) for f in loose]
     for subj, members in groups.items():
         if len(members) == 1:
-            out.append(dict(members[0], decision=_decision_of(members[0]["kind"])))
+            out.append(dict(members[0], decision=_decision_for(members[0])))
             continue
-        # The primary is the member demanding the most of the reader; ties go to
-        # the one carrying evidence, because between two findings that ask the
-        # same thing the informed one is the one worth reading.
+        # The primary is the live member demanding the most of the reader;
+        # dismissed members sort last (ISC-335), then ties go to the one
+        # carrying evidence, because between two findings that ask the same
+        # thing the informed one is the one worth reading.
         members.sort(key=lambda f: (
-            DECISION_RANK[_decision_of(f["kind"])],
+            1 if f["id"] in dismissed else 0,
+            DECISION_RANK[_decision_for(f)],
             0 if f.get("evidence") else 1,
             f["id"],
         ))
         primary = dict(members[0])
         others = members[1:]
-        primary["decision"] = _decision_of(primary["kind"])
+        primary["decision"] = _decision_for(primary)
         primary["absorbed"] = [f["id"] for f in others]
         # Carry the booking the group resolved to. `changed_mind` and
         # `confirm_no_booking` are emitted with `booking_uid: None` — they were
@@ -371,7 +422,7 @@ def resolve_subjects(findings, bookings):
         # run-on — the digest is read on a phone, and a wall of joined clauses
         # fails the same way the five separate lines did.
         others.sort(key=lambda f: (0 if f.get("evidence") else 1,
-                                   DECISION_RANK[_decision_of(f["kind"])]))
+                                   DECISION_RANK[_decision_for(f)]))
         shown = others[:2]
         rest = len(others) - len(shown)
         primary["why"] = (
@@ -385,6 +436,23 @@ def resolve_subjects(findings, bookings):
 
 STALE_DAYS = 5  # findings whose date is older than this are auto-suppressed
 
+# Booking uids as they appear embedded in finding ids
+# (e.g. "contested_cleaner:<uid>:Darya").
+_UID_IN_ID_RE = re.compile(r"[0-9a-f]+-[0-9a-f]+@airbnb\.com")
+
+
+def _dismissal_subject(finding_id, record):
+    """The booking a dismissal was about: the recorded uid, else one parsed
+    out of the dismissed finding's own id. The parse path exists for legacy
+    records — every dismissal written before ISC-349 lacks `booking_uid`, and
+    most detector ids embed the uid, so months of existing dismissals keep
+    their subject without a migration."""
+    if isinstance(record, dict) and record.get("booking_uid"):
+        return record["booking_uid"]
+    m = _UID_IN_ID_RE.search(finding_id or "")
+    return m.group(0) if m else None
+
+
 def filter_and_sort(result, dismissed):
     """Re-apply dismissed filter + sort + count over a cached raw result.
 
@@ -395,20 +463,45 @@ def filter_and_sort(result, dismissed):
     raw = list(result.get("findings_raw") or result.get("findings") or [])
     cutoff = (date.today() - timedelta(days=STALE_DAYS)).isoformat()
 
+    # ISC-349: subject cutoffs, one per booking a dismissal was about — the
+    # LATEST dismissal wins when a booking was dismissed more than once.
+    subject_cutoffs = {}
+    for did, rec in (dismissed or {}).items():
+        uid = _dismissal_subject(did, rec)
+        cut = as_instant((rec or {}).get("dismissed_at") if isinstance(rec, dict) else None)
+        if uid and cut:
+            prev = subject_cutoffs.get(uid)
+            if prev is None or cut > prev:
+                subject_cutoffs[uid] = cut
+
     def _is_dismissed(f):
-        """A merged finding is dismissed when its own id is, or when every
-        finding it absorbed was already dismissed individually.
+        """A merged finding is dismissed when its own id is, when every
+        finding it absorbed was already dismissed individually, or when a
+        dismissal on the same booking postdates ALL of its evidence.
 
         Subject resolution (2026-08-20) means an id a human dismissed last
         month may now be absorbed into a primary with a different id. Keying
         only on the primary would make every one of those dismissals inert at
         once and resurface months of resolved noise — which is exactly how a
         channel teaches you to ignore it.
+
+        The subject rule (ISC-349) exists because detectors also MINT new ids
+        over old evidence: the Aug 16 dismissals named `contested_cleaner`/
+        `decline_still_assigned` ids, and five days later the same adjudicated
+        contest returned as `changed_mind:*` — different ids, same booking,
+        no new signal. An adjudication covers everything known at the moment
+        it was made; any message arriving after `dismissed_at` re-opens the
+        subject (the finding's `evidence_latest` then exceeds the cutoff).
+        Findings without a full evidence stamp are never subject-dismissed.
         """
         if f["id"] in dismissed:
             return True
         absorbed = f.get("absorbed") or []
-        return bool(absorbed) and all(a in dismissed for a in absorbed)
+        if bool(absorbed) and all(a in dismissed for a in absorbed):
+            return True
+        cut = subject_cutoffs.get(f.get("booking_uid"))
+        latest = as_instant(f.get("evidence_latest"))
+        return bool(cut and latest and latest <= cut)
 
     dismissed_count = sum(1 for f in raw if _is_dismissed(f))
     stale_count = sum(1 for f in raw if not _is_dismissed(f) and f.get("date") and f["date"] < cutoff)
@@ -418,7 +511,7 @@ def filter_and_sort(result, dismissed):
     # what Josh reads first — a detector that has never seen a message cannot
     # outrank one holding the answer just because its emit site said so.
     kept.sort(key=lambda f: (
-        DECISION_RANK.get(f.get("decision") or _decision_of(f["kind"]), 2),
+        DECISION_RANK.get(f.get("decision") or _decision_for(f), 2),
         f.get("date") or "",
         _SEVERITY_RANK.get(f["severity"], 99),
         f["id"],
@@ -486,7 +579,18 @@ def _unread_messages(messages, facts_records, today_str, horizon_days=UNREAD_URG
         if not subject or subject < today_str:
             continue
 
-        broke = bool(m.get("parse_error"))
+        # ISC-351: "extraction failed" is a claim about the FACTS, so it must
+        # consult the facts, not just the flag. `parse_error` records that the
+        # most recent extraction ATTEMPT errored — a failed re-parse writes it
+        # over a message whose earlier extraction succeeded and whose facts
+        # still stand (3 of the 4 queued messages on 2026-08-21 were in that
+        # state, and the digest told Josh their extraction had failed). Facts
+        # present = the system has read this message; what's missing is a
+        # human decision. Version-agnostic on purpose: the detectors consume
+        # facts of every prompt version, so this check must too.
+        broke = bool(m.get("parse_error")) and not (
+            (facts_records.get(msg_id) or {}).get("facts")
+        )
         why = (
             f"a message from {(m.get('sender_name_raw') or 'a cleaner')} about the "
             f"{subject} cleaning was never read — extraction failed"
@@ -1017,6 +1121,50 @@ def _latest_by_cleaner_date(facts_records, messages_by_id, kinds, today_str):
             if prev is None or _order_key(ts) > _order_key(prev[0]):
                 latest[key] = (ts, msg_id, f)
     return latest
+
+
+def _coherent_dates(bookings, facts_records, messages_by_id, today_str):
+    """Dates whose schedule story is internally consistent (ISC-352).
+
+    A date is coherent when exactly one active non-custom booking sits on it,
+    a cleaner is assigned, and every cleaner's LATEST confirm/decline about it
+    agrees with that assignment: the assignee's latest (if any) is confirm,
+    every non-assignee's latest is decline. On such a date a changed_mind is a
+    record of how the schedule settled, not a contradiction to adjudicate —
+    the live case (2026-08-21): Darya's latest decline belonged to a cancelled
+    duplicate booking while Itzel, the assignee, had confirmed; the digest
+    still called it "conflicting signals" for 8 days.
+
+    Uses `_latest_by_cleaner_date`, so tentative facts and past dates are
+    filtered by the same rules the booking detectors already live by.
+    """
+    by_date = {}
+    for uid, b in (bookings or {}).items():
+        if b.get("status") != "active" or b.get("type") == "custom_stay":
+            continue
+        d = b.get("end")
+        if d:
+            by_date.setdefault(d, []).append(b)
+
+    latest = _latest_by_cleaner_date(
+        facts_records or {}, messages_by_id or {}, ("confirm", "decline"), today_str
+    )
+    per_date = {}
+    for (cleaner, tgt), (_ts, _mid, f) in latest.items():
+        per_date.setdefault(tgt, {})[cleaner] = f.get("kind")
+
+    out = set()
+    for d, statements in per_date.items():
+        matches = by_date.get(d) or []
+        if len(matches) != 1:
+            continue
+        assignee = matches[0].get("cleaner")
+        if not assignee:
+            continue
+        if all((kind == "confirm") == (cleaner == assignee)
+               for cleaner, kind in statements.items()):
+            out.add(d)
+    return out
 
 
 def _facts_vs_bookings(bookings, facts_records, today_str, messages_by_id=None):

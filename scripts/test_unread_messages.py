@@ -55,8 +55,22 @@ class UnreadMessages(unittest.TestCase):
         self.assertEqual(out[0]["date"], d(21))
         self.assertEqual(out[0]["kind"], "undecided_message")
 
-    def test_a_failed_extraction_is_named_as_such(self):
+    def test_a_failed_extraction_is_named_as_such_only_when_no_facts_exist(self):
+        """ISC-351: "extraction failed" consults the facts, not just the flag.
+
+        A failed RE-parse writes `parse_error` over a message whose earlier
+        extraction succeeded and whose facts still stand — on 2026-08-21 the
+        digest told Josh a message's "extraction failed" while 17 facts from
+        it sat in the corpus. Facts present = the system read it; the message
+        is waiting on a human, and the finding must say so.
+        """
         out = self.run_([msg("m1", err="Anthropic API error: 429")], facts("m1", d(21)))
+        self.assertEqual(out[0]["kind"], "undecided_message")
+        self.assertIn("waiting for a decision", out[0]["why"])
+
+    def test_error_with_no_facts_is_still_a_failed_extraction(self):
+        out = self.run_([msg("m1", err="Anthropic API error: 429")],
+                        {"m1": {"facts": []}})
         self.assertEqual(out[0]["kind"], "unread_message")
         self.assertIn("never read", out[0]["why"])
 
