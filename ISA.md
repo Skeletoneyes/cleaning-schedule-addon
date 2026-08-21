@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-21T12:55:00-07:00
-progress: 324/363
+updated: 2026-08-21T13:30:00-07:00
+progress: 326/363
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -568,8 +568,8 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 
 **W2 — Desktop→Pi write-back**
 
-- [ ] ISC-354: A conflict resolved in a desktop session ends with `POST /reconcile/dismiss` carrying a dated reason. Enforced procedurally: the `reconcile-cleaning-schedule` skill and this repo's CLAUDE.md state it as a mandatory closing step. Probe: one live round trip — dismissal in `ops_log`, finding absent from the next digest payload.
-- [ ] ISC-355: Anti: write-back is desktop/LAN-only. Nothing on the VPS or Telegram path can dismiss a finding — the wall holds in the reverse direction (consistent with ISC-347/348).
+- [x] ISC-354: A conflict resolved in a desktop session ends with `POST /reconcile/dismiss` carrying a dated reason. Enforced procedurally: the `reconcile-cleaning-schedule` skill and this repo's CLAUDE.md state it as a mandatory closing step. Probe: one live round trip — dismissal in `ops_log`, finding absent from the next digest payload.
+- [x] ISC-355: Anti: write-back is desktop/LAN-only. Nothing on the VPS or Telegram path can dismiss a finding — the wall holds in the reverse direction (consistent with ISC-347/348).
 
 **W3 — Projection enrichment**
 
@@ -1268,3 +1268,10 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - ISC-335: unit — `test_dismissal_subject_scope.py`: a dismissed member can no longer become primary while a live member exists; all-dismissed groups still filter. `resolve_subjects` now takes `dismissed` and deprioritizes dismissed ids in primary selection.
 - Full suite: 18 files, all OK (two print trailing log noise after their OK line — not failures). Deploy: push 70b0b2a → `ha store reload && ha addons update`; `version 1.38.0, state started` confirmed over SSH before probing.
 - Forge review observations, recorded not fixed: (a) `findings_raw` is post-merge/pre-dismiss, not pre-merge — the name invites misreading and absorbed members' own fields are uninspectable from the public return; (b) `_facts_vs_bookings`/`_schedule_vs_bookings` exclude by `status == "cancelled"` while `resolve_subjects`/`_coherent_dates` require `status == "active"` — the families disagree if a `complete` status ever appears inside a detector window; (c) cosmetic: two undecided messages merging on one date repeat the identical "waiting for a decision" clause in `why`.
+
+### W2 write-back — 1.38.1, verified live (2026-08-21)
+
+- ISC-354: live round trip on the real 2026-08-21 case. Procedural rule written into `CLAUDE.md` ("Write-back is the mandatory closing step") and `.claude/skills/reconcile-cleaning-schedule/SKILL.md` (route table: accept / ignore / dismiss / assign). Applied live: `/review/map` requeued Itzel's three stale-error pending messages → all re-routed to `auto` (16 booking writes; Sep 5/8/10/14 + Oct 5/10/16/24 now confirmed with her stated times; Oct 1 correctly untouched — she declined it); `/review/ignore` on the two chitchat messages; `/reconcile/dismiss` with dated reasons on `changed_mind:Darya:2026-08-21` and `changed_mind:Itzel:2026-09-10`. Evidence: both dismissals in `ops_log` at 2026-08-21T13:18:00; `/reconcile/last` after: total 12, needs-attention **0** (was 16/3 at 08:00), no changed_mind finding present. Final leg (finding absent from the *digest payload*) lands with tonight's 08:00 push.
+- ISC-355: two probes (rg exit 1, grep empty) over `~/dev/pai-telegram-bot/src/` — zero references to `/reconcile/dismiss`, `/review/*`, `/assign`, port 5000, or any LAN address. Architecturally reinforced: the VPS is egress-locked with no route to the Pi; the Pi initiates every crossing.
+- Refinement shipped as 1.38.1: `resolve_subjects` backfills `booking_uid` on single-member groups — the live probe caught the Sep-10 dismissal storing `booking_uid: null` because a LOOSE changed_mind never got its subject backfilled, leaving ISC-349's subject rule nothing to key on. Six suites re-run OK; deployed.
+- Left open on purpose: Itzel's Sep 27 question ("keep or cancel Sept 27 at 11:00?") needs a human WhatsApp reply — the `confirm_no_booking:Itzel:2026-09-27` informational finding remains as its tracker representation. The Oct 1 unassigned booking (she declined — "I'm full") and the Aug 24 time_unagreed (Darya) are real open items, correctly still reported.
