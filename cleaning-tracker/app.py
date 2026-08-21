@@ -18,7 +18,8 @@ from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
-from flask import Flask, render_template_string, request, redirect, jsonify, abort, Response
+from flask import (Flask, render_template_string, request, redirect, jsonify, abort,
+                   Response, has_request_context)
 
 import bridge_watchdog as watchdog_mod
 import facts as facts_mod
@@ -265,6 +266,45 @@ def _log_op(action, **detail):
         print(f"[ops] {action} {detail}")
     except Exception as e:
         print(f"[ops] failed to log '{action}': {e}")
+
+
+def _actor():
+    """Who is making this write: a human at the HA UI, an API caller, or the
+    system itself.
+
+    That distinction is the whole point of the write log. Once a CLI exists —
+    and through it, a model — "Josh pressed Assign" and "something called
+    /assign" must be separable after the fact, because that is the only
+    question anyone will ever ask of this record. Derived from the same three
+    signals `_require_local_or_secret` gates on, so the log cannot disagree
+    with the door.
+    """
+    if not has_request_context():
+        return "system"
+    if request.headers.get("X-Ingress-Path"):
+        return "human:ha-ui"
+    if request.headers.get("X-Shared-Secret"):
+        return "api:shared-secret"
+    return f"api:{request.remote_addr or '?'}"
+
+
+def _log_write(op, booking_uid=None, **detail):
+    """Record one mutation of the schedule: who, what, and which booking it
+    resolved to.
+
+    Separate from `_record_change`, which is the nightly "what I changed"
+    REPORT and is deliberately narrow: it watches four fields, returns early
+    when none of them moved, is only ever reached from
+    `_apply_booking_change`, and is projected to the VPS. This is the audit
+    trail — every write path, including the ones that resolve to nothing,
+    because "a delete was issued against a uid that does not exist" is exactly
+    the entry a bad automation leaves behind.
+
+    Structured fields only, and never message text: `_log_op` prints its detail
+    to the add-on log and the ops log is read by the UI, so a quote here would
+    cross the same boundary `_record_change`'s docstring exists to defend.
+    """
+    _log_op(op, actor=_actor(), booking_uid=booking_uid, **detail)
 
 
 def _write_gcal_status(status):
@@ -1661,6 +1701,11 @@ def _apply_booking_change(data, booking_uid, cleaner_name, action, msg,
     """Apply a confirm/decline to a booking. Caller holds DATA_LOCK."""
     booking = data["bookings"].get(booking_uid)
     if not booking:
+        # Logged, not silently dropped: a write aimed at a uid that no longer
+        # exists is the signature of a stale automation, and it is invisible
+        # everywhere else.
+        _log_write("booking_write_unresolved", booking_uid, attempted=action,
+                   cleaner=cleaner_name, auto=auto)
         return
     before = dict(booking)
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -1703,6 +1748,9 @@ def _apply_booking_change(data, booking_uid, cleaner_name, action, msg,
         booking["confirmed"] = False
     # Record the message id that last mutated this booking.
     booking["last_wa_msg_id"] = msg.get("id")
+    _log_write(f"booking_{action}", booking_uid,
+               cleaning_date=cleaning_date_for(booking), cleaner=cleaner_name,
+               auto=auto, message_id=(msg or {}).get("id"))
     _record_change(before, booking, booking_uid, action, msg, auto)
 
 
@@ -3177,6 +3225,9 @@ def assign(uid):
             # would outlive its own cause and sit in the digest forever —
             # a finding that cannot resolve is how a monitor becomes noise.
             data["bookings"][uid].pop("time_note", None)
+            _log_write("booking_assign", uid,
+                       cleaning_date=cleaning_date_for(data["bookings"][uid]),
+                       cleaner=cleaner or None, clean_time=clean_time_raw or None)
             save_data(data)
     return redirect(ingress_prefix() + "/")
 
@@ -3187,6 +3238,9 @@ def confirm(uid):
         data = load_data()
         if uid in data["bookings"]:
             data["bookings"][uid]["confirmed"] = True
+            _log_write("booking_confirm_manual", uid,
+                       cleaning_date=cleaning_date_for(data["bookings"][uid]),
+                       cleaner=data["bookings"][uid].get("cleaner"))
             save_data(data)
     return redirect(ingress_prefix() + "/")
 
@@ -3197,6 +3251,9 @@ def pay(uid):
         data = load_data()
         if uid in data["bookings"]:
             data["bookings"][uid]["paid"] = True
+            _log_write("booking_paid", uid,
+                       cleaning_date=cleaning_date_for(data["bookings"][uid]),
+                       cleaner=data["bookings"][uid].get("cleaner"))
             save_data(data)
     return redirect(ingress_prefix() + "/")
 
@@ -3223,6 +3280,10 @@ def delete_booking(uid):
         data = load_data()
         booking = data["bookings"].get(uid)
         if booking and (booking.get("type") in ("custom_stay", "manual_cleaning") or booking.get("status") == "cancelled"):
+            _log_write("booking_delete", uid,
+                       cleaning_date=cleaning_date_for(booking),
+                       booking_type=booking.get("type"),
+                       booking_status=booking.get("status"))
             del data["bookings"][uid]
             save_data(data)
     return redirect(ingress_prefix() + "/")
@@ -3280,6 +3341,9 @@ def _add_booking(entry_type, notes):
             "type": "manual_cleaning",
         }
 
+    _log_write("booking_add", uid, entry_type=entry_type,
+               cleaning_date=data["bookings"][uid].get("end"),
+               cleaner=data["bookings"][uid].get("cleaner"))
     save_data(data)
     return redirect(ingress_prefix() + "/")
 
@@ -3990,14 +4054,29 @@ def _run_full_reconcile():
                     dict(f, decision=reconcile_mod._decision_of(f["kind"]))
                     for f in wd_findings
                 ]
+                # Into `findings_raw` ONLY, then re-derive everything from it.
+                #
+                # Prepending to `findings` put these AHEAD of the decision
+                # ranking they had just been stamped for, and past the
+                # dismissed filter entirely — `filter_and_sort` had already
+                # run inside reconcile.run(). Two consequences, both live on
+                # 2026-08-20: `bridge_blind_window` held line 1 of every
+                # digest above the one-tap actions despite ranking
+                # `investigate`, and no dismissal could ever clear it because
+                # the next run re-prepended it (ISC-236). Those were filed as
+                # separate problems for two days; they are one.
+                #
+                # `counts` was hand-maintained here for the same reason and is
+                # now derived too — a third copy of a rule that already exists
+                # once. Every watchdog finding is dated `today_str` at its emit
+                # site, so the STALE_DAYS filter cannot drop them; that is the
+                # property the old comment here was protecting, and it holds
+                # without a second list to protect it with.
                 prior_raw = list(result.get("findings_raw") or result.get("findings") or [])
                 result["findings_raw"] = wd_findings + prior_raw
-                result["findings"] = wd_findings + list(result.get("findings") or [])
-                counts = result.setdefault("counts", {})
-                counts["total"] = counts.get("total", 0) + len(wd_findings)
-                for f in wd_findings:
-                    counts[f["severity"]] = counts.get(f["severity"], 0) + 1
-                    counts[f["kind"]] = counts.get(f["kind"], 0) + 1
+                result = reconcile_mod.filter_and_sort(
+                    result, data.get("dismissed_findings", {}) or {}
+                )
         except Exception as e:
             print(f"[reconcile] watchdog findings failed (non-fatal): {e}")
     try:
@@ -4383,8 +4462,28 @@ def _digest_compute_and_notify():
         new_findings = []
         resolved_count = 0
     else:
-        new_findings = [f for f in result["findings"] if f["id"] in current_ids - baseline_ids]
+        # One horizon, computed once, applied to BOTH halves of the diff.
+        horizon = (today + timedelta(days=REPEAT_HORIZON_DAYS)).isoformat()
         resolved_count = len(baseline_ids - current_ids)
+
+        # A finding is new to the READER only if it is also near enough to act
+        # on. The repeat filter below has always understood that; the
+        # new-finding path never did, so an Airbnb reservation landing eleven
+        # months out pushed `drift_unassigned` to Josh's phone the night it
+        # arrived — noise by his own rule ("only a problem if it's less than a
+        # month from today"), and relentless, because far-future reservations
+        # arrive constantly.
+        #
+        # Suppressed, not dropped. `finding_ids` below still records it, so it
+        # never re-announces as new later; and it starts repeating on its own
+        # once `_drift` promotes it back to needs-attention inside the window.
+        # Dateless findings — bridge down, blind window — are about NOW and
+        # always announce.
+        new_findings = [
+            f for f in result["findings"]
+            if f["id"] in current_ids - baseline_ids
+            and (not f.get("date") or f["date"] <= horizon)
+        ]
 
         # Repeat-until-fixed. Reporting only what changed since last night meant
         # a real problem was announced once and then never again — the bridge
@@ -4402,7 +4501,6 @@ def _digest_compute_and_notify():
         # true, unimportant today, and will start repeating on its own once it
         # comes inside the horizon. Findings with no date (bridge down, blind
         # window, watchdog broken) always repeat — they are about *now*.
-        horizon = (today + timedelta(days=REPEAT_HORIZON_DAYS)).isoformat()
         persisting = [
             f for f in result["findings"]
             if f["id"] in (current_ids & baseline_ids)

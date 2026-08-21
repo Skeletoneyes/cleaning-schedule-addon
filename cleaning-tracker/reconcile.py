@@ -42,7 +42,7 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     dismissed = data.get("dismissed_findings", {}) or {}
 
     findings = []
-    findings.extend(_drift(drift_items))
+    findings.extend(_drift(drift_items, today_str))
     findings.extend(_unread_messages(data.get("messages", []), facts_records, today_str))
     findings.extend(_channel_silence(silence, today_str))
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str, messages_by_id))
@@ -453,7 +453,44 @@ def _unread_messages(messages, facts_records, today_str, horizon_days=UNREAD_URG
 # the Conflicts tab has one unified list. Severity is needs-attention because
 # the notify queue's whole point is "tell a cleaner something changed".
 
-def _drift(items):
+# How close an unassigned cleaning has to be before it is a problem.
+# Josh's rule, 2026-08-20: "for cleanings where nobody is assigned it's only a
+# problem if that's less than one month from today's date." Applied to
+# `drift_unassigned` ONLY — the other drift kinds describe a cleaner who IS
+# assigned and may not have been told, which is a different question and one he
+# has not ruled on. Do not quietly widen this to them.
+UNASSIGNED_URGENT_DAYS = 30
+
+
+def _drift(items, today_str=None):
+    def _severity(kind, when):
+        """Distance decides whether an unassigned cleaning is a problem.
+
+        Every drift finding used to be stamped `needs-attention` here whatever
+        its date — the same "severity is a literal fixed at the emit site, a
+        property of the function that spoke" defect this file diagnosed earlier
+        on 2026-08-20, one layer down and left in place. Live that day: ten
+        drift findings, nine of them bookings two to twelve months out, and a
+        counts badge reading 14 needs-attention when five things actually
+        needed a human.
+
+        Two things follow for free, which is why this belongs at the emit site
+        rather than in a filter. The nightly repeat filter keys on
+        `needs-attention`, so a far-future booking stops repeating; and it
+        promotes ITSELF back the day it comes inside the window, with no state
+        to keep and nothing to remember to undo.
+
+        A past-due date returns needs-attention: `days` goes negative, which is
+        the most urgent case there is, not the least.
+        """
+        if kind != "unassigned" or not today_str or not when:
+            return "needs-attention"
+        try:
+            days = (date.fromisoformat(when) - date.fromisoformat(today_str)).days
+        except ValueError:
+            return "needs-attention"
+        return "needs-attention" if days <= UNASSIGNED_URGENT_DAYS else "suggest"
+
     why_map = {
         "new": "newly assigned — not yet notified",
         "changed": "assignment changed since last notified",
@@ -487,7 +524,7 @@ def _drift(items):
             "id": f"drift:{it['uid']}:{k}",
             "detector": "drift",
             "kind": f"drift_{k}",
-            "severity": "needs-attention",
+            "severity": _severity(k, it.get("date")),
             "booking_uid": it["uid"],
             "cleaner": cleaner,
             "date": it.get("date"),

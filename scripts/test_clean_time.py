@@ -46,6 +46,7 @@ def _extract(names, ns):
 
 
 _recorded: list = []
+_written: list = []
 
 APP = {
     "date": date, "datetime": datetime, "timedelta": timedelta, "re": re,
@@ -57,6 +58,10 @@ APP = {
                        "confirmed": "confirmed", "end": "cleaning date"},
     # Recording stub — `_record_change` is exercised by its own suite.
     "_record_change": lambda *a, **k: _recorded.append(a),
+    # Recording stub for the write-audit log (1.37.5). Recorded rather than
+    # no-op'd because "every write is logged" is the property, so a test that
+    # silently swallowed the call would pass on a build that stopped logging.
+    "_log_write": lambda op, uid=None, **k: _written.append((op, uid, k)),
 }
 _extract(["_stated_clean_time", "cleaning_date_for", "ack_notified",
           "_apply_booking_change", "_change_findings", "_recent_changes"], APP)
@@ -81,6 +86,54 @@ def fact(kind="confirm", date="2026-08-10", time="11:00", cleaner="Itzel",
     return {"kind": kind, "target_date": date, "target_time": time,
             "cleaner": cleaner, "tentative": tentative, "confidence": 0.95,
             "evidence": "see you on Monday at 11:00 am"}
+
+
+class WriteAuditLogTests(unittest.TestCase):
+    """1.37.5 — every booking mutation leaves a record naming the target.
+
+    The precondition for a CLI: once something other than a human at the HA UI
+    can assign and delete bookings, "who did this and to which booking" has to
+    be answerable after the fact. `_record_change` cannot answer it — it
+    watches four fields, returns early when none moved, and never sees the UI
+    routes at all.
+    """
+
+    def setUp(self):
+        _written.clear()
+        self.data = {"bookings": {"u1": {
+            "start": "2026-08-09", "end": "2026-08-10", "cleaner": None,
+            "confirmed": False, "status": "active", "type": "airbnb",
+        }}}
+
+    def test_a_confirm_is_logged_with_its_resolved_booking(self):
+        app._apply_booking_change(self.data, "u1", "Itzel", "confirm",
+                                  {"id": "m1"}, facts_list=[fact()])
+        self.assertEqual(len(_written), 1)
+        op, uid, detail = _written[0]
+        self.assertEqual(op, "booking_confirm")
+        self.assertEqual(uid, "u1")
+        self.assertEqual(detail["cleaning_date"], "2026-08-10")
+        self.assertEqual(detail["cleaner"], "Itzel")
+        self.assertEqual(detail["message_id"], "m1")
+
+    def test_a_decline_is_logged(self):
+        self.data["bookings"]["u1"]["cleaner"] = "Itzel"
+        app._apply_booking_change(self.data, "u1", "Itzel", "decline",
+                                  {"id": "m2"}, facts_list=[])
+        self.assertEqual([w[0] for w in _written], ["booking_decline"])
+
+    def test_a_write_against_a_uid_that_does_not_exist_is_still_logged(self):
+        """The signature of a stale automation, and invisible everywhere else.
+
+        `_record_change` is never reached on this path — the function returns
+        before it — so without this entry the attempt leaves no trace at all.
+        """
+        app._apply_booking_change(self.data, "gone", "Itzel", "confirm",
+                                  {"id": "m3"}, facts_list=[])
+        self.assertEqual(len(_written), 1)
+        op, uid, _ = _written[0]
+        self.assertEqual(op, "booking_write_unresolved")
+        self.assertEqual(uid, "gone")
 
 
 class StatedCleanTimeTests(unittest.TestCase):
