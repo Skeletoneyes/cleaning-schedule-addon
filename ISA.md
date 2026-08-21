@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-21T13:30:00-07:00
-progress: 326/363
+updated: 2026-08-21T14:50:00-07:00
+progress: 328/363
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -573,8 +573,8 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 
 **W3 — Projection enrichment**
 
-- [ ] ISC-356: `booking_status` and `absorbed` (finding ids) ride the projection: added to the Pi allowlist, accepted by the bot's parser, present in the triage prompt. Probe: capture one live payload, assert both keys.
-- [ ] ISC-357: Anti: `quote` and `evidence` still never cross — the regression probe re-runs *after* the allowlist widening and passes.
+- [x] ISC-356: `booking_status` and `absorbed` (finding ids) ride the projection: added to the Pi allowlist, accepted by the bot's parser, present in the triage prompt. Probe: capture one live payload, assert both keys.
+- [x] ISC-357: Anti: `quote` and `evidence` still never cross — the regression probe re-runs *after* the allowlist widening and passes.
 
 **W4 — Measurement + relocation gate**
 
@@ -1276,3 +1276,9 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - ISC-355: two probes (rg exit 1, grep empty) over `~/dev/pai-telegram-bot/src/` — zero references to `/reconcile/dismiss`, `/review/*`, `/assign`, port 5000, or any LAN address. Architecturally reinforced: the VPS is egress-locked with no route to the Pi; the Pi initiates every crossing.
 - Refinement shipped as 1.38.1: `resolve_subjects` backfills `booking_uid` on single-member groups — the live probe caught the Sep-10 dismissal storing `booking_uid: null` because a LOOSE changed_mind never got its subject backfilled, leaving ISC-349's subject rule nothing to key on. Six suites re-run OK; deployed.
 - Left open on purpose: Itzel's Sep 27 question ("keep or cancel Sept 27 at 11:00?") needs a human WhatsApp reply — the `confirm_no_booking:Itzel:2026-09-27` informational finding remains as its tracker representation. The Oct 1 unassigned booking (she declined — "I'm full") and the Aug 24 time_unagreed (Darya) are real open items, correctly still reported.
+
+### W3 projection enrichment — 1.39.0, verified live end-to-end (2026-08-21)
+
+- ISC-356: live capture on the VPS. Allowlist extracted to `reconcile.project_finding_for_vps` (pure; `VPS_FINDING_FIELDS` is the single enumeration); `booking_status` derived from the booking at projection time, `absorbed` passed through. Bot (`cleaning.ts`) accepts both — validated shapes, null on malformed, absent valid for an older Pi — and the triage prompt is taught what they mean (a "cancelled" subject is usually settled; absorbed is countable corroboration). Live `/digest/run` at 14:45: VPS state file shows keys exactly `absorbed, booking_status, cleaner, date, decision, detector, id, kind, severity, why`, `booking_status: "active"` populated on all 9 findings. Telegram delivered: "Actions needed — none / Unresolved conflicts — none / Changes applied — Itzel auto-confirmed via WhatsApp for 9 cleanings", the first digest with a populated changes channel and empty alarm buckets.
+- ISC-357: `scripts/test_projection_allowlist.py` (7 tests, OK) — key set equals the declared allowlist, quote/evidence/evidence_latest/booking_uid absent, raw text appears in no value, plus a source-level guard that app.py still routes through the pure function. Live payload confirmed: `any quote/evidence? False`. Bot suite 227/227 after the parser change; add-on suite 19/19.
+- Deploy note, recorded because it almost bit: `/opt/pai-telegram-bot` is NOT a git checkout — the first deploy attempt ran `git pull` there, failed, and restarted the service on old code while reporting `active`. Correct mechanism per RUNBOOK: scp the changed src file + chown paibot + restart. The repo push to the Pi remote is the source of truth; the scp is the delivery.
