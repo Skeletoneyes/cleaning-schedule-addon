@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-20T19:30:00-07:00
-progress: 318/351
+updated: 2026-08-21T12:00:00-07:00
+progress: 318/363
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -549,6 +549,39 @@ Context: Josh, 2026-08-20 — *"I find the interface of the cleaning app confusi
 - [ ] ISC-347: Anti: no new inbound listener on the Pi for Telegram write-back. The Pi already holds a VPS credential (it pushes the digest nightly), so it polls for pending taps — the existing `telegram-write-queue-generalization` envelope is the right shape but drains to the desktop, not here.
 - [ ] ISC-348: Anti: Telegram callback data carries uid + action only, never message text — the payload allowlist boundary holds in the reverse direction too.
 
+### Council plan 2026-08-21 — digest fidelity before architecture (ISC-349..360)
+
+Context: Josh's hypothesis that VPS triage working on projected findings is the structural
+weakness went to a 4-agent Opus council. Unanimous verdict: projection accounts for at most
+1 of the 4 failures in the 2026-08-21 digest; the pain is reconciler defects + the missing
+desktop→Pi write-back. Key reframe (Quinn): the desktop/VPS asymmetry is turns-and-tools,
+not location — a no-tools single-turn formatter cannot "resolve" anything wherever it runs.
+Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the same W1 pass.
+
+**W1 — Reconciler defect fixes**
+
+- [ ] ISC-349: Dismissals are subject-scoped with an evidence cutoff. Dismissing a finding records `booking_uid` + `dismissed_at`; a later finding about the same booking whose evidence is *entirely older* than `dismissed_at` is filtered, while any post-dismissal message re-opens the subject. Probe: unit replay of the Aug-16-dismissal / Aug-21-refinding sequence — suppressed on old evidence, surfaced when the Aug-18 messages are included.
+- [ ] ISC-350: Acceptance replay on the live corpus: with the 2026-08-21 data and the Aug 16 dismissal records, the rendered digest carries no bullet re-reporting the adjudicated Darya/Itzel contest, and the two Aug 18 unread messages still surface (they are genuinely new). Probe: reconcile → render → grep.
+- [ ] ISC-351: A failed re-extraction never falsifies a successful one. When a message already holds facts at the current prompt version, a later extraction error leaves it classified as *waiting for a decision*; `unread_messages` says "extraction failed" only when no facts exist. Probe: unit test forcing an API error on a message with stored facts. (Fixes the Sep 8 "extraction failed" lie — 3 of 4 queued messages were in this state on 2026-08-21.)
+- [ ] ISC-352: A coherent schedule story is not a conflict. When every cleaner's *latest* statement about a date is consistent with current booking state (assignee's latest = confirm, non-assignees' latest = decline, booking active), the merged finding takes `decision: observe` and severity informational. Probe: fixture mirroring Aug 21 → observe; fixture where the *assignee's* latest is decline → still adjudicate.
+- [ ] ISC-353: Anti: the ISC-352 downgrade never suppresses an unread/undecided message member — an unread message keeps its own severity even when the schedule story around it is coherent.
+
+**W2 — Desktop→Pi write-back**
+
+- [ ] ISC-354: A conflict resolved in a desktop session ends with `POST /reconcile/dismiss` carrying a dated reason. Enforced procedurally: the `reconcile-cleaning-schedule` skill and this repo's CLAUDE.md state it as a mandatory closing step. Probe: one live round trip — dismissal in `ops_log`, finding absent from the next digest payload.
+- [ ] ISC-355: Anti: write-back is desktop/LAN-only. Nothing on the VPS or Telegram path can dismiss a finding — the wall holds in the reverse direction (consistent with ISC-347/348).
+
+**W3 — Projection enrichment**
+
+- [ ] ISC-356: `booking_status` and `absorbed` (finding ids) ride the projection: added to the Pi allowlist, accepted by the bot's parser, present in the triage prompt. Probe: capture one live payload, assert both keys.
+- [ ] ISC-357: Anti: `quote` and `evidence` still never cross — the regression probe re-runs *after* the allowlist widening and passes.
+
+**W4 — Measurement + relocation gate**
+
+- [ ] ISC-358: Every nightly push appends its outgoing payload to `/data/digest_archive.jsonl` (30-day trailing retention, same pattern as `bridge_checks.jsonl`). Probe: two consecutive nights → two lines. Without this no replay of causality claims is possible — nothing currently retains past payloads.
+- [ ] ISC-359: A 14-night ledger classifies every digest item Josh flags as wrong or already-resolved by cause: `pi-defect | projection-poverty | write-back-gap | tooling-asymmetry`. Lives beside this ISA; ≥14 nights covered before any verdict.
+- [ ] ISC-360: Anti: no triage-relocation implementation begins before ISC-359's verdict is recorded as a Decision in this file. If relocation happens: prepaid API credits (never subscription OAuth in the add-on), stage flags retained in the payload so the VPS attestation counter survives.
+
 ## Test Strategy
 
 | isc | type | check | threshold | tool |
@@ -678,6 +711,18 @@ Context: Josh, 2026-08-20 — *"I find the interface of the cleaning app confusi
 | ISC-236 | behavior | dismiss a `bridge_blind_window` id, then `POST /reconcile/run` | id absent from `findings` | curl + jq |
 | ISC-237 | unit | replay an evening-local message with a relative date through `facts.py` | target_date == local tomorrow | test file |
 | ISC-238 | live | Josh reports receipt on-device after a digest run | confirmed by Josh | ask |
+| ISC-349 | unit | replay Aug-16 dismissals against Aug-21 findings, with and without the Aug-18 messages | suppressed / re-opened respectively | test file |
+| ISC-350 | behavior | full reconcile + render on 2026-08-21 corpus snapshot | no Darya/Itzel contest bullet; 2 unread bullets present | script + grep |
+| ISC-351 | unit | force API error on a message with stored current-version facts | classified undecided, wording ≠ "extraction failed" | test file |
+| ISC-352 | unit | Aug-21-shaped fixture vs assignee-declines fixture | observe / adjudicate respectively | test file |
+| ISC-353 | unit | coherent-schedule fixture containing an unread message | unread member keeps needs-attention | test file |
+| ISC-354 | live | resolve one real conflict in a session, POST dismiss, check next payload | ops_log entry + finding absent | curl + jq |
+| ISC-355 | invariant | grep VPS bot + Telegram callback paths for any dismiss call | zero matches | rg |
+| ISC-356 | live | capture one nightly payload | booking_status + absorbed keys present | jq |
+| ISC-357 | invariant | re-run quote/evidence exclusion probe after allowlist change | zero raw-text fields in payload | test file + jq |
+| ISC-358 | live | read /data/digest_archive.jsonl after two nights | ≥2 lines, valid JSON each | ssh + wc |
+| ISC-359 | artifact | ledger file beside this ISA | ≥14 dated nights, every flagged item cause-tagged | read |
+| ISC-360 | invariant | no relocation branch/commit before the ISC-359 Decision exists | grep Decisions for verdict first | git log + read |
 
 ## Features
 
@@ -702,9 +747,16 @@ Context: Josh, 2026-08-20 — *"I find the interface of the cleaning app confusi
 | gcal-staleness-sentinel | `pipeline:stale-push` finding when the last successful push ages out, mirroring `pipeline:stale-sync` | ISC-62..ISC-67 | gcal-push-status | false |
 | gcal-finding-correlation | `gcal_push_failed` as its own kind, absorbing the drift findings it caused | ISC-68..ISC-73 | gcal-staleness-sentinel | false |
 | gcal-repair-proof | ship, deploy, then deliberately break the push and prove the alarm reaches Telegram | ISC-74..ISC-85 | all of the above | false |
+| digest-dismissal-semantics | subject-scoped dismissal with evidence cutoff (+ close ISC-335 in the same pass) | ISC-349, ISC-350 | — | true |
+| parse-error-truthfulness | failed re-extraction cannot falsify a successful one | ISC-351 | — | true |
+| schedule-consistency-downgrade | coherent latest-statements story renders as observe, not conflict | ISC-352, ISC-353 | digest-dismissal-semantics | false |
+| desktop-write-back | session-resolved conflicts POST /reconcile/dismiss as a mandatory closing step | ISC-354, ISC-355 | — | true |
+| projection-enrichment | booking_status + absorbed ids cross the wire; quote/evidence still never | ISC-356, ISC-357 | — | true |
+| digest-measure-gate | nightly payload archive + 14-night cause ledger gating any triage relocation | ISC-358, ISC-359, ISC-360 | — | true |
 
 ## Decisions
 
+- 2026-08-21 12:00: **Council verdict on triage placement (4 Opus agents, unanimous): keep VPS triage; projection is not the primary cause.** Josh's hypothesis — that the triager working on projected rather than full facts is the structural weakness — attributed at most 1 of the 4 failures in that morning's digest, and that one was a detector defect first. The plan instead: reconciler defect fixes + desktop write-back + projection enrichment (ISC-349..357), with relocation gated on a 14-night measured ledger (ISC-358..360). Key reframe (Quinn): the desktop/VPS capability asymmetry is *turns-and-tools, not location* — a no-tools single-turn formatter cannot resolve anything wherever it runs. Withdrawn objection worth keeping (Odum): Pi-side triage on prepaid API credits with stage flags retained would survive both the billing audit and the attestation counter, so relocation stays a live option, not a dead one.
 - 2026-08-20 (wrap): **Structural — 110 criteria (ISC-239..348) were living inside `## Decisions`, not `## Criteria`.** The drift began with the 1.37.0 pass appending after the last decision bullet rather than into the criteria list, and four passes compounded it silently. Moved wholesale, with the ISC id set asserted identical before and after (351 both sides) and the bare ISC-239..314 run given a dated header — unheaded, it would have read as belonging to the 2026-08-09 block it now sits under. Worth recording because it is this project's own recurring shape: **a section-presence check scores a drifted file identically to a correct one**, which is exactly what ISC-184 says about the Test Strategy table. Nothing in the repo would have caught this; it surfaced only because a reconcile printed the section boundaries.
 - 2026-08-20 (wrap): **Index trap-ledger — one line left `PROJECTS.md`, none vanished.** *"⚠️ `bridge_blind_window` is CLOSED and **unclearable** — dismissals re-inject (ISC-236). It leads every digest until fixed."* → **IN** ISC-236, which now carries the closure, the root cause and the live evidence. The trap is retired rather than relocated: 1.37.5 fixed it. Replaced by a pointer line naming ISC-332..348 so a cold session finds the open findings and the CLI direction. `PROJECTS.md` 14,946 → 14,701 chars — well under the 30K rail, no trimming attempted beyond what this session finished.
 - 2026-08-20: **Scoped the proximity rule to `drift_unassigned` and left `drift_new` shouting.** Josh's rule named cleanings "where nobody is assigned"; `drift_new` describes a cleaner who IS assigned and has not been told. Live after the change, `drift_new:2026-11-24` still reads needs-attention at position 7. Flagged to him rather than silently widened — the requested scope is the deliverable, and quietly extending a rule to an adjacent case is how a stated preference becomes an inferred one.
