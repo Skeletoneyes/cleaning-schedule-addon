@@ -137,5 +137,56 @@ class EvidenceGate(unittest.TestCase):
         self.assertIn("2026-08-20", text)
 
 
+
+
+class EveryLatestWinsUsesInstants(unittest.TestCase):
+    """The same defect existed in four more comparisons and was missed.
+
+    `notify_ack` was fixed first, on 2026-08-20, because it failed OPEN and
+    manufactured acknowledgements. The three latest-wins detectors in
+    `reconcile.py` — plus `_fact_timeline`'s sort — had the identical bug:
+    ordering messages by raw timestamp string when the archive holds both
+    UTC-`Z` and naive-local shapes. Measured over the live corpus, 33
+    (cleaner, date) groups carry both shapes and 2 order differently under
+    string comparison than under instant comparison.
+
+    `_fact_timeline` is the one that matters most: it produces the
+    "said decline then confirm; latest is confirm" line.
+    """
+
+    def test_reconcile_exposes_one_shared_parser(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cleaning-tracker"))
+        import reconcile
+        self.assertTrue(callable(reconcile.as_instant))
+        self.assertEqual(reconcile.as_instant("2026-01-15T12:00:00").utcoffset(),
+                         timedelta(hours=-8), "winter must be PST")
+        self.assertEqual(reconcile.as_instant("2026-08-15T12:00:00").utcoffset(),
+                         timedelta(hours=-7), "summer must be PDT")
+
+    def test_notify_ack_does_not_keep_its_own_copy(self):
+        """One parser. A second copy is how they drift apart."""
+        src = (Path(__file__).resolve().parent.parent
+               / "cleaning-tracker" / "notify_ack.py").read_text()
+        self.assertIn("from reconcile import as_instant", src)
+        self.assertNotIn("def as_instant", src)
+
+    def test_no_raw_timestamp_ordering_survives_in_reconcile(self):
+        import ast as _ast
+        src = (Path(__file__).resolve().parent.parent
+               / "cleaning-tracker" / "reconcile.py").read_text()
+        code = _ast.unparse(_ast.parse(src))
+        for bad in ("ts > prev[0]", "ts > existing[0]", "said_at > prev[0]"):
+            self.assertNotIn(bad, code, f"raw string ordering survives: {bad}")
+
+    def test_a_mixed_shape_pair_orders_by_real_time(self):
+        """The live shape of the defect: a UTC message that is EARLIER in real
+        time than a naive-local one, but sorts later as a string."""
+        import reconcile
+        utc = "2026-07-21T23:15:19.000Z"   # 16:15 local
+        local = "2026-07-21T16:20:00"      # 16:20 local — five minutes LATER
+        self.assertGreater(utc, local, "precondition: string order is inverted")
+        self.assertLess(reconcile.as_instant(utc), reconcile.as_instant(local))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

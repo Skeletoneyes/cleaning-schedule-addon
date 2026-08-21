@@ -21,12 +21,71 @@ Findings schema:
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 RECONCILER_VERSION = "reconciler-v1"
 CONFIRM_THRESHOLD = 0.85
 PUSH_STALE_HOURS = 26
 CLOCK_SKEW_TOLERANCE_H = 1  # tolerate benign skew; beyond this, a future date is a broken clock
+
+# ── Timestamps ──────────────────────────────────────────────────────────────
+# The archive holds two shapes and they are NOT comparable as strings:
+#
+#     2026-08-20T05:53:19.000Z   UTC, from the WhatsApp bridge   (241 of 724)
+#     2026-07-30T12:35:00        naive local, written on the Pi  (483 of 724)
+#
+# Every message ingested since 2026-04-21 is the first shape, so the two
+# coexist across April–July and will coexist in any restored archive. UTC sorts
+# seven or eight hours AHEAD of the same instant, and `.000Z` breaks ties in
+# the same direction, so `a > b` on the raw strings can pick the wrong "latest".
+#
+# Fixed in `notify_ack` on 2026-08-20, where it was failing OPEN and inventing
+# acknowledgements. The three latest-wins detectors here had the identical
+# defect and were missed in that pass: measured over the live corpus, 33
+# (cleaner, date) groups carry both shapes and 2 of them order differently
+# under string comparison than under instant comparison.
+
+LOCAL_TZ_NAME = "America/Vancouver"
+_FALLBACK_TZ = timezone(timedelta(hours=-8))  # PST — see notify_ack for why
+
+
+def _local_tz():
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo(LOCAL_TZ_NAME)
+    except Exception:
+        return _FALLBACK_TZ
+
+
+def as_instant(ts):
+    """Either stored timestamp shape as an aware datetime, or None.
+
+    A naive value is read as local, which is what wrote it. Unparseable is
+    None rather than a sentinel that sorts as very-old or very-new — callers
+    order on it, and a stamp we cannot read must not win or lose by accident.
+    """
+    if not ts:
+        return None
+    t = str(ts).strip()
+    if not t:
+        return None
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=_local_tz()) if dt.tzinfo is None else dt
+
+
+# Sorts before every real timestamp, so an unreadable stamp never wins a
+# latest-wins comparison.
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _order_key(ts):
+    return as_instant(ts) or _EPOCH
+
 
 _SEVERITY_RANK = {"needs-attention": 0, "suggest": 1, "informational": 2}
 
@@ -840,7 +899,7 @@ def _time_agreement(bookings, facts_records, today_str, horizon_str,
                 continue
             key = (tgt, cleaner)
             prev = latest.get(key)
-            if prev is None or said_at > prev[0]:
+            if prev is None or _order_key(said_at) > _order_key(prev[0]):
                 latest[key] = (said_at, {str(tm)}, msg_id)
             elif said_at == prev[0] and msg_id == prev[2]:
                 prev[1].add(str(tm))
@@ -955,7 +1014,7 @@ def _latest_by_cleaner_date(facts_records, messages_by_id, kinds, today_str):
                 continue
             key = (cleaner, tgt)
             prev = latest.get(key)
-            if prev is None or ts > prev[0]:
+            if prev is None or _order_key(ts) > _order_key(prev[0]):
                 latest[key] = (ts, msg_id, f)
     return latest
 
@@ -1074,7 +1133,9 @@ def _fact_timeline(facts_records, messages_by_id, today_str):
         kinds = {e[1] for e in evts}
         if kinds != {"confirm", "decline"}:
             continue
-        evts.sort()
+        # Order by instant, not by the raw string — the two stored shapes are
+        # not string-comparable. msg_id breaks ties so re-runs are stable.
+        evts.sort(key=lambda e: (_order_key(e[0]), e[2]))
         first_kind = evts[0][1]
         latest_ts, latest_kind, _, latest_quote = evts[-1]
         out.append({
@@ -1137,7 +1198,7 @@ def _schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id=Non
                 continue
             key = (cleaner, tgt)
             existing = latest_assertions.get(key)
-            if existing is None or ts > existing[0]:
+            if existing is None or _order_key(ts) > _order_key(existing[0]):
                 latest_assertions[key] = (ts, msg_id, f)
 
     # Phase 2: emit findings using only the latest assertion per (cleaner, date).
