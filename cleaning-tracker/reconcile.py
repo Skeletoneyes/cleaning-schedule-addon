@@ -107,6 +107,10 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     findings.extend(_facts_vs_bookings(bookings, facts_records, today_str, messages_by_id))
     findings.extend(_fact_timeline(facts_records, messages_by_id, today_str))
     findings.extend(_schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id))
+    findings.extend(_outreach(
+        bookings, facts_records, today_str, messages_by_id,
+        group_labels=data.get("group_labels"), cleaner_jids=data.get("cleaner_jids"),
+    ))
     # Inside run() and before filter_and_sort, so counts derive from findings
     # automatically — the ISC-40 lesson, applied a third time.
     findings.extend(_time_agreement(
@@ -170,6 +174,16 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
     # under it.
     findings = resolve_subjects(findings, bookings, dismissed)
 
+    # An outreach `wait` applies to the CLEANING, so it must survive the merge
+    # whichever member led. The merged finding's default decision is its
+    # primary's (drift → investigate); the override lives on the outreach
+    # member, so re-apply it here from the carried record.
+    for f in findings:
+        o = f.get("outreach") or {}
+        if o.get("patience") and f.get("decision") == "investigate":
+            f["decision"] = "wait"
+            f["decision_override"] = "wait"
+
     # ISC-349: stamp each finding with the instant of its newest evidence,
     # so filter_and_sort can honour subject-scoped dismissals with an
     # evidence cutoff. Only stamped when EVERY evidence id resolves to a
@@ -214,7 +228,8 @@ DECISION_RANK = {
     "adjudicate": 0,   # two claims held, the system cannot pick — a human must
     "approve": 1,      # incomplete, but a candidate answer is held — one tap
     "investigate": 2,  # incomplete, nothing held — go find out
-    "observe": 3,      # nothing to do
+    "wait": 3,         # asked, answer pending — patience, not action (outreach)
+    "observe": 4,      # nothing to do
 }
 
 # Which decision each finding kind demands. Anything unlisted is treated as
@@ -241,6 +256,12 @@ _KIND_DECISION = {
     "undecided_message": "approve",
     "unread_message": "investigate",
     "drift_unassigned": "investigate",
+    # Outreach states annotate an unassigned cleaning. `asked` inside the
+    # patience window is overridden to `wait` in run(); the default here is
+    # the fail-closed one.
+    "outreach_unasked": "investigate",
+    "outreach_asked": "investigate",
+    "outreach_declined": "investigate",
     "drift_new": "investigate",
     "drift_changed": "investigate",
     "drift_cancelled": "investigate",
@@ -289,6 +310,7 @@ def _decision_for(f):
 # confirmed Sept 10" would hide a broken calendar behind a solved booking.
 MERGEABLE_DETECTORS = {
     "drift",
+    "outreach",
     "facts_vs_bookings",
     "fact_timeline",
     "schedule_vs_bookings",
@@ -417,6 +439,14 @@ def resolve_subjects(findings, bookings, dismissed=None):
                 if f.get("cleaner"):
                     primary["cleaner"] = f["cleaner"]
                     break
+        # The outreach state is a property of the cleaning, not of whichever
+        # member leads; carry it so the projection and the `wait` override in
+        # run() see it on the merged finding.
+        if not primary.get("outreach"):
+            for f in others:
+                if f.get("outreach"):
+                    primary["outreach"] = f["outreach"]
+                    break
         # Severity is the MAX across the group, not the primary's own. Getting
         # this wrong is silent and expensive: the nightly repeat filter keys on
         # `needs-attention`, so a merged finding that inherited `informational`
@@ -454,8 +484,25 @@ STALE_DAYS = 5  # findings whose date is older than this are auto-suppressed
 # every `why` must stay an f-string over structured fields.
 VPS_FINDING_FIELDS = (
     "id", "detector", "kind", "severity", "decision", "date", "cleaner",
-    "why", "booking_status", "absorbed",
+    "why", "booking_status", "absorbed", "outreach",
 )
+
+OUTREACH_STATES = ("unasked", "asked", "declined")
+
+
+def _project_outreach(o):
+    """Closed-shape copy of an outreach record for the VPS: an enum, a first
+    name (or comma-joined names), an ISO date and an int. Built field-by-field
+    like the finding itself, so nothing else on the record can ride along."""
+    if not isinstance(o, dict) or o.get("state") not in OUTREACH_STATES:
+        return None
+    days = o.get("days_waiting")
+    return {
+        "state": o["state"],
+        "cleaner": o.get("cleaner") or None,
+        "asked_on": o.get("asked_on") or None,
+        "days_waiting": int(days) if isinstance(days, int) and days >= 0 else None,
+    }
 
 
 def project_finding_for_vps(f, bookings=None):
@@ -483,6 +530,7 @@ def project_finding_for_vps(f, bookings=None):
         "why": f.get("why"),
         "booking_status": (booking or {}).get("status"),
         "absorbed": list(f.get("absorbed") or []) or None,
+        "outreach": _project_outreach(f.get("outreach")),
     }
 
 # Booking uids as they appear embedded in finding ids
@@ -691,6 +739,19 @@ def _unread_messages(messages, facts_records, today_str, horizon_days=UNREAD_URG
 UNASSIGNED_URGENT_DAYS = 30
 
 
+def _unassigned_severity(when, today_str):
+    """needs-attention inside UNASSIGNED_URGENT_DAYS (or past due), else suggest.
+    Shared by `_drift` and `_outreach` so an outreach annotation repeats on
+    exactly the nights the drift it annotates does."""
+    if not today_str or not when:
+        return "needs-attention"
+    try:
+        days = (date.fromisoformat(when) - date.fromisoformat(today_str)).days
+    except ValueError:
+        return "needs-attention"
+    return "needs-attention" if days <= UNASSIGNED_URGENT_DAYS else "suggest"
+
+
 def _drift(items, today_str=None):
     def _severity(kind, when):
         """Distance decides whether an unassigned cleaning is a problem.
@@ -712,13 +773,9 @@ def _drift(items, today_str=None):
         A past-due date returns needs-attention: `days` goes negative, which is
         the most urgent case there is, not the least.
         """
-        if kind != "unassigned" or not today_str or not when:
+        if kind != "unassigned":
             return "needs-attention"
-        try:
-            days = (date.fromisoformat(when) - date.fromisoformat(today_str)).days
-        except ValueError:
-            return "needs-attention"
-        return "needs-attention" if days <= UNASSIGNED_URGENT_DAYS else "suggest"
+        return _unassigned_severity(when, today_str)
 
     why_map = {
         "new": "newly assigned — not yet notified",
@@ -1472,6 +1529,156 @@ def _schedule_vs_bookings(bookings, facts_records, today_str, messages_by_id=Non
             # field feels over complex."
     return out
 
+
+
+# ── Detector: host outreach ⇄ unassigned bookings ───────────────────────────
+# Answers the question the digest could not (2026-08-23): for a cleaning with
+# nobody assigned, has anyone been ASKED, and did she answer? The ask is
+# already in the corpus — a host sentence naming a date for a cleaner — but
+# `_schedule_vs_bookings` reads those at CONFIRM_THRESHOLD because it
+# *assigns* on them. A question and a statement are the same event for
+# outreach (the host put the date in front of the cleaner); what separates the
+# states is whether she replied afterwards. So this detector reads the same
+# facts at a low bar, never writes, and defers to the existing approve path
+# the moment a confirm exists. No new fact kind, no prompt bump, no reprocess.
+
+OUTREACH_MIN_CONFIDENCE = 0.5     # below the 0.85 ASSIGNMENT gate on purpose
+OUTREACH_PATIENCE_DAYS = 3        # asked < this many days ago → decision `wait`
+OUTREACH_ASK_WINDOW_DAYS = 90     # an ask counts only this close to the clean
+_CLEANER_ANSWER_KINDS = ("confirm", "decline", "date_proposal", "time_proposal")
+
+
+def _ask_date(ts):
+    inst = as_instant(ts)
+    return inst.astimezone(_local_tz()).date().isoformat() if inst else None
+
+
+def _outreach(bookings, facts_records, today_str, messages_by_id=None,
+              group_labels=None, cleaner_jids=None):
+    messages_by_id = messages_by_id or {}
+    group_labels = group_labels or {}
+    cleaner_senders = {j for js in (cleaner_jids or {}).values() for j in (js or [])}
+    try:
+        today = date.fromisoformat(today_str)
+    except (TypeError, ValueError):
+        return []
+    horizon = (today + timedelta(days=UNASSIGNED_URGENT_DAYS)).isoformat()
+
+    targets = {}
+    for uid, b in (bookings or {}).items():
+        if b.get("status") != "active" or b.get("type", "airbnb") != "airbnb":
+            continue
+        if b.get("cleaner"):
+            continue
+        d = b.get("end")
+        if d and today_str <= d <= horizon:
+            targets.setdefault(d, []).append(uid)
+    if not targets:
+        return []
+
+    # Latest ask per (date, cleaner): host assertions at the low bar.
+    asks = {}
+    for msg_id, rec in (facts_records or {}).items():
+        msg = messages_by_id.get(msg_id) or {}
+        if msg.get("sender") in cleaner_senders:
+            continue
+        ts = msg.get("timestamp") or ""
+        ask_on = _ask_date(ts)
+        for f in rec.get("facts", []):
+            if f.get("kind") != "schedule_assertion" or f.get("tentative"):
+                continue
+            tgt = f.get("target_date")
+            if tgt not in targets or not ask_on:
+                continue
+            if (f.get("confidence") or 0.0) < OUTREACH_MIN_CONFIDENCE:
+                continue
+            try:
+                lead = (date.fromisoformat(tgt) - date.fromisoformat(ask_on)).days
+            except ValueError:
+                continue
+            if lead < 0 or lead > OUTREACH_ASK_WINDOW_DAYS:
+                continue
+            cleaner = f.get("cleaner") or group_labels.get(msg.get("group"))
+            if not cleaner:
+                continue
+            key = (tgt, cleaner)
+            prev = asks.get(key)
+            if prev is None or _order_key(ts) > _order_key(prev[0]):
+                asks[key] = (ts, msg_id, ask_on)
+
+    answers = _latest_by_cleaner_date(
+        facts_records, messages_by_id, _CLEANER_ANSWER_KINDS, today_str)
+
+    out = []
+    for tgt, uids in targets.items():
+        # ISC-7: a held confirm is the existing approve path's business.
+        if any(d == tgt and a[2].get("kind") == "confirm"
+               for (c, d), a in answers.items()):
+            continue
+        date_asks = {c: v for (d, c), v in asks.items() if d == tgt}
+        waiting, declined, evidence = [], [], []
+        for cleaner, (ask_ts, ask_msg, ask_on) in date_asks.items():
+            evidence.append(ask_msg)
+            ans = answers.get((cleaner, tgt))
+            if ans and _order_key(ans[0]) > _order_key(ask_ts):
+                evidence.append(ans[1])
+                if ans[2].get("kind") == "decline":
+                    declined.append((cleaner, _ask_date(ans[0]) or ask_on))
+                # a proposal means the conversation is live — say nothing
+                continue
+            waiting.append((cleaner, ask_on))
+
+        if waiting:
+            waiting.sort(key=lambda w: w[1])        # longest-waiting first
+            asked_on = waiting[0][1]
+            days = (today - date.fromisoformat(asked_on)).days
+            names = ", ".join(c for c, _ in waiting)
+            state = "asked"
+            why = f"waiting on {names} — asked {asked_on} ({days} day{'s' if days != 1 else ''})"
+        elif declined:
+            declined.sort(key=lambda w: w[1])
+            asked_on = declined[-1][1]
+            days = (today - date.fromisoformat(asked_on)).days
+            names = ", ".join(c for c, _ in declined)
+            state = "declined"
+            why = f"{names} declined {asked_on}"
+        elif date_asks:
+            continue  # every ask answered with a proposal — live conversation
+        else:
+            state, names, asked_on, days = "unasked", None, None, None
+            why = "no cleaner has been asked"
+
+        for uid in uids:
+            f = {
+                "id": f"outreach:{uid}",
+                "detector": "outreach",
+                "kind": f"outreach_{state}",
+                "severity": _unassigned_severity(tgt, today_str),
+                "booking_uid": uid,
+                # Names live in `outreach.cleaner` and `why`; a top-level
+                # `cleaner` would be lent to the merged drift finding and read
+                # as an assignee.
+                "cleaner": None,
+                "date": tgt,
+                "why": why,
+                "evidence": list(evidence),
+                "outreach": {
+                    "state": state,
+                    "cleaner": names,
+                    "asked_on": asked_on,
+                    "days_waiting": days,
+                },
+            }
+            # Patience, fail-closed: only while the clean is comfortably out.
+            # Recorded on the outreach record (not projected) so run() can
+            # re-apply it to whichever member leads the merged finding.
+            lead = (date.fromisoformat(tgt) - today).days
+            if (state == "asked" and days is not None
+                    and days < OUTREACH_PATIENCE_DAYS and lead > UNREAD_URGENT_DAYS):
+                f["outreach"]["patience"] = True
+                f["decision_override"] = "wait"
+            out.append(f)
+    return out
 
 # ── Detector 1: Airbnb iCal ⇄ bookings ──────────────────────────────────────
 # Caller parses the feed and passes a list of {uid, start, end} dicts. Three
