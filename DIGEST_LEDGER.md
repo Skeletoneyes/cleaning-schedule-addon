@@ -32,7 +32,7 @@ failures that W3's enrichment did not absorb.
 | # | Digest date | Bullets | Flagged items (verbatim, short) | Cause tag(s) | Notes |
 |---|-------------|---------|--------------------------------|--------------|-------|
 | 1 | 2026-08-22 | 1 | — | — | "Sept 2 — active booking has no cleaner assigned." Verified 08-23 against live data: booking Aug 31→Sep 2 is real, active, cleaner=None, no WhatsApp facts. Correct. |
-| 2 | 2026-08-23 | 1 | — | — | Same Sept 2 bullet, now "unresolved for 1 day". Still correct (unassigned as of 08-23 review). Observation, not a flag: tomorrow's Aug 24 Darya clean has no agreed time (`time_unagreed`, suggest) — announced once on 08-10 and silent since, because `suggest` never repeats and this detector has no urgency promotion as the date nears (unlike `drift_unassigned` at 30d). |
+| 2 | 2026-08-23 | 1 | — | — | Same Sept 2 bullet, now "unresolved for 1 day". Still correct (unassigned as of 08-23 review). Chat check 08-23: a host asked Itzel on 08-22 08:41 ("free before 3pm Aug 31? and Sept 2?"), no reply yet — the bullet can't say so because the facts schema has no `question` kind (extracted as 0.75-confidence `schedule_assertion`, below the 0.85 gate). Observation, not a flag: tomorrow's Aug 24 Darya clean has no agreed time (`time_unagreed`, suggest) — announced once on 08-10 and silent since, because `suggest` never repeats and this detector has no urgency promotion as the date nears (unlike `drift_unassigned` at 30d). |
 | 3 | 2026-08-24 | | | | |
 | 4 | 2026-08-25 | | | | |
 | 5 | 2026-08-26 | | | | |
