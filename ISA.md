@@ -4,8 +4,8 @@ slug: cleaning-schedule-addon
 type: project
 effort: E5
 phase: complete
-updated: 2026-08-21T16:45:00-07:00
-progress: 330/364
+updated: 2026-08-23T18:00:00-07:00
+progress: 342/377
 ---
 
 # Cleaning Schedule Tracker — Project ISA
@@ -339,7 +339,29 @@ and `transcript ingest` returned zero hits across the whole file.*
 - [x] ISC-181: The 30-day strip renders a day with NO recorded checks as GREY, never green — "we never looked" and "it was fine" must never render alike.
 - [x] ISC-182: Anti: today's cell must be judged against the fraction of the day elapsed, not a full day — otherwise the most-viewed cell is permanently degraded and the strip cries wolf daily.
 - [x] ISC-183: Anti: the bridge panel must not be able to break the home page — its context builder returns a rendered error state rather than raising.
-- [ ] ISC-184: Anti: every ISC carries a `## Test Strategy` row — a wrap-up audit joins Criteria against Test Strategy per-ISC, because a stale table scores identically to a current one under a section-presence check.
+- [ ] ISC-184: Anti: every ISC carries a `### 1.41.x — outreach state: where an unassigned cleaning IS, not just that it is short (2026-08-23)
+
+Context: the Aug 23 digest said "Sept 2 — assign a cleaner" while the Pi already held the
+unanswered Aug 22 ask to Itzel as a 0.75 `schedule_assertion` — discarded by the 0.85 gate,
+which exists so host questions do not *assign*, and which was that fact's only reader.
+Design record (38 criteria, the reasoning, the rejected `question` fact kind):
+`~/.claude/PAI/MEMORY/WORK/cleaning-digest-state-summary/ISA.md`.
+
+- [x] ISC-362: `_outreach` emits one finding per unassigned active Airbnb booking inside `UNASSIGNED_URGENT_DAYS`, with `outreach.state ∈ {unasked, asked, declined}`, from host `schedule_assertion`s at `OUTREACH_MIN_CONFIDENCE` (0.5) — the assignment gate is untouched.
+- [x] ISC-363: A held cleaner `confirm` for the date suppresses the outreach finding — the approve path owns that case.
+- [x] ISC-364: The outreach finding merges into `drift_unassigned` for the same booking; the merged `why` carries the clause and the merged finding carries `outreach`.
+- [x] ISC-365: `decision: wait` is applied post-merge when state is `asked`, `days_waiting < OUTREACH_PATIENCE_DAYS` (3) **and** the clean is more than `UNREAD_URGENT_DAYS` (7) out — fail-closed near the date.
+- [x] ISC-366: Anti: the detector reads no message text and lends no top-level `cleaner` to the merged drift finding (a name there reads as an assignee).
+- [x] ISC-367: Anti: an ask more than `OUTREACH_ASK_WINDOW_DAYS` (90) before the clean, a tentative fact, a sub-floor fact, or a cleaner-authored fact is not an ask.
+- [x] ISC-368: `project_finding_for_vps` crosses `outreach` as exactly `{state, cleaner, asked_on, days_waiting}` — enum, name(s), ISO date, int; `patience` never crosses.
+- [x] ISC-369: The bot accepts `outreach` and `decision: wait` as optional; a malformed `outreach` drops to null without rejecting the payload; an unknown decision degrades to `investigate`; the deterministic fallback renders the clause.
+- [x] ISC-370: Antecedent: the live Telegram bullet for Sept 2 reads as patience with the ask date — "waiting on Itzel — asked Aug 22 (1 day) — nudge in a couple of days".
+- [x] ISC-371: `notify_ack` never treats a sub-0.85 or tentative host `schedule_assertion` as the cleaner having been told (a question is an ask, not a notification).
+- [x] ISC-372: `outreach_min_confidence` is an add-on option: 0.85 ignores questions, >1.0 disables the detector — a rollback that needs no redeploy.
+- [x] ISC-373: The 0.5 floor is calibrated against the whole stored corpus: every host fact in [0.5, 0.85) hand-labelled; none produces a false `asked` on an unassigned future booking.
+- [ ] ISC-374: Watched across nights 3–5 of the ledger: `days_waiting` climbs +1/night for Sept 2, the bullet leaves `wait` on the night it reaches 3, and any `declined` bullet is read by hand. *(Open until 2026-08-26.)*
+
+## Test Strategy` row — a wrap-up audit joins Criteria against Test Strategy per-ISC, because a stale table scores identically to a current one under a section-presence check.
 - [x] ISC-185: The candidate list handed to the parser contains CLEANINGS, one date per row — a reservation carries two dates and only one of them is a cleaning, so a reservation-shaped payload is ambiguous by construction on every turnover day.
 - [x] ISC-186: Anti: a check-in date must not appear anywhere in a candidate row — not as a field, not embedded in a label. 53% of cleanings fall on a day that is also the next guest's check-in, so any surviving check-in date puts today's date on two rows.
 - [x] ISC-187: The auto-apply gate requires the model's independently-stated `cleaning_date` to equal the chosen booking's cleaning day; disagreement routes to human review and says which two dates disagreed.
@@ -724,6 +746,13 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 | ISC-358 | live | read /data/digest_archive.jsonl after two nights | ≥2 lines, valid JSON each | ssh + wc |
 | ISC-359 | artifact | ledger file beside this ISA | ≥14 dated nights, every flagged item cause-tagged | read |
 | ISC-360 | invariant | no relocation branch/commit before the ISC-359 Decision exists | grep Decisions for verdict first | git log + read |
+| ISC-362..368 | unit | `python3 scripts/test_outreach.py` | 21/21 | Bash |
+| ISC-369 | unit | `bun test test/cleaning.test.ts` in the bot repo | 114/114 | Bash |
+| ISC-370 | live | VPS journal "cleaning digest message sent" body after `/digest/run` | contains "waiting on Itzel" + ask date | ssh |
+| ISC-371 | unit | `python3 scripts/test_notify_ack.py` § AskIsNotTelling | 23/23 | Bash |
+| ISC-372 | live | `ha apps info` options carry `outreach_min_confidence` | present, default 0.5 | ssh |
+| ISC-373 | corpus | dump host facts in [0.5,0.85) from `/internal/snapshot`, hand-label | 0 false `asked` on unassigned-future | python |
+| ISC-374 | ledger | DIGEST_LEDGER nights 3–5 | monotone days_waiting; wait→nudge at 3 | read |
 
 ## Features
 
@@ -754,9 +783,11 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 | desktop-write-back | session-resolved conflicts POST /reconcile/dismiss as a mandatory closing step | ISC-354, ISC-355 | — | true |
 | projection-enrichment | booking_status + absorbed ids cross the wire; quote/evidence still never | ISC-356, ISC-357 | — | true |
 | digest-measure-gate | nightly payload archive + 14-night cause ledger gating any triage relocation | ISC-358, ISC-359, ISC-360 | — | true |
+| outreach-state | derived ask-state on unassigned cleanings, `wait` decision, closed-shape projection, bot rendering, rollback option | ISC-362..374 | — | true |
 
 ## Decisions
 
+- 2026-08-23 17:50: **No new fact kind for "the host asked" — derive outreach from the facts already stored.** The obvious fix (a `question` kind) was rejected: for outreach a question and a statement are the same event (the date was put in front of her); what separates `asked` from `declined`/confirmed is whether she answered *afterwards*. Reading the existing host assertions at 0.5 lit the feature up on the Aug 22 record with no prompt bump and no $10 reprocess, and — because extraction is untouched — cannot disturb `notify_ack`. The SystemsThinking pass proposed the new kind plus silencing asked bullets; both declined (Josh wants them in Actions, as patience), its fail-closed floor and auto-ack coupling test adopted. Shipped 1.41.0 (detector + bot) and 1.41.1 (rollback option) the same afternoon; live bullet at 17:44. Advisor (post-deliverable) pushed on the floor's asymmetry; answered with the corpus calibration (ISC-373) rather than a confidence field on the wire.
 - 2026-08-21 13:45: **Sep 27 kept as an owner cleaning — and the existing `manual_cleaning` type is the answer to "the system should handle that type of booking."** Josh's ruling on Itzel's question: keep Sep 27 at 11:00; it is a cleaning of the owners' upstairs unit, not an Airbnb turnover. No code needed: created `manual-2026-09-27-67` (type `manual_cleaning`, Itzel, 11:00, confirmed) via `/add` + `/assign`. The type already has the right properties for owner cleanings: single-date, no stay attached, never auto-cancelled by the iCal sweep, projects to the shared GCal, rides the notify queue and detectors normally. Marked notified (she confirmed 11:00 in writing twice); `confirm_no_booking:Itzel:2026-09-27` resolved by existence rather than dismissal. Reconciler after convergence: 11 findings, 0 needs-attention. Josh/Michelle still owe her a WhatsApp reply saying it's kept — the bridge is read-only by design.
 - 2026-08-21 12:00: **Council verdict on triage placement (4 Opus agents, unanimous): keep VPS triage; projection is not the primary cause.** Josh's hypothesis — that the triager working on projected rather than full facts is the structural weakness — attributed at most 1 of the 4 failures in that morning's digest, and that one was a detector defect first. The plan instead: reconciler defect fixes + desktop write-back + projection enrichment (ISC-349..357), with relocation gated on a 14-night measured ledger (ISC-358..360). Key reframe (Quinn): the desktop/VPS capability asymmetry is *turns-and-tools, not location* — a no-tools single-turn formatter cannot resolve anything wherever it runs. Withdrawn objection worth keeping (Odum): Pi-side triage on prepaid API credits with stage flags retained would survive both the billing audit and the attestation counter, so relocation stays a live option, not a dead one.
 - 2026-08-20 (wrap): **Structural — 110 criteria (ISC-239..348) were living inside `## Decisions`, not `## Criteria`.** The drift began with the 1.37.0 pass appending after the last decision bullet rather than into the criteria list, and four passes compounded it silently. Moved wholesale, with the ISC id set asserted identical before and after (351 both sides) and the bare ISC-239..314 run given a dated header — unheaded, it would have read as belonging to the 2026-08-09 block it now sits under. Worth recording because it is this project's own recurring shape: **a section-presence check scores a drifted file identically to a correct one**, which is exactly what ISC-184 says about the Test Strategy table. Nothing in the repo would have caught this; it surfaced only because a reconcile printed the section boundaries.
@@ -839,6 +870,13 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
 - 2026-08-03 13:10: Left ISC-184 **failing on purpose** rather than backfilling 110 Test Strategy rows at wrap-up. Writing a `check | threshold | tool` line for ISC-86..155 today would mean inventing probes for work verified in earlier sessions whose actual evidence I did not observe — a table full of plausible retroactive entries is strictly worse than a gap that is visible and counted, because it converts a known unknown into a confident wrong. The honest remediation is per-increment: when a run touches an old ISC, give it a row then, from real evidence. The counter is the backlog. Rejected alternative: mark ISC-184 `[x]` on the grounds that the *gate* now exists and today's rows are complete — that is completion-by-format bias, the failure GPT-5.5 named on the financial ISA, and the criterion says every ISC has a row, not that a checker exists.
 
 ## Changelog
+
+### 2026-08-23 — the assignment gate was the only reader of the ask
+
+- 2026-08-23 | conjectured: gating host `schedule_assertion`s at 0.85 (2026-08-20) made the reconciler safe from host questions, and nothing of value was lost — a question is not a schedule fact.
+  refuted by: the Aug 23 digest. "Sept 2 — assign a cleaner" reached the phone while the Pi held "if you're free on Sept 2?" (0.75, Itzel) from the day before; the gate's only consumer was the assigning detector, so rejecting the fact for assignment also erased it as evidence of outreach.
+  learned: one fact can answer two questions with opposite error costs — "should I assign on this?" (high bar) and "has anyone been asked?" (low bar, read-only). A single gate serves the first and starves the second. Separate the readers, not the vocabulary; the extractor's confidence measures *assertion-ness*, which is exactly why real asks score ~0.75.
+  criterion now: ISC-362..373 (derived outreach state at 0.5, assignment gate unchanged, `notify_ack` gated at 0.85 so the low reader never leaks into "told").
 
 ### 2026-08-21 — the subject rule swallowed the review queue
 
@@ -1136,6 +1174,17 @@ Adjacent open item: ISC-335 (dismissal consulted during merge) belongs in the sa
   criterion now: no new ISC — reaffirms the existing transcript-ingest design; bridge backfill window reverted to the known-good 15s.
 
 ## Verification
+
+### 1.41.0 / 1.41.1 — outreach state, verified live end-to-end (2026-08-23)
+
+- ISC-362..368: `scripts/test_outreach.py` 21/21; fresh `/reconcile/run` on the Pi at 10:43 returned the Sept 2 finding with `decision: wait`, `why: "booking needs a cleaner · waiting on Itzel — asked 2026-08-22 (1 day)"`, `outreach: {asked, Itzel, 2026-08-22, 1}`.
+- ISC-369: bot `bun test` 114/114 (266 repo-wide); deployed `src/cleaning.ts` sha matches git HEAD on the VPS; service active.
+- ISC-370: `/digest/run` 17:44 → VPS journal body: "Sept 2 (2026) — booking still unassigned; waiting on Itzel — asked Aug 22 (2026) (1 day) — nudge in a couple of days". Prompt wording then tightened to "asked Aug 22, 2026 (1 day)" and redeployed.
+- ISC-371: `scripts/test_notify_ack.py` 23/23 incl. the real Aug 22 record at 0.75 → no ack; 0.85 still acks; tentative never acks; legacy confidence-less records unchanged.
+- ISC-372: `ha apps info` after 1.41.1 update: `version 1.41.1, state started, outreach_min_confidence 0.5`.
+- ISC-373: corpus dump — 216 host assertions ≥0.85, 26 in [0.5,0.85); ~11 genuine asks, the rest same-day logistics on assigned cleanings or past dates; no modal/future phrasing ("I'll ask her") present.
+- ISC-374: open — ledger nights 3–5.
+- All 23 add-on suites green after the change (the two with noisy stdout confirmed by their `OK` lines).
 
 ### The confirmation that ratified the wrong time (2026-08-09) — diagnostic evidence
 
