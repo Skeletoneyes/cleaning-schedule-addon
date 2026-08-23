@@ -110,6 +110,13 @@ DIGEST_TIME = OPTIONS.get("digest_time", "08:00")
 # comment at the `persisting` filter for why this exists.
 REPEAT_HORIZON_DAYS = int(OPTIONS.get("repeat_horizon_days", 21))
 
+# Rollback lever for the outreach detector (1.41.1). The detector reads host
+# schedule_assertions at 0.5 on purpose (questions score ~0.75); set this to
+# 0.85 to ignore questions, or above 1.0 to switch the detector off — both
+# without a redeploy. Pure module constant, overridden at startup.
+reconcile_mod.OUTREACH_MIN_CONFIDENCE = float(
+    OPTIONS.get("outreach_min_confidence", reconcile_mod.OUTREACH_MIN_CONFIDENCE))
+
 # How far past a review item's subject date it stays in the queue awaiting a
 # human decision. Conflicts already self-suppress after RECONCILER STALE_DAYS
 # (5); the review queue had no equivalent and simply accumulated.
