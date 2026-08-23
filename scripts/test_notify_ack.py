@@ -202,5 +202,37 @@ class SelfDeclineTests(unittest.TestCase):
         self.assertIn("not available before 3pm", out)
 
 
+
+class AskIsNotTelling(unittest.TestCase):
+    """1.41.0 (ISC-38): a host QUESTION extracts as a schedule_assertion at
+    ~0.75 — the real Aug 22 record: "if you're free on Sept 2?". Asking is not
+    informing; below the assertion threshold the fact must not ack anyone."""
+
+    def _with_conf(self, conf, tentative=False):
+        f = facts("b", "Darya", ev="are you free on Aug 3?")
+        f["b"]["facts"][0]["confidence"] = conf
+        f["b"]["facts"][0]["tentative"] = tentative
+        messages = {"a": msg("a", ITZEL_CHAT, "2026-07-30T08:53:00"),
+                    "b": msg("b", DARYA_CHAT, "2026-07-30T09:57:00")}
+        f.update(facts("a", "Darya", ev="I will contact Daria to ask"))
+        f["a"]["facts"][0]["confidence"] = 0.9
+        return na.find_ack_evidence(booking(), f, messages, GROUPS)
+
+    def test_a_question_at_075_does_not_tell_the_assigned_cleaner(self):
+        ev = self._with_conf(0.75)
+        self.assertFalse(ev["ok"])
+        self.assertNotIn("assigned", ev["sides"])
+
+    def test_a_statement_at_threshold_still_tells_her(self):
+        self.assertTrue(self._with_conf(0.85)["ok"])
+
+    def test_a_tentative_statement_does_not_tell_her(self):
+        self.assertFalse(self._with_conf(0.95, tentative=True)["ok"])
+
+    def test_a_record_without_confidence_is_unchanged(self):
+        """Legacy fixtures and any pre-confidence record keep today's behaviour."""
+        ev = self._with_conf(None)
+        self.assertTrue(ev["ok"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

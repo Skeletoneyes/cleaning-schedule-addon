@@ -43,6 +43,10 @@ from datetime import datetime, timedelta, timezone
 # more comparisons in `reconcile.py`. A second copy is how they drift apart.
 from reconcile import as_instant as _as_instant  # noqa: E402
 
+# Mirrors reconcile.CONFIRM_THRESHOLD: a host fact below this is an ask, not a
+# statement, and must never mark a cleaner as informed.
+ASSERTION_THRESHOLD = 0.85
+
 
 def _fact_time(msg):
     return (msg or {}).get("timestamp") or ""
@@ -145,6 +149,17 @@ def find_ack_evidence(booking, facts_records, messages_by_id, group_of_cleaner):
                     continue
 
                 if f.get("kind") != "schedule_assertion":
+                    continue
+                # A question is not a notification. The extractor files a
+                # host QUESTION ("are you free Sept 2?") as a schedule_assertion
+                # at ~0.75 and a statement at ≥0.85 — the same line the
+                # assigning detector draws. Below it, or flagged tentative,
+                # the host has asked, not told (1.41.0; the outreach detector
+                # is what reads those asks).
+                if f.get("tentative"):
+                    continue
+                conf = f.get("confidence")
+                if conf is not None and conf < ASSERTION_THRESHOLD:
                     continue
                 verdict = (
                     _classify(f.get("cleaner"), f.get("target_time"), displaced,

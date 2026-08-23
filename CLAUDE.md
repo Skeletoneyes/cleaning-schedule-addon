@@ -359,6 +359,26 @@ idempotent.
   runs when `gcal_enabled`.
 - `_drift` — reshapes the notify-queue into findings (new / changed /
   cancelled / unassigned).
+- `_outreach` (1.41.0) — for each **unassigned** cleaning inside
+  `UNASSIGNED_URGENT_DAYS`, the state of the *ask*: `unasked` (no host fact
+  names the date), `asked` (host named the date to cleaner X and X has said
+  nothing about it since), `declined` (X's latest answer after the ask is a
+  decline). Reads host `schedule_assertion`s at `OUTREACH_MIN_CONFIDENCE`
+  (0.5) — deliberately **below** the 0.85 assignment gate, because a question
+  and a statement are the same event for outreach (the date was put in front
+  of her) and this detector never writes. A held `confirm` suppresses it
+  entirely (the approve path owns that). Merges into `drift_unassigned`, so the
+  digest reads "booking needs a cleaner · waiting on Itzel — asked 2026-08-22
+  (1 day)". `asked` within `OUTREACH_PATIENCE_DAYS` (3) overrides the merged
+  decision to **`wait`** — but never inside `UNREAD_URGENT_DAYS` (7) of the
+  clean (fail-closed). Crosses to the VPS as `outreach: {state, cleaner,
+  asked_on, days_waiting}` — closed shape, no text. An ask older than
+  `OUTREACH_ASK_WINDOW_DAYS` (90) before the clean does not count (April bulk
+  lists). Why it exists: on 2026-08-23 the Sept 2 bullet said "assign a
+  cleaner" while the Pi already held the unanswered Aug 22 ask to Itzel.
+  Tests: `scripts/test_outreach.py`. ⚠️ The same release gates `notify_ack`
+  on the 0.85 threshold + `tentative` (`scripts/test_notify_ack.py` §
+  AskIsNotTelling): a host *question* never marks a cleaner as told.
 - `_facts_vs_bookings` — confirm/decline facts ⇄ booking state; emits
   `unrecorded_confirmation`, `contested_cleaner`,
   `decline_still_assigned`, `confirm_no_booking`.
@@ -421,7 +441,8 @@ Three rules, each of which cost something to learn:
 
 Ranking is then by `decision` — `adjudicate` (two claims held, a human must
 pick) → `approve` (the answer is held, one tap) → `investigate` (nothing held,
-go find out) → `observe`. Severity survives as a secondary sort key and as the
+go find out) → `wait` (asked, answer pending — patience, not action; 1.41.0)
+→ `observe`. Severity survives as a secondary sort key and as the
 repeat-filter input, but no longer decides what Josh reads first. Unknown kinds
 fall to `investigate`, which fails toward asking.
 
