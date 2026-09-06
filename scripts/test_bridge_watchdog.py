@@ -61,10 +61,11 @@ class WatchdogTests(unittest.TestCase):
 
     def test_healthy_bridge_produces_no_findings(self):
         self._wire(FakeSupervisor("started"))
-        state = wd.check(self.path, "slug", "token")
+        t = datetime(2026, 9, 6, 12, 0, 0)
+        state = wd.check(self.path, "slug", "token", now=t)
         self.assertEqual(state["last_state"], "started")
         self.assertIsNone(state["outage"])
-        self.assertEqual(wd.findings(state, self.today), [])
+        self.assertEqual(wd.findings(state, self.today, now=t), [])
 
     def test_stopped_bridge_is_started_and_flagged(self):
         sup = FakeSupervisor("stopped")
@@ -420,12 +421,16 @@ class LinkStateTests(unittest.TestCase):
 
     def test_finding_is_gated_on_the_threshold_so_deploys_do_not_cry_wolf(self):
         state = self._check(None)
-        self.assertEqual(wd.findings(state, self.today), [],
+        # `findings()` MUST be given the same clock as `check()`. Omitting it
+        # defaults to the real wall clock, so this asserted "no finding" while
+        # the verdict was computing hours of downtime against a `down_since`
+        # that the test had pinned to noon — green at noon, red by teatime.
+        self.assertEqual(wd.findings(state, self.today, now=self.now), [],
                          "a 1.3 bridge behind a 1.42 tracker must not alarm "
                          "at zero minutes during a rolling deploy")
         t = self.now + timedelta(minutes=61)
         state = self._check(None, now=t)
-        kinds = [f["kind"] for f in wd.findings(state, self.today)]
+        kinds = [f["kind"] for f in wd.findings(state, self.today, now=t)]
         self.assertIn("bridge_health", kinds)
 
 
@@ -481,9 +486,10 @@ class HealCapTests(unittest.TestCase):
     def test_cap_reports_unhealable_not_restarted(self):
         for n in range(8):
             self._pass(n)
+        end = self.now + timedelta(minutes=5 * 7)
         state = wd.load_state(self.path)
         self.assertIsNotNone(state["outage"]["escalated_at"])
-        kinds = [f["kind"] for f in wd.findings(state, self.today)]
+        kinds = [f["kind"] for f in wd.findings(state, self.today, now=end)]
         self.assertIn("bridge_health", kinds)
 
     def test_counter_resets_after_recovery_so_a_later_outage_still_heals(self):

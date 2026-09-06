@@ -280,5 +280,60 @@ class PhoneEscalation(unittest.TestCase):
         self.assertIn("return False", body)
 
 
+class OneClock(unittest.TestCase):
+    """app.py cannot be imported without the add-on's runtime deps, so these
+    are source assertions — the same technique the phone-escalation tripwire
+    above uses. The behaviour underneath them is unit-tested in test_clock.py.
+    """
+
+    def _src(self):
+        return (APP_DIR / "app.py").read_text(encoding="utf-8")
+
+    def test_statement_recency_is_event_time_not_processing_time(self):
+        """The bug: `extracted_at` is when facts extraction RAN. A transcript
+        pasted today stamps every historical line with today, so an old
+        statement outranks a newer live one and overwrites it."""
+        src = self._src()
+        self.assertIn("said_at[m[\"id\"]] = m.get(\"timestamp\")", src,
+                      "the message's own timestamp must be collected")
+        self.assertIn("stated = said_at.get(msg_id)", src,
+                      "recency must key off when it was SAID")
+        self.assertNotIn("stated = rec.get(\"extracted_at\") or \"\"\n", src,
+                         "processing time must no longer be the ordering key")
+
+    def test_recency_compares_parsed_instants_not_raw_strings(self):
+        """Until every row is migrated the store mixes `...Z` with naive local,
+        and comparing those as text orders them by spelling."""
+        src = self._src()
+        self.assertIn("order = _ts_utc(stated)", src)
+        self.assertIn("if key not in best or order > best[key][0]:", src)
+
+    def test_transcript_timestamps_are_stored_as_utc(self):
+        """A WhatsApp export carries local wall time and says nothing about it."""
+        src = self._src()
+        self.assertIn('"timestamp": _utc_iso(ts),', src)
+        self.assertNotIn('"timestamp": ts.isoformat(timespec="seconds"),', src)
+
+    def test_the_live_path_never_writes_a_naive_timestamp(self):
+        src = self._src()
+        self.assertNotIn('ts or datetime.now().isoformat(timespec="seconds")', src)
+        self.assertIn('ts or _utc_iso(datetime.now(tz=timezone.utc))', src)
+
+    def test_the_migration_exists_and_is_idempotent(self):
+        src = self._src()
+        self.assertIn("def _migrate_timestamps_to_utc()", src)
+        self.assertIn('data.get("timestamps_utc_migrated")', src,
+                      "must not re-run on every boot")
+        self.assertIn("clock_mod.has_zone(raw)", src,
+                      "already-zoned rows must be left alone")
+
+    def test_zone_logic_is_not_duplicated_in_app(self):
+        """One source of truth. app.py delegates; clock.py decides."""
+        src = self._src()
+        self.assertNotIn("ZoneInfo(", src,
+                         "timezone construction belongs in clock.py")
+        self.assertIn("import clock as clock_mod", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,11 +16,17 @@ from __future__ import annotations
 import ast
 import sys
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "cleaning-tracker"
+
+# The real clock module, not a stub. `_msg_local_day` delegates its timezone
+# handling there (2026-09-06), and the harness's own rule applies: a stub would
+# let the two drift apart without failing anything.
+sys.path.insert(0, str(APP_DIR))
+import clock as clock_mod
 sys.path.insert(0, str(APP_DIR))
 
 import facts as facts_mod  # noqa: E402  (pure stdlib + requests)
@@ -44,6 +50,11 @@ NS = {
     "FACTS_HISTORY_WINDOW": 30, "FACTS_HISTORY_DAYS": 45, "FACTS_HISTORY_MAX": 120,
     "PARSE_HISTORY_WINDOW": 50, "PARSE_HISTORY_DAYS": 30, "PARSE_HISTORY_MAX": 150,
     "CROSS_FACTS_BACK_DAYS": 7, "CROSS_FACTS_FWD_DAYS": 150, "CROSS_FACTS_MAX_LINES": 80,
+    "clock_mod": clock_mod,
+    # `_ts_utc` is a module-level alias in app.py, not a def, so `_extract`
+    # (which walks FunctionDefs) cannot pull it in.
+    "_ts_utc": clock_mod.ts_utc,
+    "timezone": timezone,
 }
 _extract(["_msg_day", "_window_by_count_or_days", "_facts_history",
           "_cross_chat_facts"], NS)
@@ -196,6 +207,64 @@ class CrossChatFactsTests(unittest.TestCase):
         rows = cross_chat_facts(data, m("2026-08-02", group=DARIA))
         self.assertEqual(len(rows), 1, "same date+cleaner+kind collapses to one row")
         self.assertEqual(rows[0]["time"], "11:00", "the July statement supersedes March")
+
+    def test_a_backfilled_old_statement_does_not_beat_a_newer_live_one(self):
+        """The 2026-09-06 bug, and the reason the test above never caught it:
+        it gave `timestamp` and `extracted_at` the same value, so it passed
+        under either ordering.
+
+        Here they disagree the way a real backfill makes them disagree. She
+        said "11:00" on July 21 and it came in live. She said "09:00" back in
+        March, and that line only reached us today, in a pasted transcript —
+        so its `extracted_at` is the newest value in the store. Ordering by
+        extraction time makes MARCH win.
+        """
+        data = _facts_data()
+        data["messages"].append({"id": "live", "group": ITZEL,
+                                 "timestamp": "2026-07-21T10:00:00"})
+        data["message_facts"]["live"] = {
+            "extracted_at": "2026-07-21T10:00:05",
+            "facts": [{"kind": "confirm", "target_date": "2026-08-03",
+                       "target_time": "11:00", "cleaner": "Itzel", "confidence": 0.9}],
+        }
+        data["messages"].append({"id": "backfilled", "group": ITZEL,
+                                 "timestamp": "2026-03-04T09:00:00"})
+        data["message_facts"]["backfilled"] = {
+            "extracted_at": "2026-09-06T12:00:00",     # pasted today
+            "facts": [{"kind": "confirm", "target_date": "2026-08-03",
+                       "target_time": "09:00", "cleaner": "Itzel", "confidence": 0.9}],
+        }
+        rows = cross_chat_facts(data, m("2026-08-02", group=DARIA))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["time"], "11:00",
+                         "July was said later than March, whatever order we "
+                         "happened to read them in")
+        self.assertEqual(rows[0]["stated"], "2026-07-21",
+                         "the reported date is when she SAID it, not when we "
+                         "processed it")
+
+    def test_recency_survives_the_two_stored_timestamp_formats(self):
+        """Live rows are `...Z` UTC, un-migrated backfill rows are naive local.
+        Comparing those as text orders them by spelling."""
+        data = _facts_data()
+        data["messages"].append({"id": "utc", "group": ITZEL,
+                                 "timestamp": "2026-07-21T02:00:00Z"})   # Jul 20, 19:00 local
+        data["message_facts"]["utc"] = {
+            "extracted_at": "2026-07-21T02:00:00",
+            "facts": [{"kind": "confirm", "target_date": "2026-08-03",
+                       "target_time": "19:00", "cleaner": "Itzel", "confidence": 0.9}],
+        }
+        data["messages"].append({"id": "naive", "group": ITZEL,
+                                 "timestamp": "2026-07-21T09:00:00"})    # Jul 21, 09:00 local
+        data["message_facts"]["naive"] = {
+            "extracted_at": "2026-07-21T09:00:00",
+            "facts": [{"kind": "confirm", "target_date": "2026-08-03",
+                       "target_time": "09:00", "cleaner": "Itzel", "confidence": 0.9}],
+        }
+        rows = cross_chat_facts(data, m("2026-08-02", group=DARIA))
+        self.assertEqual(rows[0]["time"], "09:00",
+                         "Jul 21 09:00 local is later than Jul 20 19:00 local, "
+                         "even though '2026-07-21T02:00:00Z' sorts first as text")
 
     def test_unclear_facts_are_dropped(self):
         data = _facts_data(kind="unclear")

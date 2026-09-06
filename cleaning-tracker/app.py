@@ -13,7 +13,7 @@ import re
 import socket
 import threading
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
@@ -25,6 +25,7 @@ import bridge_watchdog as watchdog_mod
 import facts as facts_mod
 import notify_ack as notify_ack_mod
 import gcal as gcal_mod
+import clock as clock_mod
 import reconcile as reconcile_mod
 
 app = Flask(__name__)
@@ -867,38 +868,23 @@ def _merge_ical_events(cal):
 def _msg_local_day(msg, default=None):
     """The LOCAL calendar day a message was sent, or `default`.
 
-    Distinct from `_msg_day`, which slices `ts[:10]` off the raw string and is
-    correct for the history windows that use it (day-granularity, ±1 day is
-    noise). Here ±1 day is the whole answer: this date anchors the word
-    "today" in both the prompt header and the candidate list, and live
-    timestamps are UTC (`2026-08-05T19:12:30.000Z`). Vancouver is UTC-7/8, so
-    every message sent after ~17:00 local carries TOMORROW's UTC date — an
-    evening "see you tomorrow" would resolve two days out. Backfilled
-    timestamps are naive local already and are passed through untouched.
+    Was a near-duplicate of `_msg_day` with its own inline ZoneInfo. The two
+    genuinely differed once, because `_msg_day` sliced `ts[:10]` off the raw
+    string — which is wrong for any evening message, since 9pm in Vancouver is
+    already tomorrow in UTC. Now that `_msg_day` parses properly they are the
+    same question, so both go through clock.py and the timezone is constructed
+    in exactly one place.
     """
-    ts = (msg or {}).get("timestamp") if isinstance(msg, dict) else msg
-    if not ts or len(ts) < 10:
-        return default
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except ValueError:
+    ts = msg.get("timestamp") if isinstance(msg, dict) else msg
+    day = clock_mod.local_day(ts)
+    if day is not None:
+        return day
+    if isinstance(ts, str) and len(ts) >= 10:
         try:
-            return date.fromisoformat(str(ts)[:10])
+            return date.fromisoformat(ts[:10])
         except ValueError:
             return default
-    if dt.tzinfo is None:
-        return dt.date()
-    try:
-        import zoneinfo
-        return dt.astimezone(zoneinfo.ZoneInfo(gcal_mod.LOCAL_TZ)).date()
-    except Exception:
-        return dt.date()
-
-
-
-
-
-
+    return default
 def _date_header(msg, today=None):
     """The dating preamble every model prompt in this pipeline opens with.
 
@@ -1105,20 +1091,70 @@ CROSS_FACTS_FWD_DAYS = 150
 CROSS_FACTS_MAX_LINES = 80
 
 
-def _msg_day(m):
-    """Day-granularity date from a message timestamp, or None.
+# One clock: event time, UTC, everywhere. The reasoning, and the three-clock
+# bug this replaced, are documented in clock.py — including why a naive value
+# is read as local rather than UTC.
+_ts_utc = clock_mod.ts_utc
+_utc_iso = clock_mod.utc_iso
 
-    Deliberately string-sliced rather than parsed: stored timestamps mix
-    `2026-07-28T21:08:38.000Z` (live) with `2026-07-28T14:08:00` (backfill),
-    and day precision is all the history windows need.
+
+def _migrate_timestamps_to_utc():
+    """One-shot: convert stored naive-local timestamps to UTC. Idempotent.
+
+    Backfilled rows were written with the naive wall time straight out of the
+    WhatsApp export, while live rows were UTC — so the two sat seven to eight
+    hours apart in the same list, and every comparison across them was wrong.
+    Anything already carrying an offset or a `Z` is left alone, so this is safe
+    to run repeatedly and safe to run on a store that is already clean.
+
+    ⚠️ Message IDs are deliberately NOT touched. A backfill id is
+    `sha1(timestamp|sender|text)`, so the ids of already-stored rows were
+    derived from the naive value. Recomputing them would mean rewriting every
+    `message_facts` key in the same breath, on live data, to fix a re-paste
+    case that the structured write path is going to remove anyway. The cost of
+    leaving them: re-pasting a transcript that was ingested BEFORE this
+    migration will not dedupe against those old rows. Trim the paste to the
+    window you actually need and it does not arise.
+    """
+    with DATA_LOCK:
+        data = load_data()
+        if data.get("timestamps_utc_migrated"):
+            return 0
+        changed = 0
+        for m in data.get("messages", []) or []:
+            raw = m.get("timestamp")
+            if not isinstance(raw, str) or not raw:
+                continue
+            if clock_mod.has_zone(raw):
+                continue          # already carries a zone
+            dt = _ts_utc(raw)     # naive is read as local, which is what it is
+            if dt is None:
+                continue
+            m["timestamp"] = _utc_iso(dt)
+            changed += 1
+        data["timestamps_utc_migrated"] = True
+        save_data(data)
+        return changed
+
+
+def _msg_day(m):
+    """Local calendar day for a message, or None.
+
+    This used to slice the first ten characters off the stored string. That is
+    wrong for any evening message: 9pm in Vancouver is stored as the NEXT day
+    in UTC. See clock.py.
     """
     ts = m.get("timestamp") if isinstance(m, dict) else m
-    if not ts or len(ts) < 10:
-        return None
-    try:
-        return date.fromisoformat(ts[:10])
-    except ValueError:
-        return None
+    day = clock_mod.local_day(ts)
+    if day is not None:
+        return day
+    # Last resort for a value too malformed to parse at all.
+    if isinstance(ts, str) and len(ts) >= 10:
+        try:
+            return date.fromisoformat(ts[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _window_by_count_or_days(prior, count, days, hard_max, target):
@@ -1205,9 +1241,11 @@ def _cross_chat_facts(data, target, now=None):
     hi = (tgt_day + timedelta(days=CROSS_FACTS_FWD_DAYS)).isoformat()
 
     group_of = {}
+    said_at = {}
     for m in data.get("messages", []) or []:
         if m.get("id"):
             group_of[m["id"]] = m.get("group")
+            said_at[m["id"]] = m.get("timestamp") or ""
     labels = data.get("group_labels", {}) or {}
 
     # Keyed on (date, cleaner, kind) keeping the most recently stated — an old
@@ -1217,7 +1255,21 @@ def _cross_chat_facts(data, target, now=None):
         grp = group_of.get(msg_id)
         if not grp or grp == tgt_group:
             continue
-        stated = rec.get("extracted_at") or ""
+        # WHEN IT WAS SAID, not when we got round to reading it.
+        #
+        # This was `rec["extracted_at"]` — the moment facts extraction ran.
+        # For live traffic that tracks the send time closely enough to hide the
+        # bug. For a backfill it does not: every statement in a transcript
+        # pasted today gets today's `extracted_at`, so a cleaner's OLD message
+        # outranks her newer live one and overwrites the correct answer. The
+        # message's own timestamp is the only defensible ordering key, and it
+        # was sitting in the row this loop already joins against for `group`.
+        stated = said_at.get(msg_id) or rec.get("extracted_at") or ""
+        # Compare PARSED instants, never the raw strings. Until the migration
+        # below has run everywhere, this store holds both `...Z` UTC and naive
+        # local values, and comparing those as text orders them by their
+        # spelling rather than by when they happened.
+        order = _ts_utc(stated) or datetime.min.replace(tzinfo=timezone.utc)
         for f in rec.get("facts", []) or []:
             tgt_date = f.get("target_date")
             kind = f.get("kind")
@@ -1227,14 +1279,14 @@ def _cross_chat_facts(data, target, now=None):
             if not (lo <= tgt_date <= hi):
                 continue
             key = (tgt_date, cleaner, kind)
-            if key not in best or stated > best[key][0]:
-                best[key] = (stated, {
+            if key not in best or order > best[key][0]:
+                best[key] = (order, {
                     "date": tgt_date,
                     "cleaner": cleaner,
                     "kind": kind,
                     "time": f.get("target_time"),
                     "chat": labels.get(grp) or grp,
-                    "stated": stated[:10],
+                    "stated": (_msg_day({"timestamp": stated}) or date.min).isoformat(),
                 })
 
     # Truncate by PROXIMITY to the message's own date, then present
@@ -3523,7 +3575,7 @@ def whatsapp_inbound():
             return jsonify({"status": "duplicate", "id": msg_id})
         data["messages"].append({
             "id": msg_id,
-            "timestamp": ts or datetime.now().isoformat(timespec="seconds"),
+            "timestamp": ts or _utc_iso(datetime.now(tz=timezone.utc)),
             "sender": sender,
             "group": group,
             "text": text,
@@ -3746,13 +3798,11 @@ def admin_fix_parse_errors():
         for m in data.get("messages", []):
             if not m.get("parse_error"):
                 continue
+            # A naive value here is LOCAL, not UTC. Stamping it as UTC — which
+            # this did — shifted every backfilled row seven hours earlier and
+            # could age it past the cutoff a boundary case would depend on.
             ts_raw = m.get("timestamp") or ""
-            try:
-                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except (ValueError, AttributeError):
-                ts = None
+            ts = clock_mod.ts_utc(ts_raw)
             old = (ts < cutoff) if ts else (ts_raw < cutoff.strftime("%Y-%m-%d") if ts_raw else True)
             if old:
                 m["review_state"] = "ignored"
@@ -3995,8 +4045,10 @@ def _review_subject_date(msg, bookings):
         d = cleaning_date_for(b) or b.get("end")
         if d:
             return str(d)[:10]
-    ts = msg.get("timestamp") or ""
-    return ts[:10] if len(ts) >= 10 else None
+    # Local day, not a slice of the stored UTC string — an evening message is
+    # already tomorrow in UTC and would be labelled with the wrong date.
+    day = _msg_local_day(msg)
+    return day.isoformat() if day else None
 
 
 def expire_stale_reviews(today=None, days=REVIEW_EXPIRY_DAYS):
@@ -5414,7 +5466,14 @@ _TS_FORMATS = [
 def _parse_transcript_ts(bracket):
     """Try every known WhatsApp export timestamp layout. Handles both
     [YYYY-MM-DD, HH:MM:SS AM/PM] and [H:MM AM/PM, M/D/YYYY] (and variants
-    with/without seconds, 24h, dashes/slashes)."""
+    with/without seconds, 24h, dashes/slashes).
+
+    Returns a NAIVE datetime holding LOCAL wall time — that is what a WhatsApp
+    export contains, and there is nothing in the file to say otherwise. The
+    caller converts to UTC via `_utc_iso` before storing. Storing the naive
+    value directly, which is what happened until 2026-09-06, put every
+    backfilled message seven to eight hours away from every live one.
+    """
     normalized = (bracket
                   .replace("a.m.", "AM").replace("p.m.", "PM")
                   .replace("A.M.", "AM").replace("P.M.", "PM"))
@@ -5453,7 +5512,7 @@ def _parse_whatsapp_transcript(text):
             ts = _parse_transcript_ts(m.group(1))
             if ts:
                 out.append({
-                    "timestamp": ts.isoformat(timespec="seconds"),
+                    "timestamp": _utc_iso(ts),
                     "sender": m.group(2).strip(),
                     "text": m.group(3),
                 })
@@ -5465,7 +5524,7 @@ def _parse_whatsapp_transcript(text):
                 body = _ANDROID_BODY_RE.match(m2.group(2))
                 if body:
                     out.append({
-                        "timestamp": ts.isoformat(timespec="seconds"),
+                        "timestamp": _utc_iso(ts),
                         "sender": body.group(1).strip(),
                         "text": body.group(2),
                     })
@@ -5979,6 +6038,11 @@ if __name__ == "__main__":
             print("Sync complete!")
     else:
         print("No iCal URL configured — skipping initial sync.")
+
+    migrated = _migrate_timestamps_to_utc()
+    if migrated:
+        print(f"[migrate] {migrated} backfilled message timestamp(s) converted "
+              f"from local time to UTC")
 
     ensure_workers_started()
     print("WhatsApp parse workers started (pool=2).")
