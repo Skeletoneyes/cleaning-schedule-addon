@@ -12,17 +12,17 @@ import ast
 import types
 import sys
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "cleaning-tracker"
 
-# The real clock module, not a stub. `_msg_local_day` delegates its timezone
-# handling there (2026-09-06), and the harness's own rule applies: a stub would
-# let the two drift apart without failing anything.
+# The clock helpers live in app.py (see the "One clock" block there), so they
+# are extracted alongside everything else rather than stubbed.
 sys.path.insert(0, str(APP_DIR))
-import clock as clock_mod
+import zoneinfo
+import gcal as _gcal
 
 
 def _extract(names, ns):
@@ -43,8 +43,8 @@ def _extract(names, ns):
 # a stub here would let the two drift apart without failing anything.
 NS = {"date": date, "datetime": datetime, "timedelta": timedelta,
       "cleaning_date_for": lambda b: b.get("end"),
-      "gcal_mod": types.SimpleNamespace(LOCAL_TZ="America/Vancouver"), "clock_mod": clock_mod}
-_extract(["_review_subject_date", "_msg_local_day", "_date_header"], NS)
+      "gcal_mod": types.SimpleNamespace(LOCAL_TZ="America/Vancouver"), "zoneinfo": zoneinfo, "timezone": timezone, "LOCAL_ZONE": zoneinfo.ZoneInfo(_gcal.LOCAL_TZ)}
+_extract(["_review_subject_date", "_msg_local_day", "_date_header", "_ts_utc", "_utc_iso", "_local_day"], NS)
 subject_date = NS["_review_subject_date"]
 date_header = NS["_date_header"]
 

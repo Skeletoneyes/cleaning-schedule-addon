@@ -13,6 +13,7 @@ import re
 import socket
 import threading
 import time
+import zoneinfo
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -25,7 +26,6 @@ import bridge_watchdog as watchdog_mod
 import facts as facts_mod
 import notify_ack as notify_ack_mod
 import gcal as gcal_mod
-import clock as clock_mod
 import reconcile as reconcile_mod
 
 app = Flask(__name__)
@@ -876,7 +876,7 @@ def _msg_local_day(msg, default=None):
     in exactly one place.
     """
     ts = msg.get("timestamp") if isinstance(msg, dict) else msg
-    day = clock_mod.local_day(ts)
+    day = _local_day(ts)
     if day is not None:
         return day
     if isinstance(ts, str) and len(ts) >= 10:
@@ -1091,11 +1091,71 @@ CROSS_FACTS_FWD_DAYS = 150
 CROSS_FACTS_MAX_LINES = 80
 
 
-# One clock: event time, UTC, everywhere. The reasoning, and the three-clock
-# bug this replaced, are documented in clock.py — including why a naive value
-# is read as local rather than UTC.
-_ts_utc = clock_mod.ts_utc
-_utc_iso = clock_mod.utc_iso
+# ── One clock ───────────────────────────────────────────────────────────────
+#
+# Until 2026-09-06 this store held timestamps on three different clocks: UTC
+# from the bridge, naive LOCAL from WhatsApp exports, and `extracted_at` (the
+# moment facts extraction RAN) used as if it were statement time. The third
+# silently let an OLD backfilled statement outrank a NEWER live one, because a
+# transcript pasted today stamps every line in it with today.
+#
+# The rule now: event time, in UTC, everywhere. Anything needing a calendar day
+# converts to local first — slicing ten characters off a UTC string gets the
+# day wrong for any evening message.
+#
+# These live in app.py ON PURPOSE. A separate module has to be added to the
+# Dockerfile's explicit COPY list, and getting that wrong boots the add-on into
+# ModuleNotFoundError — which is what happened on the first attempt at this
+# change and took the tracker down for twenty minutes. The testability argument
+# for splitting them out was wrong anyway: the ast harness in
+# scripts/test_review_expiry.py already extracts functions from this file
+# without importing Flask.
+
+LOCAL_ZONE = zoneinfo.ZoneInfo(gcal_mod.LOCAL_TZ)
+
+
+def _ts_utc(raw):
+    """Parse any stored timestamp into an aware UTC datetime, or None.
+
+    A naive value is read as LOCAL, because that is what naive values in this
+    store have always been. Reading them as UTC — which `admin_fix_parse_errors`
+    did — moves them seven hours into the past.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_ZONE)
+    return dt.astimezone(timezone.utc)
+
+
+def _utc_iso(dt):
+    """Canonical stored form: UTC, `Z`-suffixed, second precision. Z-suffixed
+    UTC also sorts correctly as plain text, which several call sites rely on."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_ZONE)
+    return (dt.astimezone(timezone.utc)
+              .isoformat(timespec="seconds").replace("+00:00", "Z"))
+
+
+def _local_day(raw):
+    """The LOCAL calendar day a timestamp falls on, or None."""
+    dt = _ts_utc(raw)
+    return None if dt is None else dt.astimezone(LOCAL_ZONE).date()
+
+
+def _has_zone(raw):
+    """True if the stored string already carries an offset or `Z`. Makes the
+    migration idempotent and safe on a store that was never broken."""
+    if not raw or not isinstance(raw, str):
+        return False
+    tail = raw.strip()[10:]
+    return tail.endswith("Z") or "+" in tail or "-" in tail
 
 
 def _migrate_timestamps_to_utc():
@@ -1125,7 +1185,7 @@ def _migrate_timestamps_to_utc():
             raw = m.get("timestamp")
             if not isinstance(raw, str) or not raw:
                 continue
-            if clock_mod.has_zone(raw):
+            if _has_zone(raw):
                 continue          # already carries a zone
             dt = _ts_utc(raw)     # naive is read as local, which is what it is
             if dt is None:
@@ -1145,7 +1205,7 @@ def _msg_day(m):
     in UTC. See clock.py.
     """
     ts = m.get("timestamp") if isinstance(m, dict) else m
-    day = clock_mod.local_day(ts)
+    day = _local_day(ts)
     if day is not None:
         return day
     # Last resort for a value too malformed to parse at all.
@@ -3802,7 +3862,7 @@ def admin_fix_parse_errors():
             # this did — shifted every backfilled row seven hours earlier and
             # could age it past the cutoff a boundary case would depend on.
             ts_raw = m.get("timestamp") or ""
-            ts = clock_mod.ts_utc(ts_raw)
+            ts = _ts_utc(ts_raw)
             old = (ts < cutoff) if ts else (ts_raw < cutoff.strftime("%Y-%m-%d") if ts_raw else True)
             if old:
                 m["review_state"] = "ignored"

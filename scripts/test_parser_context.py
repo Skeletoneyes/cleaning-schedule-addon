@@ -22,11 +22,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = ROOT / "cleaning-tracker"
 
-# The real clock module, not a stub. `_msg_local_day` delegates its timezone
-# handling there (2026-09-06), and the harness's own rule applies: a stub would
-# let the two drift apart without failing anything.
+# The clock helpers live in app.py (see the "One clock" block there), so they
+# are extracted alongside everything else rather than stubbed.
 sys.path.insert(0, str(APP_DIR))
-import clock as clock_mod
+import zoneinfo
+import gcal as _gcal
 sys.path.insert(0, str(APP_DIR))
 
 import facts as facts_mod  # noqa: E402  (pure stdlib + requests)
@@ -50,14 +50,12 @@ NS = {
     "FACTS_HISTORY_WINDOW": 30, "FACTS_HISTORY_DAYS": 45, "FACTS_HISTORY_MAX": 120,
     "PARSE_HISTORY_WINDOW": 50, "PARSE_HISTORY_DAYS": 30, "PARSE_HISTORY_MAX": 150,
     "CROSS_FACTS_BACK_DAYS": 7, "CROSS_FACTS_FWD_DAYS": 150, "CROSS_FACTS_MAX_LINES": 80,
-    "clock_mod": clock_mod,
-    # `_ts_utc` is a module-level alias in app.py, not a def, so `_extract`
-    # (which walks FunctionDefs) cannot pull it in.
-    "_ts_utc": clock_mod.ts_utc,
+    "zoneinfo": zoneinfo,
+    "LOCAL_ZONE": zoneinfo.ZoneInfo(_gcal.LOCAL_TZ),
     "timezone": timezone,
 }
 _extract(["_msg_day", "_window_by_count_or_days", "_facts_history",
-          "_cross_chat_facts"], NS)
+          "_cross_chat_facts", "_ts_utc", "_utc_iso", "_local_day"], NS)
 
 NS2 = _extract(["_sender_roles"], dict(NS))
 

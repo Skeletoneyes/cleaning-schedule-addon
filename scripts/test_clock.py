@@ -14,9 +14,32 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cleaning-tracker"))
+APP_DIR = Path(__file__).resolve().parent.parent / "cleaning-tracker"
+sys.path.insert(0, str(APP_DIR))
 
-import clock
+# Extracted from app.py rather than imported: app.py cannot be imported without
+# Flask, and these helpers deliberately live there rather than in their own
+# module — a new module has to be added to the Dockerfile's COPY list, and
+# getting that wrong took the tracker down on 2026-09-06.
+import ast
+import types
+import zoneinfo
+from datetime import datetime as _dt, timezone as _tz
+import gcal as gcal_mod
+
+_NS = {"datetime": _dt, "timezone": _tz, "zoneinfo": zoneinfo,
+       "LOCAL_ZONE": zoneinfo.ZoneInfo(gcal_mod.LOCAL_TZ)}
+_tree = ast.parse((APP_DIR / "app.py").read_text(encoding="utf-8"))
+_want = {"_ts_utc", "_utc_iso", "_local_day", "_has_zone"}
+_found = {n.name: n for n in _tree.body
+          if isinstance(n, ast.FunctionDef) and n.name in _want}
+assert set(_found) == _want, f"missing from app.py: {sorted(_want - set(_found))}"
+for _n in _want:
+    exec(compile(ast.Module(body=[_found[_n]], type_ignores=[]), "app.py", "exec"), _NS)
+
+clock = types.SimpleNamespace(ts_utc=_NS["_ts_utc"], utc_iso=_NS["_utc_iso"],
+                              local_day=_NS["_local_day"], has_zone=_NS["_has_zone"],
+                              LOCAL_TZ=gcal_mod.LOCAL_TZ)
 
 
 class ParsingTests(unittest.TestCase):

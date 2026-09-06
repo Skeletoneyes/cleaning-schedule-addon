@@ -359,15 +359,26 @@ class OneClock(unittest.TestCase):
         self.assertIn("def _migrate_timestamps_to_utc()", src)
         self.assertIn('data.get("timestamps_utc_migrated")', src,
                       "must not re-run on every boot")
-        self.assertIn("clock_mod.has_zone(raw)", src,
+        self.assertIn("_has_zone(raw)", src,
                       "already-zoned rows must be left alone")
 
-    def test_zone_logic_is_not_duplicated_in_app(self):
-        """One source of truth. app.py delegates; clock.py decides."""
+    def test_the_zone_is_constructed_exactly_once(self):
+        """One source of truth. `_msg_day` and `_msg_local_day` were separate
+        near-duplicates with their own inline ZoneInfo before 2026-09-06."""
         src = self._src()
-        self.assertNotIn("ZoneInfo(", src,
-                         "timezone construction belongs in clock.py")
-        self.assertIn("import clock as clock_mod", src)
+        self.assertEqual(src.count("ZoneInfo("), 1,
+                         "build the zone once, into LOCAL_ZONE")
+        self.assertIn("LOCAL_ZONE = zoneinfo.ZoneInfo(gcal_mod.LOCAL_TZ)", src)
+
+    def test_the_clock_helpers_stay_in_app_py(self):
+        """They were briefly split into clock.py, which is not in the
+        Dockerfile COPY list by default and took the tracker down on deploy.
+        The ast harness in test_review_expiry.py already tests app.py
+        functions without importing Flask, so the split bought nothing."""
+        src = self._src()
+        for fn in ("def _ts_utc(", "def _utc_iso(", "def _local_day(", "def _has_zone("):
+            self.assertIn(fn, src, f"{fn} must live in app.py")
+        self.assertNotIn("import clock", src)
 
 
 if __name__ == "__main__":
