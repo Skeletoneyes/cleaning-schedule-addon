@@ -3727,6 +3727,182 @@ def whatsapp_heartbeat():
     return jsonify({"ok": True, "received_at": record["received_at"]})
 
 
+STATEMENT_MATCH_TOLERANCE_SEC = 120
+
+
+def _statement_id(said_at_utc, speaker, text):
+    h = hashlib.sha1(f"{said_at_utc}|{speaker}|{(text or '').strip()}".encode("utf-8")).hexdigest()[:16]
+    return f"stmt-{h}"
+
+
+def _norm_text(t):
+    return " ".join((t or "").split()).casefold()
+
+
+def _already_have(data, group, said_utc, text):
+    """Content match against messages already stored, whatever path wrote them.
+
+    This is the dedup that was impossible before 2026-09-06. Live rows carry
+    WhatsApp's own message id, backfilled rows carry a content hash, and the
+    two namespaces never met — so re-ingesting a period that had partly come
+    through live silently duplicated it. What made a content match unusable
+    was not the ids: it was that the two sides kept their timestamps on
+    different clocks, seven hours apart. Now that everything is UTC, "same
+    group, same words, within two minutes" is a real answer.
+    """
+    want = _norm_text(text)
+    for m in data.get("messages", []) or []:
+        if m.get("group") != group or _norm_text(m.get("text")) != want:
+            continue
+        other = _ts_utc(m.get("timestamp"))
+        if other is None:
+            continue
+        if abs((other - said_utc).total_seconds()) <= STATEMENT_MATCH_TOLERANCE_SEC:
+            return m.get("id")
+    return None
+
+
+@app.route("/internal/statements", methods=["POST"])
+def ingest_statements():
+    """Write already-structured statements. The repair path, deliberately dumb.
+
+    The transcript pipeline this replaces parsed three WhatsApp export formats,
+    then spent one model call per message deciding what each one meant, with no
+    context beyond a rolling window — and it stored raw timestamps on a clock
+    of their own. All of that existed to do unattended what a human and a model
+    do far better attended: read the whole conversation at once and say what
+    was agreed.
+
+    So the judgement moves out and the determinism stays here. This endpoint
+    does not interpret anything. It validates, it deduplicates, and it writes.
+    A statement it cannot parse is rejected rather than guessed at, and the
+    whole batch is refused if any member is bad — a half-applied backfill is
+    worse than none, because you cannot tell by looking which half landed.
+
+    It deliberately does NOT touch bookings. Statements land in the same store
+    the live path writes to, the detectors read them, and findings come out for
+    a human to accept. Writing bookings straight from here would bypass the
+    reconciler's contradiction checks, which are the only second opinion on
+    whether the reading was right.
+
+    Body: {"statements": [...], "source": "session-ingest", "dry_run": false}
+    Each statement: said_at, group, speaker, text, kind, and optionally
+    target_date, target_time, cleaner, tentative, confidence.
+    """
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("statements")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "statements must be a non-empty list"}), 400
+    if len(items) > 1000:
+        return jsonify({"error": "at most 1000 statements per call"}), 400
+    source = (payload.get("source") or "session-ingest").strip()
+    dry_run = bool(payload.get("dry_run"))
+
+    prepared, errors = [], []
+    for i, st in enumerate(items):
+        if not isinstance(st, dict):
+            errors.append(f"[{i}] not an object")
+            continue
+        said_raw = st.get("said_at")
+        said = _ts_utc(said_raw) if isinstance(said_raw, str) else None
+        if said is None:
+            errors.append(f"[{i}] said_at missing or unparseable: {said_raw!r}")
+        group = (st.get("group") or "").strip()
+        if not group:
+            errors.append(f"[{i}] group is required")
+        text = (st.get("text") or "").strip()
+        if not text:
+            errors.append(f"[{i}] text is required — it is the provenance for the fact")
+        kind = st.get("kind")
+        if kind not in facts_mod.VALID_KINDS:
+            errors.append(f"[{i}] kind {kind!r} not in {sorted(facts_mod.VALID_KINDS)}")
+        tgt = st.get("target_date")
+        if tgt is not None:
+            try:
+                date.fromisoformat(str(tgt))
+            except ValueError:
+                errors.append(f"[{i}] target_date {tgt!r} is not YYYY-MM-DD")
+        tm = st.get("target_time")
+        if tm is not None and not re.fullmatch(r"[0-2]\d:[0-5]\d", str(tm)):
+            errors.append(f"[{i}] target_time {tm!r} is not HH:MM")
+        if errors:
+            continue
+        prepared.append({
+            "said": said, "group": group, "text": text, "kind": kind,
+            "speaker": (st.get("speaker") or "").strip(),
+            "target_date": str(tgt) if tgt else None,
+            "target_time": str(tm) if tm else None,
+            "cleaner": st.get("cleaner") or None,
+            "tentative": bool(st.get("tentative", False)),
+            "confidence": float(st.get("confidence") or 0.9),
+        })
+
+    if errors:
+        # All or nothing. A partially applied batch cannot be told apart from a
+        # complete one by looking at the data afterwards.
+        return jsonify({"error": "validation failed, nothing written",
+                        "problems": errors[:25], "count": len(errors)}), 400
+
+    inserted, dup_id, dup_content = [], [], []
+    with DATA_LOCK:
+        data = load_data()
+        data.setdefault("messages", [])
+        data.setdefault("message_facts", {})
+        for p in prepared:
+            said_iso = _utc_iso(p["said"])
+            sid = _statement_id(said_iso, p["speaker"], p["text"])
+            if _find_message(data, sid):
+                dup_id.append(sid)
+                continue
+            hit = _already_have(data, p["group"], p["said"], p["text"])
+            if hit:
+                dup_content.append({"skipped": sid, "matches": hit})
+                continue
+            if dry_run:
+                inserted.append(sid)
+                continue
+            data["messages"].append({
+                "id": sid,
+                "timestamp": said_iso,
+                "sender": _resolve_sender_jid(data, p["speaker"]) if p["speaker"] else "",
+                "sender_name_raw": p["speaker"],
+                "group": p["group"],
+                "text": p["text"],
+                "parsed": True,
+                "applied_uid": None,
+                "review_state": "pending",
+                "source": source,
+            })
+            rec = facts_mod.build_record([{
+                "kind": p["kind"],
+                "target_date": p["target_date"],
+                "target_time": p["target_time"],
+                "cleaner": p["cleaner"],
+                "confidence": p["confidence"],
+                "tentative": p["tentative"],
+                "evidence": p["text"][:200],
+            }], p["speaker"] or source)
+            # Stamp extraction with the SAID time. `extracted_at` is only a
+            # fallback ordering key now, but a fallback that disagrees with the
+            # primary is a trap waiting for the next reader.
+            rec["extracted_at"] = said_iso
+            rec["prompt_version"] = f"session-ingest/{source}"
+            data["message_facts"][sid] = rec
+            inserted.append(sid)
+        if not dry_run and inserted:
+            save_data(data)
+
+    return jsonify({
+        "dry_run": dry_run,
+        "inserted": len(inserted),
+        "skipped_duplicate_id": len(dup_id),
+        "skipped_already_captured": len(dup_content),
+        "already_captured": dup_content[:20],
+        "ids": inserted[:50],
+    })
+
+
 @app.route("/admin/facts", methods=["GET"])
 def admin_facts():
     """Dump stored message_facts for inspection. Loopback / shared-secret only."""
