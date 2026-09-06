@@ -13,8 +13,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # Explicit file list, so a new module MUST be added here or the add-on boots
-# into ModuleNotFoundError (bridge_watchdog.py, 2026-08-02). Keep in sync with
-# every top-level `import <local module>` in app.py.
-COPY app.py gcal.py facts.py reconcile.py bridge_watchdog.py notify_ack.py ./
+# into ModuleNotFoundError (bridge_watchdog.py 2026-08-02; clock.py 2026-09-06,
+# which took the tracker down on deploy). This comment existed both times and
+# did not stop either, so the list is now ENFORCED by
+# scripts/test_attestation.py::DockerfileCoversEveryLocalImport, which parses
+# app.py's imports and fails if any local module is missing here.
+COPY app.py gcal.py facts.py reconcile.py bridge_watchdog.py notify_ack.py clock.py ./
 
 CMD ["python", "app.py"]
