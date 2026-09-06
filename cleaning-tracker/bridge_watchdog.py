@@ -86,6 +86,9 @@ def _default_state():
         "probe_error": None,
         "checks": 0,
         "heals": 0,
+        "link": None,
+        "health": None,
+        "schema": 2,
     }
 
 
@@ -240,8 +243,78 @@ def _supervisor_start(slug, token, timeout=90):
 
 # ── The check ───────────────────────────────────────────────────────────────
 
+DEFAULT_LINK_DOWN_ALERT_MIN = 60
+DEFAULT_HEARTBEAT_STALE_SEC = 300
+DEFAULT_MAX_HEAL_ATTEMPTS = 5
+# Decrypt failures inside an allowlisted group. This is a COMPLETENESS fault,
+# not a liveness one: the socket is wide open and healthy while one person's
+# messages silently fail to decrypt. Daria was muted this way for three months.
+# No heartbeat can see it, which is why it stays a separate verdict.
+DECRYPT_ALERT_THRESHOLD = 5
+
+# What link monitoring does NOT cover. Stated here on purpose: believing you
+# are covered when you are not is worse than knowing you are not.
+#
+#   - Per-sender sender-key breakage. The socket is open, everything reports
+#     healthy, and ONE participant's messages silently never decrypt. Daria was
+#     muted this way for three months while other members forwarded fine.
+#   - A wrong `group_allowlist`. Messages reach the bridge, are filtered before
+#     forwarding, and the link is genuinely up the whole time.
+#
+# Both are completeness failures, not liveness failures. Liveness is a
+# necessary condition for completeness, never the same thing.
+
+def _link_verdict(heartbeat, now, stale_sec):
+    """Is the WhatsApp link actually carrying, right now?
+
+    This replaces two signals that both failed on 2026-09-05. Container state
+    said `started` while the process crash-looped against a revoked
+    registration. Message absence said nothing, because a quiet chat and a dead
+    pipe are the same observation.
+
+    Silence is a verdict here, not an abstention: no beat means DOWN. A deadman
+    that answers "unknown" when it hears nothing is not a deadman.
+    """
+    if not heartbeat:
+        return {"verdict": "never_seen",
+                "reason": "the bridge has never reported its link state"}
+
+    received = heartbeat.get("received_at")
+    if not isinstance(received, (int, float)):
+        return {"verdict": "down",
+                "reason": "heartbeat carries no usable received_at"}
+
+    age = now.timestamp() - received
+    # Direction check, not merely a NaN check. A negative age means the stored
+    # timestamp is in the future — corruption, or a clock that moved. Reading
+    # that as "0 seconds old, all good" is the fail-open that makes a deadman
+    # useless, so it is DOWN and it says why.
+    if age < 0:
+        return {"verdict": "down", "age_sec": age,
+                "reason": f"heartbeat timestamp is {abs(int(age))}s in the "
+                          f"future — corrupt or a clock moved; refusing to "
+                          f"read it as fresh"}
+
+    if age > stale_sec:
+        return {"verdict": "down", "age_sec": age,
+                "reason": f"no heartbeat for {int(age)}s (stale after "
+                          f"{stale_sec}s) — the bridge is not reporting"}
+
+    conn = heartbeat.get("connection")
+    if conn != "open":
+        return {"verdict": "down", "age_sec": age,
+                "reason": f"bridge is reporting connection '{conn}'"}
+
+    return {"verdict": "up", "age_sec": age,
+            "reason": "bridge reports an open WhatsApp connection"}
+
+
 def check(state_path, slug, token, last_message_at=None, now=None, heal=True,
-          log_path=None):
+          log_path=None, heartbeat=None,
+          link_down_alert_min=DEFAULT_LINK_DOWN_ALERT_MIN,
+          heartbeat_stale_sec=DEFAULT_HEARTBEAT_STALE_SEC,
+          max_heal_attempts=DEFAULT_MAX_HEAL_ATTEMPTS,
+          alert_cb=None):
     """One watchdog pass. Returns the updated state dict.
 
     `last_message_at` is the timestamp of the newest WhatsApp message the
@@ -258,7 +331,10 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True,
     """
     with _STATE_LOCK:
         now = now or datetime.now()
-        state, record = _check_locked(state_path, slug, token, last_message_at, now, heal)
+        state, record = _check_locked(
+            state_path, slug, token, last_message_at, now, heal,
+            heartbeat, link_down_alert_min, heartbeat_stale_sec,
+            max_heal_attempts, alert_cb)
         if log_path:
             _log_check(log_path, record)
             if int(state.get("checks") or 0) % PRUNE_EVERY_N_CHECKS == 0:
@@ -266,23 +342,161 @@ def check(state_path, slug, token, last_message_at=None, now=None, heal=True,
         return state
 
 
-def _check_locked(state_path, slug, token, last_message_at, now, heal):
+def _maybe_alert_health(state, now, now_s, alert_cb):
+    """Fire the one alert, at most once per unhealthy episode.
+
+    Josh, 2026-09-06: *"I want to strip it way back to a single chain of
+    notifications."* This is that chain's only sender. Everything that used to
+    alert independently — the bridge's five, the watchdog's four, the two
+    silence detectors — now contributes a sentence to `_health_reasons` and
+    nothing more.
+    """
+    health = state.get("health") or {}
+    reasons = _health_reasons(state, now)
+    current = {cls for cls, _ in reasons}
+
+    # ONE alert per incident. An incident opens when health goes from clear to
+    # unhealthy and closes when it returns to clear.
+    #
+    # A first cut keyed this on the SET of active fault classes so that a newly
+    # appearing fault would speak again. That produced three phone buzzes for
+    # one broken bridge — the link, then the capped restarts, then the wedged
+    # consumer, as each crossed its threshold — which is precisely the noise
+    # this whole change exists to remove. The alert's job is "the chain is
+    # broken, go look"; a second buzz adds nothing a human can act on. The
+    # evolving detail belongs in the finding, which regenerates every pass.
+    #
+    # (The set-keyed version was really compensating for a bug: the 24-hour
+    # cumulative-downtime reason used to stay true after recovery and latch the
+    # boolean shut. Once cumulative was scoped to a currently-down link, the
+    # simple guard became correct again.)
+    if current and not health.get("alerted_at"):
+        if not health.get("since"):
+            health["since"] = now_s
+        health["alerted_at"] = now_s
+        if alert_cb:
+            try:
+                alert_cb("bridge_health",
+                         "WhatsApp is not reaching the cleaning app",
+                         " ".join(t for _, t in reasons))
+            except Exception as e:
+                print(f"[watchdog] health alert failed: {e}")
+    if not current:
+        health["since"] = None
+        health["alerted_at"] = None
+    health["faults"] = sorted(current)
+    state["health"] = health
+    return reasons
+
+
+def _check_locked(state_path, slug, token, last_message_at, now, heal,
+                  heartbeat=None,
+                  link_down_alert_min=DEFAULT_LINK_DOWN_ALERT_MIN,
+                  heartbeat_stale_sec=DEFAULT_HEARTBEAT_STALE_SEC,
+                  max_heal_attempts=DEFAULT_MAX_HEAL_ATTEMPTS,
+                  alert_cb=None):
     """Returns `(state, record)`. Every exit path produces a record, so the log
     can never silently omit a pass — an omitted pass is indistinguishable from
     a watchdog that stopped running."""
     now_s = now.strftime("%Y-%m-%dT%H:%M:%S")
     state = load_state(state_path)
+
+    # The Pi carries state written before 1.4.0, including the open 2026-09-05
+    # episode. Left alone, first boot would compute ~30 hours of downtime and
+    # fire the phone immediately — or, worse, find the alert guard already set
+    # and stay silent through a real fault. The durable record (blind windows,
+    # heal counts, check history) is preserved; only the volatile verdict is
+    # rebuilt from the first heartbeat.
+    if int(state.get("schema") or 0) < 2:
+        state["schema"] = 2
+        state["link"] = None
+        state["health"] = None
+        print("[watchdog] migrated state to schema 2 — link verdict rebuilt "
+              "from the next heartbeat; blind windows and counts preserved")
+
     state["last_check"] = now_s
     state["checks"] = int(state.get("checks") or 0) + 1
     previous = state.get("last_state")
 
     def _done(observed, action, **extra):
+        # The single alert. Evaluated here because every exit path returns
+        # through `_done`, including the early ones (no token, probe failed) —
+        # an alert that only fires on the happy path is the failure this
+        # module exists to end.
+        _maybe_alert_health(state, now, now_s, alert_cb)
         save_state(state_path, state)
         record = {"at": now_s, "state": observed, "action": action}
         if previous is not None and observed != previous:
             record["from_state"] = previous
         record.update({k: v for k, v in extra.items() if v is not None})
         return state, record
+
+    # ── Link state ─────────────────────────────────────────────────────────
+    # Evaluated on every pass, before and independent of the Supervisor probe.
+    # The container answer and the link answer are different questions and the
+    # link one is the one that matters: a container can be perfectly `started`
+    # while the WhatsApp socket is dead, which is precisely how 2026-09-05 went
+    # unnoticed for 22 hours.
+    verdict = _link_verdict(heartbeat, now, heartbeat_stale_sec)
+    link = state.get("link") or {
+        "verdict": None, "down_since": None, "alerted_at": None, "episodes": []
+    }
+    link["verdict"] = verdict["verdict"]
+    link["reason"] = verdict["reason"]
+    link["checked_at"] = now_s
+    if verdict.get("age_sec") is not None:
+        link["age_sec"] = int(verdict["age_sec"])
+    link["bridge_version"] = (heartbeat or {}).get("bridge_version")
+    link["alert_after_min"] = link_down_alert_min
+    # Counters are the presence-based half of the signal. Josh ruled that
+    # absence proves nothing — a quiet cleaner group is not evidence. A ratio
+    # between two things the bridge WATCHED happen is not an absence.
+    link["counters"] = {k: (heartbeat or {}).get(k) for k in (
+        "socket_events_seen", "allowlist_matched", "forwarded_ok",
+        "forward_failed", "decrypt_failures", "last_forward_ok_at", "boot_id")}
+
+    if verdict["verdict"] == "up":
+        if link.get("down_since"):
+            # Close the episode and KEEP it. Recovery is silent; loss is not —
+            # the same rule the blind windows above follow.
+            link.setdefault("episodes", []).append({
+                "down_since": link["down_since"],
+                "recovered_at": now_s,
+                "alerted": bool(link.get("alerted_at")),
+            })
+            link["episodes"] = link["episodes"][-50:]
+        link["down_since"] = None
+        link["alerted_at"] = None
+    else:
+        if not link.get("down_since"):
+            link["down_since"] = now_s
+        try:
+            down_for = (now - datetime.strptime(
+                link["down_since"], "%Y-%m-%dT%H:%M:%S")).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            down_for = 0.0
+        # This box is a Raspberry Pi with no RTC; it steps its clock at boot.
+        # A BACKWARD step makes this negative, and a negative duration never
+        # reaches the threshold — the alert simply never fires, silently, which
+        # is the one direction a deadman must not fail in. Clamp and restamp so
+        # the clock cannot buy the fault more quiet time. (A forward step fires
+        # early instead: noisy, but safe.)
+        if down_for < 0:
+            print(f"[watchdog] clock moved backwards — down_since "
+                  f"{link['down_since']} is in the future; restamping")
+            link["down_since"] = now_s
+            down_for = 0.0
+        link["down_for_min"] = int(down_for)
+        # One alert per episode. `alerted_at` is the guard: without it this
+        # fires on every poll for as long as the fault lasts, and an alert that
+        # repeats every five minutes is one you learn to swipe away.
+        # No alert is raised here any more. The verdict is assembled once, in
+        # `_maybe_alert_health`, so that a link fault and a container fault and
+        # a wedged consumer produce ONE message naming all of them rather than
+        # three racing each other.
+        if down_for >= link_down_alert_min and not link.get("alerted_at"):
+            link["alerted_at"] = now_s
+    state["link"] = link
 
     if not token:
         # Fail loud. A watchdog that silently never ran is precisely the
@@ -345,17 +559,42 @@ def _check_locked(state_path, slug, token, last_message_at, now, heal):
     if not heal:
         return _done(current, "observed_down")
 
+    # A restart cannot repair every fault, and pretending otherwise is what
+    # made 2026-09-05 look like an outage under active repair for 22 hours:
+    # 263 identical restarts, five minutes apart, against a WhatsApp
+    # registration the server had revoked. The attempt count was already being
+    # written down — nothing ever read it back. Past the cap, stop, say so
+    # once, and report `unhealable` rather than `restarted` so every downstream
+    # surface stops describing a dead bridge as one being fixed.
+    #
+    # The counter lives on the outage, and recovery clears the outage, so a
+    # later genuinely-restartable fault still heals automatically.
+    attempts_so_far = int(outage.get("restart_attempts") or 0)
+    if attempts_so_far >= max_heal_attempts:
+        if not outage.get("escalated_at"):
+            outage["escalated_at"] = now_s
+        return _done(current, "unhealable", attempt=attempts_so_far)
+
     try:
-        _supervisor_start(slug, token)
-        outage["restart_attempts"] = int(outage.get("restart_attempts") or 0) + 1
+        # Count the ATTEMPT, before the outcome is known. This used to
+        # increment only after `_supervisor_start` returned, so a start that
+        # always failed — a permanent "Another job is already in progress", a
+        # permissions problem — left the counter pinned at zero and the
+        # watchdog retrying forever with nothing to show it had tried. Any cap
+        # keyed on a success-only counter can never fire on the failure it
+        # most needs to stop. `heals` still counts successes only, because
+        # that is what it is reported as.
+        outage["restart_attempts"] = attempts_so_far + 1
         outage["last_restart_at"] = now_s
+        _supervisor_start(slug, token)
         state["heals"] = int(state.get("heals") or 0) + 1
         print(f"[watchdog] started bridge (attempt {outage['restart_attempts']})")
         return _done(current, "restarted", attempt=outage["restart_attempts"])
     except Exception as e:
         outage["last_restart_error"] = str(e)
         print(f"[watchdog] start FAILED: {e}")
-        return _done(current, "restart_failed", detail=str(e))
+        return _done(current, "restart_failed", detail=str(e),
+                     attempt=outage.get("restart_attempts"))
 
 
 # ── Reporting ───────────────────────────────────────────────────────────────
@@ -454,59 +693,214 @@ def _age_days(iso_ts, today):
         return None
 
 
-def findings(state, today_str, now=None):
-    """Reconciler findings derived from watchdog state.
+# Cumulative downtime and flap thresholds. A single continuous-downtime rule
+# cannot see flapping: a bridge cycling down-3-up-5 is sampled `up` at most
+# polls and never accumulates 60 continuous minutes, yet loses messages in
+# every gap. That is the shape of the 2026-07-21 outage.
+CUMULATIVE_DOWN_ALERT_MIN = 60
+FLAP_EPISODES_24H = 4
 
-    These are ordinary findings, so they ride the existing nightly digest →
-    Telegram path and the existing dismiss mechanism. A blind window persists
-    until dismissed on purpose — that is the "keep telling me until it's
-    fixed" requirement, implemented as data rather than as a second alerting
-    system that could itself go quiet.
+
+def _episodes_since(link, now, hours=24):
+    cutoff = now - timedelta(hours=hours)
+    out = []
+    for e in (link.get("episodes") or []):
+        try:
+            start = datetime.strptime(e["down_since"], "%Y-%m-%dT%H:%M:%S")
+            end = datetime.strptime(e["recovered_at"], "%Y-%m-%dT%H:%M:%S")
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end < start:
+            continue          # corrupt or clock-stepped; never negative time
+        if end >= cutoff:
+            out.append((max(start, cutoff), end))
+    return out
+
+
+def _cumulative_down_min(link, now, hours=24):
+    """Total minutes the link was down in the window, closed episodes plus the
+    one currently open. Continuous downtime is the wrong measure on its own —
+    see CUMULATIVE_DOWN_ALERT_MIN."""
+    total = sum((e - s).total_seconds() for s, e in _episodes_since(link, now, hours))
+    if link.get("down_since"):
+        try:
+            start = datetime.strptime(link["down_since"], "%Y-%m-%dT%H:%M:%S")
+            total += max(0.0, (now - start).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    return total / 60.0
+
+
+def _fmt_dur(minutes):
+    """4320 minutes is not a readable outage. Days once it is days."""
+    m = int(minutes)
+    if m < 90:
+        return f"{m} minute(s)"
+    if m < 60 * 48:
+        return f"{m // 60} hour(s)"
+    return f"{m // 1440} day(s)"
+
+
+def _health_reasons(state, now):
+    """Every input to the one verdict, most-decisive first.
+
+    Each of these used to be its own alert with its own channel and its own
+    latency. On 2026-09-05 five of them fired or would have fired for a single
+    fault: `logged_out` instantly to a panel nobody reads, `bridge_down` to the
+    08:00 digest twenty hours later, `bridge_silent` four days later, and the
+    blind-window record after the fact. Twelve alerts did not make the system
+    observable; they made it noisy enough to ignore. They are inputs now.
+    """
+    reasons = []
+    link = state.get("link") or {}
+    counters = link.get("counters") or {}
+    alert_after = link.get("alert_after_min", DEFAULT_LINK_DOWN_ALERT_MIN)
+
+    # 1. The evaluator itself. Categorically different from "the bridge is
+    #    down": it means every other verdict here is untrustworthy, so it is
+    #    stated first and never silently skipped.
+    if state.get("probe_error"):
+        reasons.append(("probe", f"The watchdog cannot check the bridge: {state['probe_error']}"))
+
+    # 2. The link — the primary signal.
+    down_min = int(link.get("down_for_min") or 0)
+    if link.get("verdict") == "never_seen" and down_min >= alert_after:
+        reasons.append(("link", 
+            "The bridge has never reported its link state — it is running a "
+            "build older than 1.4.0, or it cannot reach the tracker at all."))
+    elif link.get("verdict") == "down" and down_min >= alert_after:
+        reasons.append(("link", 
+            f"No working WhatsApp connection for {_fmt_dur(down_min)}: "
+            f"{link.get('reason')}."))
+
+    # 3. Cumulative and flap. What a continuous-downtime rule cannot see.
+    cum = _cumulative_down_min(link, now)
+    episodes = len(_episodes_since(link, now))
+    # Only while the link is DOWN RIGHT NOW but has not yet been down long
+    # enough for the continuous rule. That is exactly the flapping case: each
+    # individual drop is too short to trip the hour, but they add up.
+    #
+    # It must not speak while the link is healthy. A 24-hour lookback that
+    # reports on a recovered bridge keeps the verdict unhealthy for a whole
+    # day, and since the alert guard keys on the set of active faults, that
+    # would silently suppress the alert for the NEXT outage inside that day.
+    # What the earlier outage cost belongs in the blind-window record, which
+    # is durable and dismissible; it does not belong in a live verdict.
+    if link.get("down_since") and down_min < alert_after:
+        if cum >= CUMULATIVE_DOWN_ALERT_MIN:
+            reasons.append(("link", 
+                f"The link has been down for {int(cum)} minutes in total over "
+                f"the last 24 hours, in {episodes} separate episode(s) — no "
+                f"single one long enough to notice, all of them losing messages."))
+        elif episodes >= FLAP_EPISODES_24H:
+            reasons.append(("link", 
+                f"The link has dropped and recovered {episodes} times in 24 "
+                f"hours. Messages arriving in the gaps are lost."))
+
+    # 4. Container state — kept as a cross-check so the heartbeat is not a
+    #    single point of failure, but no longer an alert of its own.
+    outage = state.get("outage")
+    if outage:
+        try:
+            out_min = (now - datetime.strptime(
+                outage.get("detected_at") or "", "%Y-%m-%dT%H:%M:%S")).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            out_min = 0.0
+        if outage.get("escalated_at"):
+            reasons.append(("unhealable", 
+                f"Restarting is not fixing it: "
+                f"{int(outage.get('restart_attempts') or 0)} automatic restarts "
+                f"since {outage.get('detected_at')} all failed. This needs "
+                f"hands — uninstall + install the add-on and re-scan the QR."))
+        elif out_min >= alert_after:
+            err = outage.get("last_restart_error")
+            # Gated like the link. The watchdog restarts a stopped container
+            # within five minutes, and paging a phone for something already
+            # being fixed is how an alert becomes background noise.
+            reasons.append(("container", 
+                f"The add-on container is '{outage.get('observed_state')}' — "
+                f"down for {_fmt_dur(out_min)}, since {outage.get('detected_at')}."
+                + (f" Automatic restart failed: {err}" if err else "")))
+
+    # 5. Consumer wedged. Positive evidence, not an absence: WhatsApp handed us
+    #    messages for a cleaner group and none of them reached the tracker. A
+    #    reconnect that fails to re-attach the messages.upsert handler looks
+    #    exactly like this, and the connection reports open throughout.
+    matched = int(counters.get("allowlist_matched") or 0)
+    ok = int(counters.get("forwarded_ok") or 0)
+    failed = int(counters.get("forward_failed") or 0)
+    if matched > 0 and ok == 0:
+        reasons.append(("consumer", 
+            f"The bridge saw {matched} message(s) in a cleaner group and "
+            f"forwarded none of them. This is not a quiet chat — it is a "
+            f"broken consumer."))
+    elif failed > 0 and ok == 0:
+        reasons.append(("consumer", 
+            f"All {failed} attempt(s) to hand messages to the tracker failed."))
+
+    return reasons
+
+
+def findings(state, today_str, now=None):
+    """ONE health verdict for "is WhatsApp reaching the cleaning app", plus the
+    record of what was lost while it wasn't.
+
+    Before 2026-09-06 this returned up to four separate kinds and the bridge
+    raised five more of its own straight to a Home Assistant panel, while
+    `reconcile._channel_silence` raised two more. Twelve alerts, three
+    channels, one question — and the 22-hour outage they were all watching was
+    found by a human looking at his phone.
+
+    The rule now: **many inputs, one verdict, one alert, one channel.**
+    Redundant detection is defensive; redundant alerting is noise. Every
+    former alert is an input to `_health_reasons`, and its detail lives in
+    this finding's `why`.
+
+    The id is a CONSTANT. It must not encode which fault is active: the digest
+    diffs finding ids between nights (`app.py` `current_ids - baseline_ids`),
+    so an id that changed with the fault mode would announce itself as brand
+    new and mark the previous one resolved every time the symptom shifted.
     """
     now = now or datetime.now()
     out = []
 
-    if state.get("probe_error"):
+    reasons = _health_reasons(state, now)
+    if reasons:
         out.append({
-            "id": "bridge_watchdog_error",
+            "id": "bridge_health",
             "detector": "bridge_watchdog",
-            "kind": "bridge_watchdog_error",
+            "kind": "bridge_health",
             "severity": "needs-attention",
             "booking_uid": None,
             "cleaner": None,
             "date": today_str,
-            "why": (
-                f"The bridge watchdog cannot check whether the WhatsApp bridge is "
-                f"running: {state['probe_error']} Until this is fixed the bridge "
-                f"could be down without anything noticing."
-            ),
+            "why": ("WhatsApp is not reaching the cleaning app. "
+                    + " ".join(t for _, t in reasons)),
             "evidence": [],
         })
 
-    outage = state.get("outage")
-    if outage:
-        attempts = int(outage.get("restart_attempts") or 0)
-        age = _age_days(outage.get("detected_at"), now)
-        age_txt = f" (down for {age} day(s))" if age else ""
-        err = outage.get("last_restart_error")
-        tail = (
-            f" Automatic restart failed: {err}"
-            if err else
-            f" Restarted automatically {attempts} time(s) and it is still not running."
-            if attempts else ""
-        )
+    # The second and last verdict: completeness. Deliberately NOT folded into
+    # bridge_health — "the pipe is down" and "the pipe is up and quietly
+    # dropping one person" need different answers from a human, and merging
+    # them would make the common case bury the rare one.
+    dec = int(((state.get("link") or {}).get("counters") or {}).get("decrypt_failures") or 0)
+    if dec >= DECRYPT_ALERT_THRESHOLD:
         out.append({
-            "id": "bridge_down",
+            "id": "completeness:decrypt",
             "detector": "bridge_watchdog",
-            "kind": "bridge_down",
+            "kind": "bridge_completeness",
             "severity": "needs-attention",
             "booking_uid": None,
             "cleaner": None,
             "date": today_str,
             "why": (
-                f"The WhatsApp bridge add-on is '{outage.get('observed_state')}' and NOT "
-                f"receiving messages{age_txt}.{tail} Anything the cleaners send right now "
-                f"is being lost permanently."
+                f"{dec} message(s) in a cleaner group failed to decrypt. The "
+                f"connection is fine — this is libsignal session corruption, "
+                f"the failure that silently dropped three months of Daria's "
+                f"messages while everything reported healthy. Check the Log tab "
+                f"first and confirm the failures are still arriving in an "
+                f"allowlisted group; re-pairing costs the auth state, so it is "
+                f"the last step, not the first."
             ),
             "evidence": [],
         })

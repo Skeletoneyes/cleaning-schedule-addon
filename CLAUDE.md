@@ -554,25 +554,45 @@ at `.secrets/pulls/<ts>/ha_snapshot.json`.
   for testing). To move to a dedicated bot number: stop the add-on, delete
   `/data/auth/`, register WhatsApp Business on the bot phone (SpeakOut
   $125/yr — pending), restart and scan the new QR.
-- **Health alarms (1.1.0)** — the bridge posts HA persistent notifications
-  (6h cooldown per kind, `homeassistant_api: true`) on: ≥5 decrypt failures
-  in 10 min, ≥4 disconnects in 30 min, ≥5 tracker-forward failures in
-  10 min, and immediately on logged-out. Verify the path end-to-end by
-  setting the `test_alarm` option to true and restarting (fires one test
-  notification on connect; turn it back off after). Decrypt failures are
-  detected by intercepting the Baileys pino logger (`hooks.logMethod`) —
-  Baileys exposes no public event for them.
-- **Decrypt alarm is allowlist-scoped (1.2.0).** The decrypt counter used to
-  count failures in **every** group the account belongs to (~60 personal
-  chats), not just the forwarded ones — so a stale sender-key in an unrelated
-  group fired an alarm whose text blamed the cleaning channel and advised a
-  re-pair. `noteDecryptFailure()` now parses `remoteJid` out of the intercepted
-  log line and only alarms when it's in `group_allowlist` (same filter as the
-  `messages.upsert` loop). Out-of-scope failures are logged at `warn` and
-  visible in the Log tab, just not escalated. **Failures with no parseable
-  `remoteJid` still alarm** — deliberate fail-loud, since silent loss is the
-  bug this whole alarm exists to catch. The alarm text now says check the Log
-  tab first and treat re-pairing as the last step, not the first.
+- **One health verdict, one channel (1.4.0 / tracker 1.42.0, 2026-09-06).**
+  This used to be twelve bridge-health alerts across three channels: five the
+  bridge posted itself straight to a Home Assistant panel (`logged_out`,
+  `flapping`, `forward`, `decrypt`, `test`), four from the watchdog, and two
+  silence detectors — all answering one question. On 2026-09-05 five of them
+  fired or would have fired for a single fault at five different latencies, and
+  the fastest one landed on the panel nobody visits. Josh: *"I want to strip it
+  way back to a single chain of notifications."*
+  - **The bridge is now a pure sensor.** It raises no alarms, has no
+    `homeassistant_api`, and holds no `SUPERVISOR_TOKEN`. It reports its own
+    Baileys link state plus counters to `POST /internal/whatsapp/heartbeat`
+    every 60s and on every connection change, and decides nothing.
+  - **The tracker makes every decision.** `bridge_watchdog._health_reasons()`
+    assembles one verdict from all inputs — link state, container state,
+    cumulative downtime, flap count, capped restarts, wedged consumer, and its
+    own probe errors. Exactly **three** kinds can now be emitted:
+    `bridge_health` (liveness), `bridge_completeness` (per-sender mute), and
+    `bridge_blind_window` (the record of what was lost).
+  - **One alert per incident**, opened when health goes bad and closed when it
+    clears. New faults appearing mid-incident update the finding, never re-buzz
+    the phone. `bridge_health` has a CONSTANT id — the digest diffs ids between
+    nights, so an id encoding the active fault would re-announce on every shift.
+  - ⚠️ **Absence is not a signal, ratios are.** `bridge_silent` (7-day
+    whole-bridge silence) is gone; Josh: *"Not receiving messages tells us
+    nothing, the chat may have been quiet."* A wedged consumer is caught by
+    `allowlist_matched > 0 && forwarded_ok == 0` — positive evidence of
+    messages seen and not forwarded, which is not an inference from silence.
+    The per-group check survives only because it runs *after* a guard proving
+    other groups are flowing, making it a difference rather than an absence.
+  - ⚠️ **Deleted kinds keep tombstones in `_KIND_DECISION`** — a cached
+    `reconciler_last.json` and a live dismissal
+    `bridge_blind:2026-07-28T21:08:38.000Z` still carry them.
+  - 🔑 **If a sixth `to_phone=True` site ever appears, the sprawl is growing
+    back.** `test_attestation.py` guards the count; fold new faults into an
+    existing verdict rather than raising the number.
+  - 🔑 The digest carries a **positive** health line every night. This design
+    can only fail by silence, so if that line stops appearing, the alert chain
+    itself is what broke.
+
 - **⚠️ Session-corruption failure mode (bit hard 2026-07-21):** libsignal
   `MessageCounterError: Key used already or never filled` on decrypt →
   Baileys stream crashes (code 500) → reconnect → WhatsApp redelivers the

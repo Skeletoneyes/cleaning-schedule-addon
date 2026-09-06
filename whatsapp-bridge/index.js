@@ -50,9 +50,16 @@ const BACKFILL_PER_GROUP = opts.backfill_per_group ?? parseInt(process.env.BACKF
 const BACKFILL_WINDOW_MS = opts.backfill_window_ms ?? parseInt(process.env.BACKFILL_WINDOW_MS || "15000", 10);
 const LIST_GROUPS = process.argv.includes("--list-groups");
 const STARTED_AT_SEC = Math.floor(Date.now() / 1000);
-const TEST_ALARM = !!opts.test_alarm;
+const HEARTBEAT_INTERVAL_SEC = opts.heartbeat_interval_sec ?? parseInt(process.env.HEARTBEAT_INTERVAL_SEC || "60", 10);
 
 const log = P({ level: "info" });
+// Self-reported, so it proves nothing on its own — but it is still the
+// cheapest way to tell, from the heartbeat alone, which build is running.
+// ⚠️ package.json's version and config.yaml's must be bumped TOGETHER. They
+// drifted once already (package.json sat at 1.0.0 while the add-on shipped
+// 1.3.0), which makes this field worse than useless: it reports a number
+// Supervisor has never heard of, so a stale deploy reads as a fresh one.
+const BRIDGE_VERSION = require("./package.json").version;
 
 // ---------------------------------------------------------------------------
 // Delivery watermark.
@@ -102,108 +109,61 @@ if (storedWatermark !== null) {
 }
 
 // ---------------------------------------------------------------------------
-// Health alarms → HA persistent notifications.
+// Sensor counters.
 //
-// This bridge failed silently for 3 months (libsignal MessageCounterError
-// poison loop: decrypt failure → stream crash → reconnect → redeliver → …)
-// and nothing surfaced it. These alarms make that class of failure loud.
-// Requires homeassistant_api: true in config.yaml (SUPERVISOR_TOKEN env).
+// This bridge used to raise its own alarms — five kinds, straight to a Home
+// Assistant persistent notification. They were deleted on 2026-09-06. Not
+// because they were wrong, but because there were twelve bridge-health alerts
+// across three channels all answering one question, and on 2026-09-05 five of
+// them fired or would have fired for a single fault at five different
+// latencies, with the fastest one landing on a panel nobody reads.
+//
+// The bridge is now a pure sensor: it counts what it observes and reports it,
+// and every decision is made in one place, in the tracker. Nothing here
+// interprets, thresholds, or escalates.
+//
+// Why counters and not just a connection flag: a socket can be open while the
+// pipeline is broken. If a reconnect fails to re-attach the messages.upsert
+// handler — a known Baileys shape — the connection reports open forever and
+// nothing is ever forwarded. `socket_events_seen` rising while `forwarded_ok`
+// stays flat is POSITIVE evidence of that, which is a different thing from
+// inferring breakage from a quiet chat. Josh's ruling was that absence proves
+// nothing; a ratio between two things we watched happen is not an absence.
 // ---------------------------------------------------------------------------
-const SUPERVISOR_TOKEN = process.env.SUPERVISOR_TOKEN || "";
-const ALARM_COOLDOWN_MS = 6 * 60 * 60 * 1000; // one HA notification per kind per 6h
-const _alarmLastSent = {};
 
-async function postAlarm(kind, title, message) {
-  const now = Date.now();
-  if (_alarmLastSent[kind] && now - _alarmLastSent[kind] < ALARM_COOLDOWN_MS) return;
-  _alarmLastSent[kind] = now;
-  log.error({ kind, message }, "HEALTH ALARM");
-  if (!SUPERVISOR_TOKEN) {
-    log.warn("no SUPERVISOR_TOKEN — cannot post HA notification");
-    return;
-  }
-  try {
-    const res = await fetch("http://supervisor/core/api/services/persistent_notification/create", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${SUPERVISOR_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        notification_id: `whatsapp_bridge_${kind}`,
-        title: `WhatsApp Bridge: ${title}`,
-        message,
-      }),
-    });
-    log.info({ kind, status: res.status }, "health alarm posted to HA");
-  } catch (err) {
-    log.error({ err: err.message, kind }, "health alarm post failed");
-  }
-}
+// Regenerated every process start. Lets the tracker tell "the same bridge is
+// still running" from "it restarted and I am talking to a different process" —
+// which is how a duplicate or stale instance would otherwise stay invisible.
+const BOOT_ID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 
-// Sliding-window event counters: alarm when `threshold` events land within `windowMs`.
-function makeWindowCounter(kind, threshold, windowMs, title, messageFn) {
-  const events = [];
-  return () => {
-    const now = Date.now();
-    events.push(now);
-    while (events.length && events[0] < now - windowMs) events.shift();
-    if (events.length >= threshold) postAlarm(kind, title, messageFn(events.length));
-  };
-}
-
-const countDecryptFailure = makeWindowCounter(
-  "decrypt", 5, 10 * 60 * 1000,
-  "message decryption failing",
-  (n) => `${n} messages failed to decrypt in a cleaning group in the last 10 minutes ` +
-    `(libsignal session corruption — the failure mode that silently dropped 3 months ` +
-    `of Daria's messages). First CHECK, don't re-pair: open the Log tab and confirm ` +
-    `the failures are still arriving and are in an allowlisted group. Only if it ` +
-    `persists, re-pair — uninstall + reinstall the add-on to wipe /data/auth, restore ` +
-    `options, restart, scan the QR. Re-pairing costs the auth state, so it is the ` +
-    `last step, not the first. Messages missed meanwhile are recoverable via chat ` +
-    `export → transcript ingest.`
-);
-
-const countDisconnect = makeWindowCounter(
-  "flapping", 4, 30 * 60 * 1000,
-  "connection flapping",
-  (n) => `${n} disconnects in the last 30 minutes. Messages arriving during the gaps ` +
-    `may be lost. If this persists, check the bridge Log tab for decrypt errors ` +
-    `(session corruption → re-pair) or network issues.`
-);
-
-const countForwardFailure = makeWindowCounter(
-  "forward", 5, 10 * 60 * 1000,
-  "cannot reach cleaning tracker",
-  (n) => `${n} forwards to the cleaning-tracker add-on failed in the last 10 minutes. ` +
-    `Incoming WhatsApp messages are NOT being recorded. Check that the Cleaning ` +
-    `Schedule Tracker add-on is running and whatsapp_shared_secret matches.`
-);
+const counters = {
+  socket_events_seen: 0,   // every group message Baileys handed us, pre-filter
+  allowlist_matched: 0,    // ...of those, the ones in a cleaner group
+  forwarded_ok: 0,
+  forward_failed: 0,
+  decrypt_failures: 0,
+  last_forward_ok_at: null,
+};
 
 // Baileys logs decrypt failures through the logger we hand it — intercept them
 // there, since it exposes no public event for this.
 const DECRYPT_ERR_RE = /failed to decrypt|MessageCounterError|Bad MAC|No matching sessions|No SenderKeyRecord|SessionError/i;
 const REMOTE_JID_RE = /"remoteJid"\s*:\s*"([^"]+)"/;
 
-// Only ALARM on failures in groups this bridge actually forwards (same filter
-// as the messages.upsert loop below). The account is in ~60 personal groups;
-// a stale sender-key in "Property Bros" costs the cleaning schedule nothing,
-// but it used to trip a 5-in-10-min alarm whose text says "the exact failure
-// mode that dropped 3 months of Daria's messages" — a false alarm that teaches
-// you to ignore the real one. Out-of-scope failures are still logged (visible
-// in the Log tab), just not escalated to a persistent notification.
-// Unattributable failures (no parseable remoteJid) still count: the detector
-// exists because silent loss went unnoticed for 3 months, so anything we
-// cannot rule out stays loud.
+// Count only failures in groups this bridge actually forwards. The account is
+// in ~60 personal groups; a stale sender-key in an unrelated chat costs the
+// cleaning schedule nothing, and counting it would teach the tracker to cry
+// wolf about the cleaning channel. Unattributable failures (no parseable
+// remoteJid) DO count — this detector exists because silent loss went
+// unnoticed for three months, so anything we cannot rule out stays loud.
 function noteDecryptFailure(flat) {
   const jid = (flat.match(REMOTE_JID_RE) || [])[1] || "";
   const inScope = !jid || GROUP_ALLOWLIST.size === 0 || GROUP_ALLOWLIST.has(jid);
   if (!inScope) {
-    log.warn({ jid }, "decrypt failure in non-allowlisted group — not alarming");
+    log.warn({ jid }, "decrypt failure in non-allowlisted group — not counted");
     return;
   }
-  countDecryptFailure();
+  counters.decrypt_failures += 1;
 }
 
 const baileysLogger = P({
@@ -249,13 +209,15 @@ async function forward(payload) {
     });
     if (!res.ok) {
       log.error({ status: res.status, id: payload.id }, "forward failed");
-      countForwardFailure();
+      counters.forward_failed += 1;
     } else {
+      counters.forwarded_ok += 1;
+      counters.last_forward_ok_at = Math.floor(Date.now() / 1000);
       log.info({ id: payload.id, group: payload.group_jid, from_me: payload.from_me }, "forwarded");
     }
   } catch (err) {
     log.error({ err: err.message, id: payload.id }, "forward threw");
-    countForwardFailure();
+    counters.forward_failed += 1;
   }
 }
 
@@ -311,6 +273,90 @@ function scheduleReconnect(deadSock) {
   }, delay);
 }
 
+// ---------------------------------------------------------------------------
+// Link-state heartbeat.
+//
+// On 2026-09-05 the bridge went logged-out at 11:47 and sat that way for 22
+// hours before anyone found out. Two things had to fail together for that to
+// go unnoticed: the tracker's own container-state watchdog restarted the
+// add-on 263 times without ever concluding restarting was useless (a running
+// container with a dead WhatsApp socket looks perfectly healthy to it — see
+// bridge_watchdog.py), and the ONLY other signal the tracker had was message
+// traffic, which cannot tell "the bridge is dead" apart from "nobody's said
+// anything in three days" — the chat really had been quiet since 2026-09-02,
+// three days before the container ever went unhealthy. Traffic answers "did
+// anyone say anything"; it can never answer "can this pipe carry a message
+// right now".
+//
+// So the bridge reports its own Baileys connection state on a schedule,
+// independent of whether anyone is talking — this is true even in an empty
+// room, which message traffic structurally cannot be. It's a push, not a
+// poll, because this process runs no HTTP server for the tracker to ask.
+// Sent on every connection-state change AND on a fixed interval: the interval
+// is what turns "the last thing we heard was open" into an actual deadman
+// switch on the tracker side. A push that only fires on change is silent in
+// exactly the case that matters most — this process being frozen or killed
+// outright, with no close event ever firing.
+let linkState = "closed";
+let connectedSince = null;
+let lastCloseCode = null;
+
+async function postHeartbeat() {
+  if (!HA_URL) {
+    // Nothing configured to report to — same as forward()'s HA_URL guard,
+    // not a bridge failure.
+    return;
+  }
+  const body = {
+    connection: linkState,
+    connected_since: connectedSince,
+    last_close_code: lastCloseCode,
+    reconnect_attempts: reconnectAttempts,
+    boot_id: BOOT_ID,
+    allowlist_size: GROUP_ALLOWLIST.size,
+    version: BRIDGE_VERSION,
+    sent_at: Math.floor(Date.now() / 1000),
+    ...counters,
+  };
+  // CRITICAL: a heartbeat failure must never throw into the message path,
+  // never crash the process, and never block forwarding — it is purely a
+  // side channel. Every failure mode below is caught and logged, nothing is
+  // re-thrown.
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (SHARED_SECRET) headers["X-Shared-Secret"] = SHARED_SECRET;
+    // Explicit timeout, well under the beat interval. A `catch` protects
+    // against a tracker that REFUSES; it does nothing about one that simply
+    // never answers, and without this those requests pile up forever.
+    const res = await fetch(`${HA_URL}/internal/whatsapp/heartbeat`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Math.max(2, Math.floor(HEARTBEAT_INTERVAL_SEC / 4)) * 1000),
+    });
+    if (!res.ok) {
+      log.warn({ status: res.status }, "heartbeat post failed");
+    }
+  } catch (err) {
+    // Deliberately NOT retried. A heartbeat is a sample, not a message: a beat
+    // generated fifty minutes ago and delivered on a backoff would be stamped
+    // fresh on arrival and paper over the very outage it was meant to reveal.
+    // Drop it; the next tick is seconds away.
+    log.warn({ err: err.message }, "heartbeat post threw — dropped, not retried");
+  }
+}
+
+// Fixed schedule, independent of connection events — this is the deadman
+// half of the design. `.unref()` so a pending interval never keeps the
+// process alive past a clean shutdown.
+setInterval(() => { postHeartbeat(); }, Math.max(5, HEARTBEAT_INTERVAL_SEC) * 1000).unref();
+
+// One beat at boot, before any connection is attempted. A bridge that starts
+// and never manages to connect emits no close event and no open event; without
+// this it would be indistinguishable from a bridge that was never started, and
+// the tracker would sit on a stale "open" from the previous process.
+postHeartbeat();
+
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -344,9 +390,13 @@ async function start() {
       // every later retry stuck at the 60s ceiling.
       reconnectAttempts = 0;
       log.info("connected");
-      if (TEST_ALARM) {
-        postAlarm("test", "test alarm", "Bridge health-alarm path works. Turn the test_alarm option back off.");
-      }
+      // Edge-triggered beat. The interval alone would leave the tracker
+      // believing the link was down for up to one full period after it
+      // recovered, which turns every brief blip into a spurious outage.
+      linkState = "open";
+      connectedSince = Math.floor(Date.now() / 1000);
+      lastCloseCode = null;
+      postHeartbeat();
       // Always log visible groups so you can populate group_allowlist on first install.
       try {
         const groups = await sock.groupFetchAllParticipating();
@@ -362,18 +412,23 @@ async function start() {
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       log.warn({ code, shouldReconnect }, "disconnected");
+      // Report the drop before doing anything else with it. The logged-out
+      // path below calls process.exit(1), so a beat sent after that branch
+      // would never leave the process — and logged-out is precisely the
+      // case the tracker most needs to hear about.
+      linkState = "closed";
+      connectedSince = null;
+      lastCloseCode = code ?? null;
+      await postHeartbeat();
       if (shouldReconnect) {
-        countDisconnect();
         scheduleReconnect(sock);
       } else {
-        log.error("logged out — delete /data/auth and restart to re-pair");
-        await postAlarm(
-          "logged_out",
-          "LOGGED OUT — re-pair required",
-          "WhatsApp unlinked this device. NO messages are being captured. Reinstall " +
-          "the WhatsApp Bridge add-on (wipes /data/auth), restart, and scan the QR " +
-          "from the Log tab."
-        );
+        // No alarm is raised here any more. The heartbeat above already told
+        // the tracker `connection: "closed"` with `last_close_code: 401`, and
+        // the tracker decides what that means and who to tell. This used to
+        // post straight to a Home Assistant panel — which is where it sat,
+        // correctly and uselessly, for the 22 hours of 2026-09-05.
+        log.error({ code }, "logged out — delete /data/auth and restart to re-pair");
         process.exit(1);
       }
     }
@@ -432,7 +487,12 @@ async function start() {
 
       const remoteJid = msg.key.remoteJid || "";
       if (!remoteJid.endsWith("@g.us")) continue;
+      // Counted BEFORE the allowlist filter: proves this handler is still
+      // attached and WhatsApp is still delivering, independently of whether
+      // the cleaners happen to be talking.
+      counters.socket_events_seen += 1;
       if (GROUP_ALLOWLIST.size > 0 && !GROUP_ALLOWLIST.has(remoteJid)) continue;
+      counters.allowlist_matched += 1;
 
       const ts = Number(msg.messageTimestamp || 0);
 

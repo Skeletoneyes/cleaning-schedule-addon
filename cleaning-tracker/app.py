@@ -181,6 +181,15 @@ BRIDGE_WATCHDOG_ENABLED = bool(OPTIONS.get("bridge_watchdog_enabled", True))
 BRIDGE_WATCHDOG_SLUG = (OPTIONS.get("bridge_watchdog_slug", "") or "").strip()
 BRIDGE_WATCHDOG_INTERVAL_MIN = int(OPTIONS.get("bridge_watchdog_interval_min", 60))
 BRIDGE_WATCHDOG_FILE = DATA_DIR / "bridge_watchdog.json"
+BRIDGE_HEARTBEAT_FILE = DATA_DIR / "bridge_heartbeat.json"
+# How long the link may be down before it buzzes a phone. Josh, 2026-09-06:
+# "Warn me if it's down for even 1 hour."
+BRIDGE_LINK_DOWN_ALERT_MIN = int(OPTIONS.get("bridge_link_down_alert_min", 60))
+# Silence that long counts as DOWN. At a 60s beat this is five missed beats —
+# long enough to ride out a restart, short enough that it is not a new blind
+# spot of its own.
+BRIDGE_HEARTBEAT_STALE_SEC = int(OPTIONS.get("bridge_heartbeat_stale_sec", 300))
+BRIDGE_MAX_HEAL_ATTEMPTS = int(OPTIONS.get("bridge_max_heal_attempts", 5))
 # One JSONL line per liveness check, including the uneventful ones — that is
 # what makes a stable stretch evidence rather than an absence. Trailing 30-day
 # window; see bridge_watchdog.CHECK_LOG_RETENTION_DAYS.
@@ -3546,6 +3555,66 @@ def _require_local_or_secret():
         abort(403)
 
 
+def _load_heartbeat():
+    """Last link-state beat from the bridge. Missing/corrupt reads as absent,
+    which the watchdog treats as DOWN — never as 'unknown, carry on'."""
+    try:
+        return json.loads(BRIDGE_HEARTBEAT_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _save_heartbeat(record):
+    """Temp-then-replace, same reason as bridge_watchdog.save_state: this is
+    written every 60s and a restart landing mid-write must not leave a partial
+    file that reads back as 'no heartbeat ever' and fires a false outage."""
+    tmp = BRIDGE_HEARTBEAT_FILE.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(record, indent=2))
+        os.replace(tmp, BRIDGE_HEARTBEAT_FILE)
+    except OSError as e:
+        print(f"[heartbeat] failed to persist: {e}")
+
+
+@app.route("/internal/whatsapp/heartbeat", methods=["POST"])
+def whatsapp_heartbeat():
+    """Accept the bridge's report of its own WhatsApp link state.
+
+    Why this endpoint exists, and why it is not about message traffic:
+    on 2026-09-05 the bridge went logged-out and nobody knew for 22 hours. The
+    two signals available both failed. Container state said `started` — true,
+    and useless, because the process was alive and crash-looping against a
+    revoked registration. Message absence said nothing at all, because a quiet
+    cleaner group and a dead pipe are indistinguishable; the chat genuinely had
+    been quiet for three days before the container ever went unhealthy.
+
+    The bridge is the only component that knows whether WhatsApp is actually
+    talking to it. It runs no HTTP server, so it cannot be polled — it pushes
+    here instead, on every connection change and on a fixed interval.
+
+    ⚠️ `received_at` is stamped HERE, from this host's clock, and the bridge's
+    own `sent_at` is kept for information only. Age is always computed from two
+    readings of the same clock. A prior incident in this fleet compared a
+    timestamp generated on one machine against another machine's clock; the
+    skew produced a NEGATIVE age, which rendered as "0 hours old, all good"
+    and fails open forever — in a deadman switch, the one direction that must
+    never fail.
+    """
+    _require_local_or_secret()
+    payload = request.get_json(silent=True) or {}
+    record = {
+        "received_at": int(time.time()),
+        "connection": str(payload.get("connection") or "unknown"),
+        "connected_since": payload.get("connected_since"),
+        "last_close_code": payload.get("last_close_code"),
+        "reconnect_attempts": payload.get("reconnect_attempts"),
+        "bridge_version": payload.get("version"),
+        "sent_at": payload.get("sent_at"),
+    }
+    _save_heartbeat(record)
+    return jsonify({"ok": True, "received_at": record["received_at"]})
+
+
 @app.route("/admin/facts", methods=["GET"])
 def admin_facts():
     """Dump stored message_facts for inspection. Loopback / shared-secret only."""
@@ -3805,6 +3874,51 @@ def _latest_message_ts(data):
     return best
 
 
+def _bridge_health_line():
+    """One line of proof-of-life for the WhatsApp chain. Never raises — a
+    reporting helper must not be able to break the digest it rides on."""
+    try:
+        hb = _load_heartbeat()
+        if not hb:
+            return "WhatsApp link: NO HEARTBEAT — the bridge has never reported in."
+        age = int(time.time()) - int(hb.get("received_at") or 0)
+        conn = hb.get("connection")
+        state = watchdog_mod.load_state(BRIDGE_WATCHDOG_FILE)
+        faults = (state.get("health") or {}).get("faults") or []
+        c = (state.get("link") or {}).get("counters") or {}
+        fwd = c.get("forwarded_ok")
+        tail = f"; {fwd} message(s) forwarded since the bridge started" if fwd is not None else ""
+        if faults:
+            return (f"WhatsApp link: DOWN ({', '.join(faults)}) — last heartbeat "
+                    f"{age}s ago{tail}.")
+        return (f"WhatsApp link: UP (connection {conn}, last heartbeat "
+                f"{age}s ago){tail}.")
+    except Exception as e:
+        return f"WhatsApp link: could not be determined ({e})."
+
+
+def _bridge_phone_alert(kind, title, message):
+    """Escalate a bridge fault to the phone.
+
+    Phone escalation is deliberately rare — `_post_ha_notification`'s own
+    docstring reserves it for "the cases where nobody would otherwise find
+    out: the pipeline itself being broken." Every prior call site was a
+    tracker-side failure. A dead bridge was not among them, which is exactly
+    how it stayed invisible for 22 hours while the panel quietly held an
+    alarm nobody was looking at.
+    """
+    try:
+        _post_ha_notification(
+            title,
+            message,
+            notification_id=kind,
+            to_phone=True,
+        )
+    except Exception as e:
+        # A failing alerter must never take down the watchdog that called it.
+        print(f"[watchdog] phone alert '{kind}' failed: {e}")
+
+
 def _watchdog_check_now(heal=True):
     """One bridge liveness pass. Safe to call from the timer or a route."""
     if not (BRIDGE_WATCHDOG_ENABLED and BRIDGE_WATCHDOG_SLUG):
@@ -3818,6 +3932,11 @@ def _watchdog_check_now(heal=True):
         last_message_at=last_msg,
         heal=heal,
         log_path=BRIDGE_CHECK_LOG,
+        heartbeat=_load_heartbeat(),
+        link_down_alert_min=BRIDGE_LINK_DOWN_ALERT_MIN,
+        heartbeat_stale_sec=BRIDGE_HEARTBEAT_STALE_SEC,
+        max_heal_attempts=BRIDGE_MAX_HEAL_ATTEMPTS,
+        alert_cb=_bridge_phone_alert,
     )
 
 
@@ -4649,6 +4768,18 @@ def _digest_compute_and_notify():
         message = message + "\n" + "\n".join(f"• [changed] {c['why']}" for c in changes[:10])
         if len(changes) > 10:
             message += f"\n…and {len(changes) - 10} more changes"
+
+    # Positive confirmation, always, healthy or not.
+    #
+    # The old twelve-alert design failed by NOISE. This one can only fail by
+    # SILENCE — and silence is the mode that has bitten this household twice
+    # already (Daria's three quiet months, and the 2026-09-05 outage). "Nothing
+    # arriving" is now indistinguishable from "everything is fine" unless the
+    # system says so out loud. One line, in a message Josh already reads, is
+    # also the cheapest possible deadman for the alert chain itself: if this
+    # line stops appearing, the chain that would report a fault is the thing
+    # that broke.
+    message = message + "\n\n" + _bridge_health_line()
 
     notified = _post_ha_notification(title, message)
     _push_digest_to_vps(

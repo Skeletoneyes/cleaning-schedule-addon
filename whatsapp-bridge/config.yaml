@@ -1,5 +1,5 @@
 name: WhatsApp Bridge
-version: "1.3.0"
+version: "1.4.0"
 slug: whatsapp-bridge
 description: Baileys WhatsApp linked-device bridge that forwards group messages to the Cleaning Schedule Tracker.
 init: false
@@ -9,13 +9,22 @@ arch:
 startup: application
 boot: auto
 host_network: true
-homeassistant_api: true
 panel_icon: mdi:whatsapp
 options:
   group_allowlist: []
   backfill_per_group: 10
   backfill_window_ms: 15000
   shared_secret: ""
+  heartbeat_interval_sec: 60
+  # DEPRECATED and ignored since 1.4.0 — the bridge raises no alarms to test.
+  # It stays in the schema on purpose: the option is already stored in the
+  # live config on the Pi, Supervisor's /options endpoint MERGES rather than
+  # replaces (omitting a key does not remove it), and it refuses to null a key
+  # the INSTALLED version still declares. So it cannot be cleared before the
+  # update, and dropping it from the schema would make the update fail
+  # validation with "extra keys not allowed" — bricking the add-on, whose
+  # obvious recovery is uninstall/install, which destroys /data/auth. Remove
+  # it in a later version, after clearing it from the stored options.
   test_alarm: false
 schema:
   group_allowlist:
@@ -23,4 +32,5 @@ schema:
   backfill_per_group: int
   backfill_window_ms: int
   shared_secret: password?
+  heartbeat_interval_sec: int(5,)?
   test_alarm: bool?

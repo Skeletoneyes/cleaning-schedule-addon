@@ -262,9 +262,14 @@ class PhoneEscalation(unittest.TestCase):
     def test_only_pipeline_failures_escalate(self):
         """The phone is reserved for 'nobody would otherwise find out'."""
         src = (APP_DIR / "app.py").read_text(encoding="utf-8")
-        self.assertEqual(src.count("to_phone=True"), 4,
+        self.assertEqual(src.count("to_phone=True"), 5,
                          "expected exactly: vps push failed, ical sync failed, "
-                         "reconcile failed, bot unhealthy")
+                         "reconcile failed, bot unhealthy, and (added 2026-09-06) "
+                         "the SINGLE bridge health verdict. That fifth one "
+                         "replaced twelve bridge-health alerts across three "
+                         "channels; if a sixth ever appears here, the same "
+                         "sprawl is growing back and the answer is to fold it "
+                         "into an existing verdict, not to raise this number.")
 
     def test_escalation_failure_cannot_break_the_notification(self):
         """ISC-113 — it amplifies an alert; it must not be able to unwind it."""

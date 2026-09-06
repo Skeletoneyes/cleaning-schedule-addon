@@ -279,7 +279,22 @@ _KIND_DECISION = {
     "gcal_push_failed": "investigate",
     "gcal_push_timeout": "investigate",
     "gcal_read_failed": "investigate",
+    # The one liveness verdict and the one completeness verdict, since
+    # 2026-09-06. Everything below them is a tombstone.
+    "bridge_health": "investigate",
+    "bridge_completeness": "investigate",
+    # ── Tombstones ──────────────────────────────────────────────────────────
+    # Collapsed into `bridge_health` on 2026-09-06 (twelve bridge-health alerts
+    # across three channels, all answering one question). The mappings stay for
+    # the same reason `schedule_mismatch` above stays: a cached
+    # `reconciler_last.json` on the Pi, and a LIVE dismissal
+    # `bridge_blind:2026-07-28T21:08:38.000Z` in the host's data.json, still
+    # carry these kinds. Removing the entries would drop them to the default
+    # rather than resolving them.
+    "bridge_link_down": "investigate",
+    "bridge_unhealable": "investigate",
     "bridge_silent": "investigate",
+    "channel_silent": "investigate",
     "channel_silent": "investigate",
     "pipeline": "investigate",
 }
@@ -999,26 +1014,20 @@ def _channel_silence(silence, today_str):
     min_msgs = silence.get("min_group_msgs", 10)
     last_any = silence.get("last_any_age_days")
 
-    # 1. Whole-bridge silence — nothing from ANY group in bridge_days. Almost
-    #    always the bridge is down / logged out. Emit ONE finding and stop; a
-    #    dead bridge shouldn't also spam a per-group finding for every channel.
+    # 1. Whole-bridge silence is NO LONGER AN ALERT. Josh, 2026-09-06: "Not
+    #    receiving messages tells us nothing, the chat may have been quiet."
+    #    He is right — a quiet household and a dead pipe are the same
+    #    observation, and liveness is now answered properly by the bridge's own
+    #    link heartbeat (`bridge_watchdog._health_reasons`).
+    #
+    #    The check survives as a GUARD, which is what makes step 2 defensible.
+    #    Returning here means "the bridge as a whole is not demonstrably
+    #    carrying traffic", so a single quiet group proves nothing. Past this
+    #    line, some group IS flowing — which turns step 2 from an absence into
+    #    a DIFFERENCE: this channel is silent while that one is live. That is
+    #    the per-sender sender-key mute, and no liveness signal can see it.
     if last_any is None or last_any >= bridge_days:
-        span = "ever" if last_any is None else f"{int(last_any)} days"
-        return [{
-            "id": "bridge_silent",
-            "detector": "channel_silence",
-            "kind": "bridge_silent",
-            "severity": "needs-attention",
-            "booking_uid": None,
-            "cleaner": None,
-            "date": today_str,
-            "why": (
-                f"No WhatsApp messages received from ANY group in {span} — the "
-                f"bridge is likely down or logged out. Check the WhatsApp Bridge "
-                f"add-on Log tab; re-pair (uninstall→install→scan QR) if needed."
-            ),
-            "evidence": [],
-        }]
+        return []
 
     # 2. Per-group silence — a channel that was demonstrably active
     #    (≥ min_group_msgs historical messages) has gone quiet past dead_days.
@@ -1034,17 +1043,19 @@ def _channel_silence(silence, today_str):
         label = g.get("label") or gjid
         last_ts = (g.get("last_ts") or "")[:10] or "unknown"
         out.append({
-            "id": f"channel_silent:{gjid}",
+            "id": f"completeness:group:{gjid}",
             "detector": "channel_silence",
-            "kind": "channel_silent",
+            "kind": "bridge_completeness",
             "severity": "needs-attention",
             "booking_uid": None,
             "cleaner": None,
             "date": today_str,
             "why": (
                 f"No messages from the '{label}' WhatsApp group in {int(age)} days "
-                f"(last: {last_ts}). This channel may have gone dark — the "
-                f"per-sender mute that silently dropped 3 months of Daria's "
+                f"(last: {last_ts}) — while other groups ARE still coming "
+                f"through. That difference is the point: the link is up, so "
+                f"this is not a quiet week, it is one channel gone dark. It is "
+                f"the per-sender mute that silently dropped 3 months of Daria's "
                 f"messages. Send a test message in the group and confirm it "
                 f"appears in Review; re-pair the bridge if it doesn't."
             ),
