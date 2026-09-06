@@ -12,11 +12,12 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Explicit file list, so a new module MUST be added here or the add-on boots
-# into ModuleNotFoundError (bridge_watchdog.py 2026-08-02; and again
-# 2026-09-06, which took the tracker down mid-deploy). The list is ENFORCED by
-# scripts/test_attestation.py::DockerfileCoversEveryLocalImport, which parses
-# app.py's imports and fails if any local module is missing here.
-COPY app.py gcal.py facts.py reconcile.py bridge_watchdog.py notify_ack.py ./
+# Copy every module in the build context. This was an explicit file list, on
+# the theory that forgetting to add a new module should fail loudly. It failed
+# loudly twice — bridge_watchdog.py on 2026-08-02, and again on 2026-09-06 when
+# a new clock.py took the tracker down for half an hour — and prevented
+# nothing. A glob cannot be forgotten. The build context is this directory, so
+# this is exactly the add-on's own modules and nothing else.
+COPY *.py ./
 
 CMD ["python", "app.py"]
