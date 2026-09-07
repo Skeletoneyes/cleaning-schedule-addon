@@ -21,10 +21,23 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "cleaning-tracker"))
 import reconcile  # noqa: E402
+
+# Pinned so the suite cannot rot. `filter_and_sort` suppresses findings older
+# than STALE_DAYS (5), reading the clock; before this was injectable, every
+# assertion here started failing five days after the fixtures were written —
+# identically, with an empty list, which reads like a broken detector and is
+# really just the calendar.
+PINNED_TODAY = date(2026, 8, 22)
+
+
+def filter_and_sort_pinned(result, dismissed):
+    return reconcile.filter_and_sort(result, dismissed, today=PINNED_TODAY)
+
 
 UID = "b-aug21@airbnb.com"
 # Legacy-shaped uid embedded in a finding id, matching reconcile._UID_IN_ID_RE
@@ -64,7 +77,7 @@ class SubjectScopedFilter(unittest.TestCase):
         f = finding("changed_mind:Itzel:2026-08-21",
                      evidence_latest="2026-08-15T04:00:07.000Z",  # before Aug 16 10:51 local
                      evidence=["m1"])
-        out = reconcile.filter_and_sort({"findings_raw": [f]}, dismissed)
+        out = filter_and_sort_pinned({"findings_raw": [f]}, dismissed)
         self.assertEqual(out["findings"], [],
                          "evidence predating the dismissal cutoff must be subject-dismissed "
                          "even though the finding's own id was never dismissed")
@@ -77,7 +90,7 @@ class SubjectScopedFilter(unittest.TestCase):
         f = finding("changed_mind:Itzel:2026-08-21",
                      evidence_latest="2026-08-17T04:00:07.000Z",  # after Aug 16 10:51 local
                      evidence=["m1"])
-        out = reconcile.filter_and_sort({"findings_raw": [f]}, dismissed)
+        out = filter_and_sort_pinned({"findings_raw": [f]}, dismissed)
         self.assertEqual([x["id"] for x in out["findings"]], [f["id"]],
                          "a message arriving after dismissed_at must re-open the subject")
 
@@ -100,7 +113,7 @@ class LegacyDismissalKey(unittest.TestCase):
         }
         f = finding("changed_mind:Itzel:2026-08-21", uid=UID_LEGACY,
                      evidence_latest="2026-08-15T04:00:07.000Z", evidence=["m1"])
-        out = reconcile.filter_and_sort({"findings_raw": [f]}, dismissed)
+        out = filter_and_sort_pinned({"findings_raw": [f]}, dismissed)
         self.assertEqual(out["findings"], [],
                          "a legacy dismissal (no booking_uid field) must still filter by "
                          "the uid embedded in its own key")
@@ -120,7 +133,7 @@ class NoEvidenceLatestNeverSubjectDismissed(unittest.TestCase):
         # for a drift finding, since `ev` is empty and the stamp loop only
         # sets the key when `ev` is truthy.
         self.assertNotIn("evidence_latest", drift)
-        out = reconcile.filter_and_sort({"findings_raw": [drift]}, dismissed)
+        out = filter_and_sort_pinned({"findings_raw": [drift]}, dismissed)
         self.assertEqual([x["id"] for x in out["findings"]], [drift["id"]],
                          "an evidence-free finding must never be subject-dismissed")
 
@@ -156,7 +169,7 @@ class InstantNotStringComparison(unittest.TestCase):
         }}
         f = finding("changed_mind:Itzel:2026-08-21", evidence_latest=evidence_latest,
                      evidence=["m1"])
-        out = reconcile.filter_and_sort({"findings_raw": [f]}, dismissed)
+        out = filter_and_sort_pinned({"findings_raw": [f]}, dismissed)
         self.assertEqual(out["findings"], [],
                          "comparison must use as_instant, not the raw timestamp strings")
 
@@ -201,7 +214,7 @@ class SubjectAwarePrimarySelection(unittest.TestCase):
         # And the merged finding survives filtering: not every absorbed id is
         # dismissed (only the one), and the primary's own id was never
         # dismissed.
-        survived = reconcile.filter_and_sort({"findings_raw": out}, {dismissed_id: {}})
+        survived = filter_and_sort_pinned({"findings_raw": out}, {dismissed_id: {}})
         self.assertIn(primary["id"], [x["id"] for x in survived["findings"]],
                      "a live primary absorbing one dismissed member must survive")
 
@@ -216,7 +229,7 @@ class SubjectAwarePrimarySelection(unittest.TestCase):
         merged = [x for x in out if x.get("booking_uid") == UID]
         self.assertEqual(len(merged), 1)
 
-        survived = reconcile.filter_and_sort({"findings_raw": merged}, dismissed)
+        survived = filter_and_sort_pinned({"findings_raw": merged}, dismissed)
         self.assertEqual(survived["findings"], [],
                          "a group where every member is dismissed must filter out entirely")
 
@@ -227,13 +240,13 @@ class RegressionDirectAndAllAbsorbedDismissal(unittest.TestCase):
 
     def test_a_findings_own_id_being_dismissed_still_filters_it(self):
         f = finding("changed_mind:Itzel:2026-08-21", evidence=["m1"])
-        out = reconcile.filter_and_sort({"findings_raw": [f]}, {f["id"]: {}})
+        out = filter_and_sort_pinned({"findings_raw": [f]}, {f["id"]: {}})
         self.assertEqual(out["findings"], [])
 
     def test_every_absorbed_id_dismissed_still_filters_the_merged_primary(self):
         primary = dict(finding("primary-id", evidence=["m1", "m2"]))
         primary["absorbed"] = ["absorbed-1", "absorbed-2"]
-        out = reconcile.filter_and_sort({"findings_raw": [primary]},
+        out = filter_and_sort_pinned({"findings_raw": [primary]},
                                         {"absorbed-1": {}, "absorbed-2": {}})
         self.assertEqual(out["findings"], [],
                          "every absorbed id dismissed must still silence the primary")
@@ -241,7 +254,7 @@ class RegressionDirectAndAllAbsorbedDismissal(unittest.TestCase):
     def test_a_partial_absorbed_dismissal_does_not_filter_the_primary(self):
         primary = dict(finding("primary-id-2", evidence=["m1", "m2"]))
         primary["absorbed"] = ["absorbed-a", "absorbed-b"]
-        out = reconcile.filter_and_sort({"findings_raw": [primary]}, {"absorbed-a": {}})
+        out = filter_and_sort_pinned({"findings_raw": [primary]}, {"absorbed-a": {}})
         self.assertEqual([x["id"] for x in out["findings"]], ["primary-id-2"])
 
 
@@ -265,12 +278,12 @@ class ReviewQueueExemption(unittest.TestCase):
                        evidence=["m-old"], evidence_latest="2026-08-15T04:00:07.000Z")
 
     def test_undecided_message_predating_the_cutoff_still_surfaces(self):
-        out = reconcile.filter_and_sort(
+        out = filter_and_sort_pinned(
             {"findings_raw": [self._msg_finding("undecided_message")]}, self.DISMISSED)
         self.assertEqual(len(out["findings"]), 1)
 
     def test_unread_message_predating_the_cutoff_still_surfaces(self):
-        out = reconcile.filter_and_sort(
+        out = filter_and_sort_pinned(
             {"findings_raw": [self._msg_finding("unread_message")]}, self.DISMISSED)
         self.assertEqual(len(out["findings"]), 1)
 
@@ -285,7 +298,7 @@ class ReviewQueueExemption(unittest.TestCase):
         """The exemption is surgical — changed_mind on old evidence stays dismissed."""
         f = finding("changed_mind:Itzel:2026-08-21",
                     evidence=["m1"], evidence_latest="2026-08-15T04:00:07.000Z")
-        out = reconcile.filter_and_sort({"findings_raw": [f]}, self.DISMISSED)
+        out = filter_and_sort_pinned({"findings_raw": [f]}, self.DISMISSED)
         self.assertEqual(out["findings"], [])
 
 

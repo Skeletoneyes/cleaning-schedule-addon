@@ -314,6 +314,51 @@ class DockerfileCoversEveryLocalImport(unittest.TestCase):
                          f"COPY them — the add-on will not boot")
 
 
+class InjectedClockReachesTheStaleFilter(unittest.TestCase):
+    """`run(today=...)` must reach `filter_and_sort`'s STALE_DAYS suppression.
+
+    It did not until 2026-09-06. Every detector was dated from the injected
+    `today`, then the suppression at the end read the WALL clock — so a test
+    that correctly pinned its date still had its findings filtered away once
+    real time moved five days past the fixtures. Five suites failed that way,
+    all identically with an empty list, which reads like a broken detector and
+    is really a clock leaking in at the last step.
+    """
+
+    def test_run_passes_its_today_to_filter_and_sort(self):
+        import ast
+        src = (APP_DIR / "reconcile.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.parse(src).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "run")
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name) and n.func.id == "filter_and_sort"]
+        self.assertTrue(calls, "run() must end in filter_and_sort")
+        for c in calls:
+            self.assertIn("today", [k.arg for k in c.keywords],
+                          "run() must thread its own `today` through, or the "
+                          "wall clock filters out everything it just produced")
+
+    def test_filter_and_sort_accepts_an_injected_today(self):
+        import ast
+        src = (APP_DIR / "reconcile.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.parse(src).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "filter_and_sort")
+        self.assertIn("today", [a.arg for a in fn.args.args])
+
+    def test_a_finding_older_than_stale_days_survives_a_pinned_today(self):
+        """The behaviour, not just the wiring."""
+        sys.path.insert(0, str(APP_DIR))
+        import reconcile
+        from datetime import date
+        f = {"id": "x", "detector": "d", "kind": "drift_unassigned",
+             "severity": "needs-attention", "date": "2026-08-15",
+             "booking_uid": None, "cleaner": None, "why": "w", "evidence": []}
+        near = reconcile.filter_and_sort({"findings_raw": [f]}, {}, today=date(2026, 8, 16))
+        far = reconcile.filter_and_sort({"findings_raw": [f]}, {}, today=date(2027, 1, 1))
+        self.assertEqual(len(near["findings"]), 1, "one day old — must survive")
+        self.assertEqual(len(far["findings"]), 0, "months old — must be suppressed")
+
+
 class OneClock(unittest.TestCase):
     """app.py cannot be imported without the add-on's runtime deps, so these
     are source assertions — the same technique the phone-escalation tripwire

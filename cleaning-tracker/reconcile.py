@@ -198,11 +198,16 @@ def run(data, drift_items, ical_events=None, gcal_events=None, today=None, silen
         if ev and len(stamps) == len(ev):
             f["evidence_latest"] = max(stamps, key=_order_key)
 
+    # Thread the SAME `today` the detectors above ran against. Without it the
+    # stale suppression inside `filter_and_sort` read the wall clock while
+    # every finding was dated from the injected one — so a test that pinned
+    # the date still had its results filtered away by the real calendar, and
+    # five suites rotted silently five days after they were written.
     return filter_and_sort({
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "version": RECONCILER_VERSION,
         "findings_raw": findings,
-    }, dismissed)
+    }, dismissed, today=today)
 
 
 # ── Subject resolution + decision-state ranking ─────────────────────────────
@@ -565,15 +570,24 @@ def _dismissal_subject(finding_id, record):
     return m.group(0) if m else None
 
 
-def filter_and_sort(result, dismissed):
+def filter_and_sort(result, dismissed, today=None):
     """Re-apply dismissed filter + sort + count over a cached raw result.
 
     Used both by the fresh run() path and by the dismiss/undismiss path so a
     dismiss doesn't require re-fetching iCal / GCal. The raw pre-filter list
     lives in `findings_raw`; `findings` + `counts` are derived each call.
+
+    `today` is injectable for the same reason `_channel_silence`'s is: the
+    STALE_DAYS suppression below reads a clock, and a test that cannot pin
+    that clock stops testing anything five days after its fixtures were
+    written. Five suites had rotted that way by 2026-09-06 — every assertion
+    failing identically with an empty list, which reads like a broken detector
+    and is really just the calendar moving. Production passes nothing and gets
+    `date.today()`, exactly as before.
     """
     raw = list(result.get("findings_raw") or result.get("findings") or [])
-    cutoff = (date.today() - timedelta(days=STALE_DAYS)).isoformat()
+    today = today or date.today()
+    cutoff = (today - timedelta(days=STALE_DAYS)).isoformat()
 
     # ISC-349: subject cutoffs, one per booking a dismissal was about — the
     # LATEST dismissal wins when a booking was dismissed more than once.
